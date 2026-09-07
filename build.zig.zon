@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
+.{
+    .name = .fluxion_rhi,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x4163e3da0ff09bfa,
+    .dependencies = .{
+        // The two backends, and what they are written against.
+        .fluxion_gl = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#c88649494881a0515562b9193412e7ad9c095057",
+            .hash = "fluxion_gl-0.1.0-F9AI4lllBQB4-oTssR_6bpY6Vg9fYSx1mFb5fIDy98hO",
+        },
+        .fluxion_d3d = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#39f2fdb57298cdcf2ff9ac3dc1b53657f8a4b48d",
+            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQDhuFiAJ7iobTfIee_s2o4iHWecdyKG65bz",
+        },
+        // `Clip`: which clip space a device wants, so a projection is built
+        // for the backend that was actually opened.
+        .fluxion_math = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-math#92afdbddbf930369265d24136402c7eb5dd8f70e",
+            .hash = "fluxion_math-0.1.0-dfpZBeNUBAAwUMriLKaOTRBWGFmfY53_jyYuMUxkPYek",
+        },
+        // Generational handles: what a program holds instead of a pointer
+        // into a backend.
+        .fluxion_id = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-id#64a04a156031a5d87ead8ce9d4fdb8c78f21ef30",
+            .hash = "fluxion_id-0.1.0--9Hv-nGFAQAW36SvJvMB6L1nUNErZzh7JC0-nRPlrotw",
+        },
+
+        // What the examples draw into and save with. Lazy: fetched only when
+        // the examples are built, which is when this is the root package or
+        // `-Dexamples` is given. The library never opens a window and never
+        // writes a file.
+        .fluxion_platform = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#373505b40d7d5d20840adba8485cc3bf707ce4ce",
+            .hash = "fluxion_platform-0.1.0-WsOjUVkbDADvAs9Vhe9Wbgw8FROUEtsQIVRwAiLuonq5",
+            .lazy = true,
+        },
+        .fluxion_image = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-image#034c37b6ab2511088973bcb96ffb5ada06b4b038",
+            .hash = "fluxion_image-0.1.0-fyJkdUhXAAAijeOycvswOxJWKcXIuU8MVaOHi0L8L7K0",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}
