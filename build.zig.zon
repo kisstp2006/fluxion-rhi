@@ -47,8 +47,8 @@
         // library takes shader source as text and does not care where the
         // text came from.
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#e96139da87e51a25819b7557f49bc09829b9d379",
-            .hash = "fluxion_shader-0.1.0-FqFMEuhnAwAZf9QrwAh2B9qCpkX0lIYdaULtQAvYq4FW",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#a079f4016b1583c9c1c1cbc17b70e66f8c9e0ec0",
+            .hash = "fluxion_shader-0.1.0-FqFMErVpAwBtQlJAuNsUUct10MAS3oie4RXrkG36zpi9",
             .lazy = true,
         },
     },
