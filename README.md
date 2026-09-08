@@ -177,7 +177,13 @@ real command buffer, which is why the list exists.
 | Example | What it shows |
 | --- | --- |
 | `zig build example` | Which backends this build has; a frame validated against `none`; a triangle through Direct3D's software rasteriser with no window anywhere, printed as text. |
-| `zig build example-sprites` | 2D: two dozen textured sprites bouncing in a window, in one instanced draw, with alpha blending and a top-left orthographic matrix, from one shader source compiled into both languages. `-- --backend gl` or `d3d11`; `-- --capture out.png` draws one frame to a file instead. |
+| `zig build example-sprites` | 2D: two dozen textured sprites bouncing in a window, in one instanced draw, with alpha blending and a top-left orthographic matrix, from one shader source compiled into both languages and an atlas read off the disk. `-- --backend gl` or `d3d11`; `-- --capture out.png` draws one frame to a file instead. |
+
+The sprite example loads `examples/atlas.png` at run time, which is why it
+wants to be run from the root of this repository; `-- --atlas PATH` says
+otherwise. The file in this repository was written by the example itself, and
+`-- --write-atlas examples/atlas.png` writes it again - so the one binary
+here is not one nobody can account for.
 
 `examples/window.zig` is the window and the device on it, through Fluxion
 Platform: the `GlHooks` for one backend and the `HWND` for the other, and the

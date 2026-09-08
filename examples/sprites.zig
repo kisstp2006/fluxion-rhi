@@ -12,6 +12,9 @@
 //! how this can be looked at on a machine with no display - and how the test
 //! at the bottom checks that both backends draw the same picture.
 //!
+//! The atlas is read from `examples/atlas.png`, so run this from the root of
+//! the repository or say where it is with `-- --atlas PATH`.
+//!
 //! What a 2D renderer is made of, and what this library was built for first:
 //!
 //!   * one quad in a vertex buffer, and a second buffer stepping once per
@@ -22,6 +25,10 @@
 //!   * an orthographic matrix with the origin at the top left, built with
 //!     `device.clip()` so it is right for the backend that was opened;
 //!   * alpha blending, so the transparent corners of the atlas are transparent;
+//!   * an atlas read off the disk with
+//!     [Fluxion Image](https://github.com/kisstp2006/fluxion-image), because
+//!     that is what a sprite atlas is - `-- --atlas PATH` draws with another
+//!     one, and the texture takes its size from the file;
 //!   * one shader source, compiled by
 //!     [Fluxion Shader](https://github.com/kisstp2006/fluxion-shader) into the
 //!     language each backend takes - and the pipeline described out of what
@@ -203,9 +210,20 @@ fn hue(turn: f32, alpha: f32) [4]f32 {
     };
 }
 
-/// A 64 by 64 atlas of four 32-pixel cells: a disc, a ring, a diamond and a
-/// square, white on transparent, so the tint is the colour and the corners
-/// show what is behind.
+/// Where the atlas is, relative to the root of this repository.
+const atlas_path = "examples/atlas.png";
+
+/// The atlas this repository ships, written by the function below.
+///
+/// It is a file rather than a few lines of arithmetic because that is what a
+/// sprite atlas is: something an artist made, loaded at run time. Keeping the
+/// generator means the file can be checked against what claims to have
+/// produced it - `-- --write-atlas examples/atlas.png` writes it again - so
+/// the one binary in this repository is not one nobody can account for.
+///
+/// Four 32-pixel cells: a disc, a ring, a diamond and a square, white on
+/// transparent, so the tint is the colour and the corners show what is
+/// behind.
 fn makeAtlas() [64 * 64 * 4]u8 {
     var pixels: [64 * 64 * 4]u8 = undefined;
     for (0..64) |y| {
@@ -254,7 +272,7 @@ const Renderer = struct {
     atlas: rhi.Texture,
     sampler: rhi.Sampler,
 
-    fn init(gpa: std.mem.Allocator, device: *rhi.Device) !Renderer {
+    fn init(gpa: std.mem.Allocator, io: Io, device: *rhi.Device, path: []const u8) !Renderer {
         var log: Io.Writer.Allocating = .init(gpa);
         defer log.deinit();
 
@@ -307,9 +325,19 @@ const Renderer = struct {
             return err;
         };
 
+        // The atlas comes off the disk, as a sprite atlas does. Its size is
+        // the file's, not a number written here twice.
+        var atlas = image.png.readFile(gpa, io, path, .{}) catch |err| {
+            std.debug.print(
+                "could not read `{s}`: {t}\nrun this from the root of the repository, or pass `-- --atlas PATH`\n",
+                .{ path, err },
+            );
+            return err;
+        };
+        defer atlas.deinit(gpa);
+
         // One quad, as a strip, in 0..1: the shader scales and moves it.
         const corners = [_]f32{ 0, 0, 1, 0, 0, 1, 1, 1 };
-        const atlas = makeAtlas();
         const frame_block = module.block("Frame") orelse return error.NoFrameBlock;
         return .{
             .device = device,
@@ -320,7 +348,11 @@ const Renderer = struct {
             // The size the shader said the block was, not the size this
             // program guessed it would be.
             .frame = try device.createBuffer(.{ .kind = .uniform, .size = frame_block.size }),
-            .atlas = try device.createTexture(.{ .width = 64, .height = 64, .data = &atlas }),
+            .atlas = try device.createTexture(.{
+                .width = atlas.width,
+                .height = atlas.height,
+                .data = atlas.pixels,
+            }),
             .sampler = try device.createSampler(.linear),
         };
     }
@@ -375,6 +407,11 @@ const Options = struct {
     at: f32 = 2.0,
     software: bool = false,
     debug: bool = false,
+    /// The picture the sprites are cut out of, read at run time.
+    atlas: []const u8 = atlas_path,
+    /// Write the atlas this repository ships and stop, so the one binary
+    /// here can be accounted for by the code that made it.
+    write_atlas: ?[]const u8 = null,
 
     fn fromArguments(init: std.process.Init, arena: std.mem.Allocator) !Options {
         var self: Options = .{ .backend = windowing.defaultBackend() };
@@ -401,6 +438,12 @@ const Options = struct {
             } else if (std.mem.eql(u8, argument, "--height")) {
                 self.height = try std.fmt.parseInt(u32, value orelse return error.MissingValue, 10);
                 i += 1;
+            } else if (std.mem.eql(u8, argument, "--atlas")) {
+                self.atlas = value orelse return error.MissingValue;
+                i += 1;
+            } else if (std.mem.eql(u8, argument, "--write-atlas")) {
+                self.write_atlas = value orelse return error.MissingValue;
+                i += 1;
             } else if (std.mem.eql(u8, argument, "--software")) {
                 self.software = true;
             } else if (std.mem.eql(u8, argument, "--debug")) {
@@ -420,6 +463,19 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     const options = try Options.fromArguments(init, init.arena.allocator());
+
+    // Writing the atlas needs no device, no window and no display.
+    if (options.write_atlas) |path| {
+        const pixels = makeAtlas();
+        try image.png.writeFile(gpa, init.io, path, .{
+            .width = 64,
+            .height = 64,
+            .pixels = &pixels,
+            .row_pitch = 64 * 4,
+        }, .{ .keep_alpha = true });
+        try out.print("wrote {s}\n", .{path});
+        return out.flush();
+    }
 
     // A window either way: the OpenGL backend has no context without one, and
     // the capture path keeps it hidden.
@@ -444,7 +500,7 @@ pub fn main(init: std.process.Init) !void {
     defer device.deinit();
     try out.print("{f}\n", .{device.info()});
 
-    var renderer = Renderer.init(gpa, &device) catch |err| {
+    var renderer = Renderer.init(gpa, init.io, &device, options.atlas) catch |err| {
         try out.print("the shader did not become a pipeline: {t}\n", .{err});
         try out.flush();
         return err;
@@ -511,7 +567,7 @@ fn frameOn(backend: rhi.Backend, gpa: std.mem.Allocator) ![]u8 {
     defer fixture.close();
     var device = &fixture.device;
 
-    var renderer = try Renderer.init(gpa, device);
+    var renderer = try Renderer.init(gpa, std.testing.io, device, atlas_path);
     defer renderer.deinit();
     var scene: Scene = .init(test_width, test_height);
     scene.step(1.0);
