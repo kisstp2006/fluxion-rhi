@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     const examples_wanted = b.option(
         bool,
         "examples",
-        "Build the examples and their tests (pulls fluxion-platform and fluxion-image)",
+        "Build the examples and their tests (pulls fluxion-platform, fluxion-image and fluxion-shader)",
     ) orelse (b.pkg_hash.len == 0);
     if (!examples_wanted) return;
 
@@ -71,6 +71,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) orelse return;
     const image_dep = b.lazyDependency("fluxion_image", .{
+        .target = target,
+        .optimize = optimize,
+    }) orelse return;
+    const shader_dep = b.lazyDependency("fluxion_shader", .{
         .target = target,
         .optimize = optimize,
     }) orelse return;
@@ -129,6 +133,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "fluxion_rhi", .module = mod },
                 .{ .name = "fluxion_math", .module = math.module("fluxion_math") },
                 .{ .name = "fluxion_image", .module = image_dep.module("fluxion_image") },
+                .{ .name = "fluxion_shader", .module = shader_dep.module("fluxion_shader") },
                 .{ .name = "window", .module = window_mod },
             },
         });

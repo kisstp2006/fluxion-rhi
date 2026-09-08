@@ -115,19 +115,25 @@ where `Clip` comes from, and [Fluxion Id](https://github.com/kisstp2006/fluxion-
 is the handles. Fluxion D3D is imported on every target and analysed only on
 Windows, so a Linux build never sees it.
 
-Two more are named in `build.zig.zon` and are *not* fetched for you:
+Three more are named in `build.zig.zon` and are *not* fetched for you:
 [Fluxion Platform](https://github.com/kisstp2006/fluxion-platform) opens the
-window the examples draw into, and
+window the examples draw into,
 [Fluxion Image](https://github.com/kisstp2006/fluxion-image) saves a frame as
-a PNG. Both are `lazy`, asked for only when this is the package being built.
-Pass `-Dexamples=false` to skip them in a checkout of this repository too.
+a PNG, and [Fluxion Shader](https://github.com/kisstp2006/fluxion-shader) is
+what the sprite example writes its shader in. All three are `lazy`, asked for
+only when this is the package being built. Pass `-Dexamples=false` to skip
+them in a checkout of this repository too.
 
 ## The shader contract
 
 There is no cross-compiler here. A shader is source in the backend's own
-language, and a program that ships on both backends ships both - which is
-what a shader compiler would produce, and the seam one slots into later
-without `ShaderDesc` changing shape. What has to agree between the two:
+language, and a program that ships on both backends ships both. That is a
+seam rather than a burden: a shader compiler produces both without
+`ShaderDesc` changing shape, and
+[Fluxion Shader](https://github.com/kisstp2006/fluxion-shader) is the one
+these examples use - one source in, both languages out, plus the locations
+and slots to describe the pipeline with. What has to agree between the two,
+whether a compiler wrote them or a person did:
 
 | | GLSL 330 | HLSL 5.0 |
 | --- | --- | --- |
@@ -171,7 +177,7 @@ real command buffer, which is why the list exists.
 | Example | What it shows |
 | --- | --- |
 | `zig build example` | Which backends this build has; a frame validated against `none`; a triangle through Direct3D's software rasteriser with no window anywhere, printed as text. |
-| `zig build example-sprites` | 2D: two dozen textured sprites bouncing in a window, in one instanced draw, with alpha blending and a top-left orthographic matrix. `-- --backend gl` or `d3d11`; `-- --capture out.png` draws one frame to a file instead. |
+| `zig build example-sprites` | 2D: two dozen textured sprites bouncing in a window, in one instanced draw, with alpha blending and a top-left orthographic matrix, from one shader source compiled into both languages. `-- --backend gl` or `d3d11`; `-- --capture out.png` draws one frame to a file instead. |
 
 `examples/window.zig` is the window and the device on it, through Fluxion
 Platform: the `GlHooks` for one backend and the `HWND` for the other, and the

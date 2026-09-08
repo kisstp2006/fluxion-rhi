@@ -22,7 +22,11 @@
 //!   * an orthographic matrix with the origin at the top left, built with
 //!     `device.clip()` so it is right for the backend that was opened;
 //!   * alpha blending, so the transparent corners of the atlas are transparent;
-//!   * the same shader twice, in GLSL and HLSL, bound by one contract.
+//!   * one shader source, compiled by
+//!     [Fluxion Shader](https://github.com/kisstp2006/fluxion-shader) into the
+//!     language each backend takes - and the pipeline described out of what
+//!     that shader says about itself, so a location, a slot and a name are
+//!     never written down twice.
 
 const std = @import("std");
 const Io = std.Io;
@@ -30,6 +34,7 @@ const Io = std.Io;
 const rhi = @import("fluxion_rhi");
 const math = @import("fluxion_math");
 const image = @import("fluxion_image");
+const shader = @import("fluxion_shader");
 const windowing = @import("window");
 const Window = windowing.Window;
 
@@ -42,52 +47,57 @@ const count = 24;
 // The shader, in both languages
 // -------------------------------------------------------------------------
 
-const glsl_vs =
-    \\#version 330 core
-    \\layout(location = 0) in vec2 corner;
-    \\layout(location = 1) in vec4 placement;
-    \\layout(location = 2) in vec4 tint;
-    \\layout(location = 3) in vec4 uv_rect;
-    \\layout(std140) uniform Frame { mat4 projection; };
-    \\out vec2 v_uv;
-    \\out vec4 v_tint;
-    \\void main() {
-    \\    vec2 world = placement.xy + corner * placement.zw;
-    \\    v_uv = mix(uv_rect.xy, uv_rect.zw, corner);
-    \\    v_tint = tint;
-    \\    gl_Position = projection * vec4(world, 0.0, 1.0);
+/// One source, and the library that reads it writes both languages out. The
+/// contract between them - `layout(location = n)` against `ATTRn`, a block
+/// name against `register(bn)` - is what `fluxion-shader` exists to keep, so
+/// none of it appears twice here.
+const source =
+    \\attribute vec2 corner : 0;
+    \\attribute vec4 placement : 1;
+    \\attribute vec4 tint : 2;
+    \\attribute vec4 uv_rect : 3;
+    \\
+    \\varying vec2 uv;
+    \\varying vec4 shade;
+    \\
+    \\uniform Frame : 0 {
+    \\    mat4 projection;
     \\}
-;
-const glsl_fs =
-    \\#version 330 core
-    \\uniform sampler2D atlas;
-    \\in vec2 v_uv;
-    \\in vec4 v_tint;
-    \\out vec4 o_colour;
-    \\void main() { o_colour = texture(atlas, v_uv) * v_tint; }
+    \\
+    \\texture2d atlas : 0;
+    \\
+    \\vertex {
+    \\    // The quad is a unit square; each instance says where it goes.
+    \\    vec2 world = placement.xy + corner * placement.zw;
+    \\    uv = mix(uv_rect.xy, uv_rect.zw, corner);
+    \\    shade = tint;
+    \\    position = projection * vec4(world, 0.0, 1.0);
+    \\}
+    \\
+    \\fragment {
+    \\    target = sample(atlas, uv) * shade;
+    \\}
 ;
 
-const hlsl_common =
-    \\cbuffer Frame : register(b0) { float4x4 projection; };
-    \\Texture2D atlas : register(t0);
-    \\SamplerState atlas_sampler : register(s0);
-    \\struct VsIn { float2 corner : ATTR0; float4 placement : ATTR1; float4 tint : ATTR2; float4 uv_rect : ATTR3; };
-    \\struct PsIn { float4 position : SV_POSITION; float2 uv : TEXCOORD0; float4 tint : COLOR0; };
-    \\
-;
-const hlsl_vs = hlsl_common ++
-    \\PsIn main(VsIn i) {
-    \\    PsIn o;
-    \\    float2 world = i.placement.xy + i.corner * i.placement.zw;
-    \\    o.uv = lerp(i.uv_rect.xy, i.uv_rect.zw, i.corner);
-    \\    o.tint = i.tint;
-    \\    o.position = mul(projection, float4(world, 0.0, 1.0));
-    \\    return o;
-    \\}
-;
-const hlsl_ps = hlsl_common ++
-    \\float4 main(PsIn i) : SV_TARGET { return atlas.Sample(atlas_sampler, i.uv) * i.tint; }
-;
+/// Which vertex buffer each attribute is read from.
+///
+/// The one thing the shader does not know and cannot: a location and a format
+/// belong to the shader, but how the vertices are packed into buffers is the
+/// program's business. Everything else about the pipeline comes out of the
+/// module.
+fn bufferOf(name: []const u8) u32 {
+    return if (std.mem.eql(u8, name, "corner")) 0 else 1;
+}
+
+fn vertexFormat(ty: shader.Type) !rhi.VertexFormat {
+    return switch (ty) {
+        .float => .float,
+        .vec2 => .float2,
+        .vec3 => .float3,
+        .vec4 => .float4,
+        else => error.NotAVertexFormat,
+    };
+}
 
 // -------------------------------------------------------------------------
 // The scene
@@ -233,6 +243,10 @@ fn makeAtlas() [64 * 64 * 4]u8 {
 
 const Renderer = struct {
     device: *rhi.Device,
+    /// Kept rather than thrown away: the names in it are what the pipeline
+    /// was described with, and holding it means nothing has to reason about
+    /// how long a driver looks at them.
+    module: shader.Module,
     pipeline: rhi.Pipeline,
     quad: rhi.Buffer,
     instances: rhi.Buffer,
@@ -240,31 +254,53 @@ const Renderer = struct {
     atlas: rhi.Texture,
     sampler: rhi.Sampler,
 
-    fn init(device: *rhi.Device) !Renderer {
-        const shader = device.createShader(.{
-            .glsl = .{ .vertex = glsl_vs, .fragment = glsl_fs },
-            .hlsl = .{ .vertex = hlsl_vs, .fragment = hlsl_ps },
+    fn init(gpa: std.mem.Allocator, device: *rhi.Device) !Renderer {
+        var log: Io.Writer.Allocating = .init(gpa);
+        defer log.deinit();
+
+        var module = shader.compile(gpa, source, &log.writer) catch |err| {
+            std.debug.print("{s}\n", .{log.written()});
+            return err;
+        };
+        errdefer module.deinit();
+
+        const handle = device.createShader(.{
+            .glsl = .{ .vertex = module.glsl.vertex, .fragment = module.glsl.fragment },
+            .hlsl = .{ .vertex = module.hlsl.vertex, .fragment = module.hlsl.fragment },
             .label = "sprites",
         }) catch |err| {
             std.debug.print("{s}\n", .{device.diagnostics()});
             return err;
         };
+
+        // The locations and the formats are the shader's; the packing into
+        // buffers is this program's. Nothing is written down twice.
+        var attributes: [8]rhi.VertexAttribute = undefined;
+        var strides: [2]u32 = @splat(0);
+        for (module.attributes, 0..) |a, i| {
+            const buffer = bufferOf(a.name);
+            const format = try vertexFormat(a.ty);
+            attributes[i] = .{
+                .location = a.location,
+                .format = format,
+                .offset = strides[buffer],
+                .buffer = buffer,
+            };
+            strides[buffer] += format.size();
+        }
+
         const pipeline = device.createPipeline(.{
-            .shader = shader,
-            .attributes = &.{
-                .{ .location = 0, .format = .float2, .offset = 0, .buffer = 0 },
-                .{ .location = 1, .format = .float4, .offset = 0, .buffer = 1 },
-                .{ .location = 2, .format = .float4, .offset = 16, .buffer = 1 },
-                .{ .location = 3, .format = .float4, .offset = 32, .buffer = 1 },
-            },
+            .shader = handle,
+            .attributes = attributes[0..module.attributes.len],
             .buffers = &.{
-                .{ .stride = 8 },
-                .{ .stride = @sizeOf(Instance), .step = .instance },
+                .{ .stride = strides[0] },
+                .{ .stride = strides[1], .step = .instance },
             },
             .topology = .triangle_strip,
             .blend = .alpha,
-            .uniform_blocks = &.{"Frame"},
-            .textures = &.{"atlas"},
+            // The two lists the shader itself wrote down, in slot order.
+            .uniform_blocks = (try module.uniformBlockNames()) orelse return error.SlotsHaveHoles,
+            .textures = (try module.textureNames()) orelse return error.SlotsHaveHoles,
             .label = "sprites",
         }) catch |err| {
             std.debug.print("{s}\n", .{device.diagnostics()});
@@ -274,15 +310,24 @@ const Renderer = struct {
         // One quad, as a strip, in 0..1: the shader scales and moves it.
         const corners = [_]f32{ 0, 0, 1, 0, 0, 1, 1, 1 };
         const atlas = makeAtlas();
+        const frame_block = module.block("Frame") orelse return error.NoFrameBlock;
         return .{
             .device = device,
+            .module = module,
             .pipeline = pipeline,
             .quad = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) }),
             .instances = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf([count]Instance), .dynamic = true }),
-            .frame = try device.createBuffer(.{ .kind = .uniform, .size = @sizeOf(math.Mat4) }),
+            // The size the shader said the block was, not the size this
+            // program guessed it would be.
+            .frame = try device.createBuffer(.{ .kind = .uniform, .size = frame_block.size }),
             .atlas = try device.createTexture(.{ .width = 64, .height = 64, .data = &atlas }),
             .sampler = try device.createSampler(.linear),
         };
+    }
+
+    fn deinit(self: *Renderer) void {
+        self.module.deinit();
+        self.* = undefined;
     }
 
     /// One frame into `target`, which is `width` by `height`.
@@ -399,7 +444,12 @@ pub fn main(init: std.process.Init) !void {
     defer device.deinit();
     try out.print("{f}\n", .{device.info()});
 
-    var renderer = try Renderer.init(&device);
+    var renderer = Renderer.init(gpa, &device) catch |err| {
+        try out.print("the shader did not become a pipeline: {t}\n", .{err});
+        try out.flush();
+        return err;
+    };
+    defer renderer.deinit();
     var scene: Scene = .init(options.width, options.height);
 
     if (options.capture) |path| {
@@ -442,7 +492,6 @@ pub fn main(init: std.process.Init) !void {
         frames += 1;
         if (options.frames) |limit| if (frames >= limit) break;
     }
-    _ = &renderer;
     try out.print("{d} frames\n", .{frames});
     try out.flush();
 }
@@ -462,8 +511,8 @@ fn frameOn(backend: rhi.Backend, gpa: std.mem.Allocator) ![]u8 {
     defer fixture.close();
     var device = &fixture.device;
 
-    var renderer = try Renderer.init(device);
-    _ = &renderer;
+    var renderer = try Renderer.init(gpa, device);
+    defer renderer.deinit();
     var scene: Scene = .init(test_width, test_height);
     scene.step(1.0);
 

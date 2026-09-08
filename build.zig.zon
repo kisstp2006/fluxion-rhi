@@ -42,6 +42,15 @@
             .hash = "fluxion_image-0.1.0-fyJkdUhXAAAijeOycvswOxJWKcXIuU8MVaOHi0L8L7K0",
             .lazy = true,
         },
+        // What the sprite example writes its shader in - once, rather than
+        // once per backend. Lazy for the same reason as the rest: this
+        // library takes shader source as text and does not care where the
+        // text came from.
+        .fluxion_shader = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#e96139da87e51a25819b7557f49bc09829b9d379",
+            .hash = "fluxion_shader-0.1.0-FqFMEuhnAwAZf9QrwAh2B9qCpkX0lIYdaULtQAvYq4FW",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
