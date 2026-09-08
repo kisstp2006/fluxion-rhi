@@ -8,12 +8,12 @@
     .dependencies = .{
         // The two backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#c88649494881a0515562b9193412e7ad9c095057",
-            .hash = "fluxion_gl-0.1.0-F9AI4lllBQB4-oTssR_6bpY6Vg9fYSx1mFb5fIDy98hO",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#7e833c2cb2f57c478ae25a31cba46bbb86577b3a",
+            .hash = "fluxion_gl-0.1.0-F9AI4lllBQD0yBq6yPNEKl6jKSuuAzRujbxM6ufMsuku",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#39f2fdb57298cdcf2ff9ac3dc1b53657f8a4b48d",
-            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQDhuFiAJ7iobTfIee_s2o4iHWecdyKG65bz",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#a31ff973e67aa6809a939f01e2cce812b7ec8983",
+            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQAvb_lj9JVfe3Frau1qUW_zJgEN0NZTc9ex",
         },
         // `Clip`: which clip space a device wants, so a projection is built
         // for the backend that was actually opened.
@@ -47,8 +47,8 @@
         // library takes shader source as text and does not care where the
         // text came from.
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#a079f4016b1583c9c1c1cbc17b70e66f8c9e0ec0",
-            .hash = "fluxion_shader-0.1.0-FqFMErVpAwBtQlJAuNsUUct10MAS3oie4RXrkG36zpi9",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#a6123c159554eb6c8a6e6b3896150970069fadcb",
+            .hash = "fluxion_shader-0.1.0-FqFMErVpAwADP9jr6xmJH4qqnFHkQGLMesDmf06ZLbuG",
             .lazy = true,
         },
     },
