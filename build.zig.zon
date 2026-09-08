@@ -38,8 +38,8 @@
             .lazy = true,
         },
         .fluxion_image = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-image#034c37b6ab2511088973bcb96ffb5ada06b4b038",
-            .hash = "fluxion_image-0.1.0-fyJkdUhXAAAijeOycvswOxJWKcXIuU8MVaOHi0L8L7K0",
+            .url = "git+https://github.com/kisstp2006/fluxion-image#40c621cae37d3e916c4ef9b476eec2756c7b4633",
+            .hash = "fluxion_image-0.1.0-fyJkdS7vAABoCM9ka3MqX0VGd_L7My5Bqmg-BXQUtAPO",
             .lazy = true,
         },
         // What the sprite example writes its shader in - once, rather than
