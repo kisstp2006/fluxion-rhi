@@ -65,15 +65,8 @@ pub fn main(init: std.process.Init) !void {
     const height = 24;
     const target = try device.createTexture(.{ .width = width, .height = height, .usage = .{ .render_target = true } });
     const shader = device.createShader(.{ .hlsl = .{
-        .vertex =
-        \\struct In { float2 position : ATTR0; float3 colour : ATTR1; };
-        \\struct Out { float4 position : SV_POSITION; float3 colour : COLOR0; };
-        \\Out main(In i) { Out o; o.position = float4(i.position, 0, 1); o.colour = i.colour; return o; }
-        ,
-        .fragment =
-        \\struct Out { float4 position : SV_POSITION; float3 colour : COLOR0; };
-        \\float4 main(Out i) : SV_TARGET { return float4(i.colour, 1); }
-        ,
+        .vertex = @embedFile("shaders/flat.vert.hlsl"),
+        .fragment = @embedFile("shaders/flat.frag.hlsl"),
     } }) catch |err| {
         try out.print("   shader: {s}\n", .{device.diagnostics()});
         return err;

@@ -58,33 +58,7 @@ const count = 24;
 /// contract between them - `layout(location = n)` against `ATTRn`, a block
 /// name against `register(bn)` - is what `fluxion-shader` exists to keep, so
 /// none of it appears twice here.
-const source =
-    \\attribute vec2 corner : 0;
-    \\attribute vec4 placement : 1;
-    \\attribute vec4 tint : 2;
-    \\attribute vec4 uv_rect : 3;
-    \\
-    \\varying vec2 uv;
-    \\varying vec4 shade;
-    \\
-    \\uniform Frame : 0 {
-    \\    mat4 projection;
-    \\}
-    \\
-    \\texture2d atlas : 0;
-    \\
-    \\vertex {
-    \\    // The quad is a unit square; each instance says where it goes.
-    \\    vec2 world = placement.xy + corner * placement.zw;
-    \\    uv = mix(uv_rect.xy, uv_rect.zw, corner);
-    \\    shade = tint;
-    \\    position = projection * vec4(world, 0.0, 1.0);
-    \\}
-    \\
-    \\fragment {
-    \\    target = sample(atlas, uv) * shade;
-    \\}
-;
+const source = @embedFile("shaders/sprites.fxs");
 
 /// Which vertex buffer each attribute is read from.
 ///
