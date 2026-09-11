@@ -8,12 +8,12 @@
     .dependencies = .{
         // The three backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#cedefeae33f7d2e83765f81a802bc7b632c7de8f",
-            .hash = "fluxion_gl-0.1.0-F9AI4lllBQBFwRMmiwrXDqyvomA8S-QQ52f7fqCQEKIU",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#aa40b987b6c787e23a17f6679f39c6e006c39da7",
+            .hash = "fluxion_gl-0.1.0-F9AI4lllBQDb6qQfOnn4WQc2om_ZQRYjwgi7UU8z4NzP",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#3a17dd70dfb79fe1223d7604767380cad629c919",
-            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQAmKKAW9uPW2HnbFTONgsbL9K1S7AvubQ5y",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#5361f0659abac647634bff69a08a0dab6ccc9392",
+            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQDPLFfUJDTxq2EoMK1b9KdmHxgrw2tTFNDY",
         },
         // Not lazy, though only a browser draws with it: off wasm it is the
         // stub the WebGL backend's tests run against, and it has no
@@ -41,8 +41,8 @@
         // `-Dexamples` is given. The library never opens a window and never
         // writes a file.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#9f1074bad5a0065d9dec480d02ac04703933cf1c",
-            .hash = "fluxion_platform-0.1.0-WsOjUQfIDwCfGQbLE_BLrLcPicPcGadwyqYXABp9zB7r",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#96c5acc58d792c8f670c5c1a7b4b3d9b53a12fb0",
+            .hash = "fluxion_platform-0.1.0-WsOjUYYeEACL_j-AGVgBNiPwb2wlj0G5bCqyaw248YGc",
             .lazy = true,
         },
         .fluxion_image = .{
@@ -55,8 +55,8 @@
         // library takes shader source as text and does not care where the
         // text came from.
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#76d1a21c4c119b96cecae4cc1a7bc6fcfccb8d20",
-            .hash = "fluxion_shader-0.1.0-FqFMEmaMAwDssz5rnA3-LuEII7dBfIDZRzH1zr-Gz8WU",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#929418fd6bcdd887414d3cda2328684b50368bd8",
+            .hash = "fluxion_shader-0.1.0-FqFMEmaMAwA0kjWxXizOFk30I7U5UDuPgk-063ElX_5X",
             .lazy = true,
         },
     },
