@@ -102,8 +102,9 @@ pub fn build(b: *std.Build) void {
     web_step.dependOn(&b.addInstallArtifact(web, .{ .dest_dir = .{ .override = .{ .custom = "web" } } }).step);
     web_step.dependOn(&b.addInstallFile(b.path("examples/web/index.html"), "web/index.html").step);
     // The glue is fluxion-webgl's, and comes from there rather than being
-    // copied into this repository to drift.
-    web_step.dependOn(&b.addInstallFile(webgl.path("examples/web/fluxion-webgl.js"), "web/fluxion-webgl.js").step);
+    // copied into this repository to drift - asked for by the name that
+    // package gives it, not by where it keeps the file.
+    web_step.dependOn(&b.addInstallFile(webgl.namedLazyPath("glue"), "web/fluxion-webgl.js").step);
 
     // And its tests, on the host against the stub, with the library's.
     const web_host = b.createModule(.{

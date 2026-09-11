@@ -8,20 +8,20 @@
     .dependencies = .{
         // The three backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#7e833c2cb2f57c478ae25a31cba46bbb86577b3a",
-            .hash = "fluxion_gl-0.1.0-F9AI4lllBQD0yBq6yPNEKl6jKSuuAzRujbxM6ufMsuku",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#dc56819c3dcc09f793b433bb8a0e68a9efb29671",
+            .hash = "fluxion_gl-0.1.0-F9AI4lllBQCma_MoEjvSwP_-2suutvlbpF3h_5Jk5SNB",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#a31ff973e67aa6809a939f01e2cce812b7ec8983",
-            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQAvb_lj9JVfe3Frau1qUW_zJgEN0NZTc9ex",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#994bba2ae8e24c2b39aed3c91aaaa7b8da5d12d8",
+            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQByqRx2NKWDbYIWZorNuKATj0Ozm2o85f-r",
         },
         // Not lazy, though only a browser draws with it: off wasm it is the
         // stub the WebGL backend's tests run against, and it has no
-        // dependencies of its own to fetch. Pinned to the commit that added
-        // the calls the backend binds by slot with.
+        // dependencies of its own to fetch. Pinned to a commit that has the
+        // calls the backend binds by slot with, and that names its glue.
         .fluxion_webgl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-webgl#d3208479305c9d1114837206dbd566e491c95cba",
-            .hash = "fluxion_webgl-0.1.0-8yvbdeY5AwCDBMbSWH8wZcT6KILV64Q3m-abrVt1Gh0Z",
+            .url = "git+https://github.com/kisstp2006/fluxion-webgl#228b85f17702d28660e3fa6745ad7fcb3faa32ee",
+            .hash = "fluxion_webgl-0.1.0-8yvbdRdVAwDPfmGZBp5vku1-TRr6fCwl5ka84zXvguxU",
         },
         // `Clip`: which clip space a device wants, so a projection is built
         // for the backend that was actually opened.
@@ -32,7 +32,7 @@
         // Generational handles: what a program holds instead of a pointer
         // into a backend.
         .fluxion_id = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-id#64a04a156031a5d87ead8ce9d4fdb8c78f21ef30",
+            .url = "git+https://github.com/kisstp2006/fluxion-id#a52c29dfe5ac0a49a5d5469cdc1a4fb96b799ccc",
             .hash = "fluxion_id-0.1.0--9Hv-nGFAQAW36SvJvMB6L1nUNErZzh7JC0-nRPlrotw",
         },
 
@@ -41,13 +41,13 @@
         // `-Dexamples` is given. The library never opens a window and never
         // writes a file.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#373505b40d7d5d20840adba8485cc3bf707ce4ce",
-            .hash = "fluxion_platform-0.1.0-WsOjUVkbDADvAs9Vhe9Wbgw8FROUEtsQIVRwAiLuonq5",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#9ee5f1357cb6bc3e7b9b5323826e4e8957009e79",
+            .hash = "fluxion_platform-0.1.0-WsOjUWHDDwDCjU4rmewIqMFLVQEOj7pQ-NfBLPZ_5B9t",
             .lazy = true,
         },
         .fluxion_image = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-image#40c621cae37d3e916c4ef9b476eec2756c7b4633",
-            .hash = "fluxion_image-0.1.0-fyJkdS7vAABoCM9ka3MqX0VGd_L7My5Bqmg-BXQUtAPO",
+            .url = "git+https://github.com/kisstp2006/fluxion-image#79463ef201f11e15ada014467c0ad1d58b2a882d",
+            .hash = "fluxion_image-0.1.0-fyJkdS7vAAB1p43VSutvpxQB32hIcvJb3fGSZbo_qeha",
             .lazy = true,
         },
         // What the sprite example writes its shader in - once, rather than
@@ -55,8 +55,8 @@
         // library takes shader source as text and does not care where the
         // text came from.
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#a6123c159554eb6c8a6e6b3896150970069fadcb",
-            .hash = "fluxion_shader-0.1.0-FqFMErVpAwADP9jr6xmJH4qqnFHkQGLMesDmf06ZLbuG",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#f86db608c8cf2247fb739e32b054e6b41fca3273",
+            .hash = "fluxion_shader-0.1.0-FqFMEmaMAwA0wYgi2ulZW4oKDds1fvXP623VqQTQ8fGk",
             .lazy = true,
         },
     },
