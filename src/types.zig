@@ -39,25 +39,33 @@ pub const Backend = enum {
     gl,
     /// Direct3D 11, feature level 11.0. Windows only.
     d3d11,
+    /// WebGL 2, in a browser, through `fluxion-webgl`. A `wasm32` build
+    /// only - and, under test, any build, where it talks to that library's
+    /// stub instead of a page.
+    webgl,
 
     pub fn clip(self: Backend) math.Clip {
         return switch (self) {
             .none => .gl,
             .gl => .gl,
             .d3d11 => .d3d,
+            // OpenGL ES's, which is OpenGL's: depth from -1 to 1.
+            .webgl => .gl,
         };
     }
 };
 
 /// Which backend to open.
 pub const Select = enum {
-    /// OpenGL if `DeviceDesc.gl` was given, Direct3D 11 on Windows otherwise,
-    /// and `error.Unsupported` where neither applies. Never `none` - a
-    /// program that wants nothing drawn has to say so.
+    /// OpenGL if `DeviceDesc.gl` was given; otherwise Direct3D 11 on Windows
+    /// and WebGL on the web; and `error.Unsupported` where none of those
+    /// applies. Never `none` - a program that wants nothing drawn has to say
+    /// so.
     auto,
     none,
     gl,
     d3d11,
+    webgl,
 };
 
 pub const Error = error{
@@ -267,16 +275,22 @@ pub const ShaderStages = struct {
 /// on two backends ships two sources, or generates them - which is the seam
 /// a shader compiler slots into later without this struct changing shape.
 ///
-/// **The contract between the two languages** is where things are bound:
+/// **The contract between the languages** is where things are bound. The two
+/// GLSLs keep it the same way, because neither has `layout(binding = n)`:
 ///
-/// | | GLSL 330 | HLSL 5.0 |
+/// | | GLSL 330 and GLSL ES 300 | HLSL 5.0 |
 /// | --- | --- | --- |
 /// | Vertex attribute at location `n` | `layout(location = n) in` | semantic `ATTRn` |
 /// | Uniform buffer in slot `n` | block named in `PipelineDesc.uniform_blocks[n]`, `std140` | `register(bn)` |
 /// | Texture in slot `n` | sampler named in `PipelineDesc.textures[n]` | `register(tn)` and `register(sn)` |
 /// | Fragment colour | `out vec4` at location 0 | `SV_TARGET` |
 pub const ShaderDesc = struct {
+    /// GLSL 3.30 core, for the OpenGL backend.
     glsl: ?ShaderStages = null,
+    /// GLSL ES 3.00, for the WebGL backend: `#version 300 es` on the first
+    /// line, and a precision for `float` in the fragment stage.
+    glsl_es: ?ShaderStages = null,
+    /// HLSL for shader model 5.0, for the Direct3D 11 backend.
     hlsl: ?ShaderStages = null,
     label: []const u8 = "",
 };
@@ -401,11 +415,11 @@ pub const PipelineDesc = struct {
     depth: DepthState = .none,
     cull: CullMode = .none,
     front_face: FrontFace = .ccw,
-    /// GLSL only: the uniform block bound to each slot, by name, in slot
+    /// The GLSLs only: the uniform block bound to each slot, by name, in slot
     /// order. HLSL binds by `register(bn)` and ignores this.
     uniform_blocks: []const [:0]const u8 = &.{},
-    /// GLSL only: the `sampler2D` bound to each slot, by name, in slot order.
-    /// HLSL binds by `register(tn)`/`register(sn)` and ignores this.
+    /// The GLSLs only: the `sampler2D` bound to each slot, by name, in slot
+    /// order. HLSL binds by `register(tn)`/`register(sn)` and ignores this.
     textures: []const [:0]const u8 = &.{},
     /// What this pipeline draws into. A pass whose attachments differ is an
     /// error on the backends that check and wrong pixels on the ones that
@@ -510,7 +524,8 @@ pub const DeviceDesc = struct {
 pub const SurfaceDesc = struct {
     /// The window, as the platform's integer: an `HWND` on Windows. Ignored
     /// by the OpenGL backend, whose surface is the context's own framebuffer
-    /// and which therefore has exactly one.
+    /// and which therefore has exactly one - and by the WebGL backend, whose
+    /// one surface is the canvas the page made the context on.
     native_window: usize = 0,
     /// Zero means "the window's size".
     width: u32 = 0,
@@ -565,4 +580,6 @@ test "each backend names its clip space" {
     try testing.expectEqual(math.Clip.gl.depth, Backend.gl.clip().depth);
     try testing.expectEqual(math.Clip.d3d.depth, Backend.d3d11.clip().depth);
     try testing.expect(!Backend.d3d11.clip().flip_y);
+    // WebGL is OpenGL ES, and OpenGL ES keeps OpenGL's clip space.
+    try testing.expectEqual(Backend.gl.clip(), Backend.webgl.clip());
 }

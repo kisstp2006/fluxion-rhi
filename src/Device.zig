@@ -47,9 +47,24 @@ const resources = @import("resources.zig");
 const commands = @import("commands.zig");
 const backend = @import("backend.zig");
 
+/// Whether this is a build for a browser. The architecture decides it, as it
+/// does in `fluxion-webgl`: a wasm module reaches WebGL through its imports
+/// whatever the operating system field says.
+const is_wasm = switch (builtin.target.cpu.arch) {
+    .wasm32, .wasm64 => true,
+    else => false,
+};
+
 const none_backend = @import("backend/none.zig");
-const gl_backend = @import("backend/gl.zig");
+/// Everywhere but the web, where there is no OpenGL to load - only WebGL,
+/// which is imported rather than found.
+const gl_backend = if (!is_wasm) @import("backend/gl.zig") else void;
 const d3d11_backend = if (builtin.os.tag == .windows) @import("backend/d3d11.zig") else void;
+/// On the web, and under test everywhere: off wasm, `fluxion-webgl` answers
+/// from its stub, which is what lets the backend's bookkeeping be checked on
+/// a machine with no browser. A desktop program that asks for it outside a
+/// test is refused, because a stub draws nothing.
+const webgl_backend = if (is_wasm or builtin.is_test) @import("backend/webgl.zig") else void;
 
 const Device = @This();
 
@@ -79,7 +94,9 @@ log_len: usize = 0,
 
 /// Which backends this build could open. `.none` is always among them.
 pub fn available() []const types.Backend {
-    return if (builtin.os.tag == .windows)
+    return if (is_wasm)
+        &.{ .webgl, .none }
+    else if (builtin.os.tag == .windows)
         &.{ .d3d11, .gl, .none }
     else
         &.{ .gl, .none };
@@ -90,13 +107,22 @@ pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
         .none => .none,
         .gl => .gl,
         .d3d11 => .d3d11,
-        .auto => if (desc.gl != null) .gl else if (builtin.os.tag == .windows) .d3d11 else return error.Unsupported,
+        .webgl => .webgl,
+        .auto => if (desc.gl != null)
+            .gl
+        else if (builtin.os.tag == .windows)
+            .d3d11
+        else if (is_wasm)
+            .webgl
+        else
+            return error.Unsupported,
     };
 
     const opened = switch (chosen) {
         .none => try none_backend.open(gpa, desc),
-        .gl => try gl_backend.open(gpa, desc),
+        .gl => if (!is_wasm) try gl_backend.open(gpa, desc) else return error.Unsupported,
         .d3d11 => if (builtin.os.tag == .windows) try d3d11_backend.open(gpa, desc) else return error.Unsupported,
+        .webgl => if (is_wasm or builtin.is_test) try webgl_backend.open(gpa, desc) else return error.Unsupported,
     };
 
     return .{

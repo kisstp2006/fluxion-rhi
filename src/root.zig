@@ -4,9 +4,10 @@
 //!
 //! A render hardware interface: buffers, textures, samplers, shaders,
 //! pipelines and passes, described once as plain values and executed by a
-//! backend chosen when the device is made. Two backends today - OpenGL 3.3
-//! and Direct3D 11 - and a third, `none`, that accepts everything and draws
-//! nothing, for the machines that have no GPU and the tests that need none.
+//! backend chosen when the device is made. Three backends today - OpenGL
+//! 3.3, Direct3D 11 and WebGL 2 - and a fourth, `none`, that accepts
+//! everything and draws nothing, for the machines that have no GPU and the
+//! tests that need none.
 //!
 //!   `Device`     one backend, the resources on it, and the frame being recorded
 //!   `types`      everything a program says to a device, backend-free
@@ -126,5 +127,7 @@ test {
     _ = Device;
     _ = @import("backend/none.zig");
     _ = @import("backend/gl.zig");
+    // Against `fluxion-webgl`'s stub, on whatever machine the tests run on.
+    _ = @import("backend/webgl.zig");
     if (@import("builtin").os.tag == .windows) _ = @import("backend/d3d11.zig");
 }

@@ -137,6 +137,9 @@ pub const Window = struct {
                 .gl => .gl,
                 .d3d11 => .d3d11,
                 .none => .none,
+                // A browser's, and this is a desktop window: `Device` says
+                // `Unsupported`, which is the truth.
+                .webgl => .webgl,
             },
             .gl = if (self.backend == .gl) self.hooks() else null,
             .debug = options.debug,
@@ -218,6 +221,9 @@ pub const TestDevice = struct {
                 return .{ .window = null, .device = device };
             },
             .none => return .{ .window = null, .device = try rhi.Device.init(std.testing.allocator, .{ .backend = .none }) },
+            // There is no browser here to draw in. The backend's own suite
+            // runs against the stub; the picture is `examples/web.zig`'s.
+            .webgl => return error.SkipZigTest,
         }
     }
 

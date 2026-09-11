@@ -6,7 +6,7 @@
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x4163e3da0ff09bfa,
     .dependencies = .{
-        // The two backends, and what they are written against.
+        // The three backends, and what they are written against.
         .fluxion_gl = .{
             .url = "git+https://github.com/kisstp2006/fluxion-gl#7e833c2cb2f57c478ae25a31cba46bbb86577b3a",
             .hash = "fluxion_gl-0.1.0-F9AI4lllBQD0yBq6yPNEKl6jKSuuAzRujbxM6ufMsuku",
@@ -14,6 +14,14 @@
         .fluxion_d3d = .{
             .url = "git+https://github.com/kisstp2006/fluxion-d3d#a31ff973e67aa6809a939f01e2cce812b7ec8983",
             .hash = "fluxion_d3d-0.1.0-ufazEIAiBQAvb_lj9JVfe3Frau1qUW_zJgEN0NZTc9ex",
+        },
+        // Not lazy, though only a browser draws with it: off wasm it is the
+        // stub the WebGL backend's tests run against, and it has no
+        // dependencies of its own to fetch. Pinned to the commit that added
+        // the calls the backend binds by slot with.
+        .fluxion_webgl = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-webgl#d3208479305c9d1114837206dbd566e491c95cba",
+            .hash = "fluxion_webgl-0.1.0-8yvbdeY5AwCDBMbSWH8wZcT6KILV64Q3m-abrVt1Gh0Z",
         },
         // `Clip`: which clip space a device wants, so a projection is built
         // for the backend that was actually opened.
