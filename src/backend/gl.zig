@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-//! The OpenGL 3.3 core backend.
+//! The OpenGL 3.3 core and Android OpenGL ES 3.0 backend.
 //!
 //! The context is not made here and never will be: it comes through
 //! `GlHooks` from whoever opened the window, and this file starts where
@@ -18,10 +18,9 @@
 //! buffer binding changes, at the draw that uses it. That costs a handful of
 //! calls per draw that changes buffers and nothing otherwise.
 //!
-//! OpenGL 3.3 cannot instance and offset by a base vertex in the same draw -
-//! `glDrawElementsInstancedBaseVertex` is 4.2 - so a draw that asks for both
-//! is refused with `error.Unsupported`. Everything else in `Command` maps to
-//! one call.
+//! OpenGL 3.3 cannot instance and offset by a base vertex in the same draw,
+//! and OpenGL ES 3.0 has no base-vertex draw. Unsupported combinations are
+//! refused with `error.Unsupported`.
 //!
 //! **Uniform blocks and samplers are bound by name once**, when the pipeline
 //! is made, from `PipelineDesc.uniform_blocks` and `PipelineDesc.textures`.
@@ -29,6 +28,7 @@
 //! `setUniformBuffer(slot, ...)` mean the same thing on Direct3D.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -42,6 +42,8 @@ const commands = @import("../commands.zig");
 const Device = @import("../Device.zig");
 
 const Error = backend.Error;
+const is_gles = builtin.abi.isAndroid();
+const Api = if (is_gles) opengl.Gles else opengl.Gl;
 
 // -------------------------------------------------------------------------
 // The backend
@@ -50,7 +52,7 @@ const Error = backend.Error;
 const Gl = struct {
     gpa: Allocator,
     hooks: types.GlHooks,
-    api: opengl.Gl,
+    api: Api,
     debug: bool,
     renderer: [128]u8 = undefined,
     renderer_len: usize = 0,
@@ -155,12 +157,11 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!struct { backend.Impl,
         .surface = .{},
     };
 
-    // The whole 3.3 table, or the name of what was missing - which is what a
-    // 2.1 context or a context that is not current looks like.
     self.api.load(Resolver{ .hooks = hooks }) catch return error.NoDevice;
 
     const version = self.api.version() catch return error.NoDevice;
-    if (!version.atLeast(3, 3)) return error.NoDevice;
+    if (!version.atLeast(3, if (is_gles) 0 else 3)) return error.NoDevice;
+    if (is_gles and !hasEs3Functions(&self.api)) return error.NoDevice;
 
     if (self.api.string(c.renderer)) |name| {
         const n = @min(name.len, self.renderer.len);
@@ -173,7 +174,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!struct { backend.Impl,
     self.api.pixelStorei(c.unpack_alignment, 1);
     self.api.enable(c.scissor_test);
 
-    if (desc.debug) {
+    if (!is_gles and desc.debug) {
         if (self.api.debugMessageCallback) |set| {
             self.api.enable(c.debug_output);
             self.api.enable(c.debug_output_synchronous);
@@ -182,6 +183,24 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!struct { backend.Impl,
     }
 
     return .{ self, &vtable };
+}
+
+fn hasEs3Functions(api: *const Api) bool {
+    if (!is_gles) return true;
+    return api.genVertexArrays != null and
+        api.deleteVertexArrays != null and
+        api.bindVertexArray != null and
+        api.drawArraysInstanced != null and
+        api.drawElementsInstanced != null and
+        api.vertexAttribDivisor != null and
+        api.vertexAttribIPointer != null and
+        api.bindBufferBase != null and
+        api.getUniformBlockIndex != null and
+        api.uniformBlockBinding != null and
+        api.genSamplers != null and
+        api.deleteSamplers != null and
+        api.bindSampler != null and
+        api.samplerParameteri != null;
 }
 
 fn debugMessage(
@@ -432,11 +451,13 @@ fn createSampler(impl: backend.Impl, desc: types.SamplerDesc) Error!backend.Nati
     errdefer self.gpa.destroy(res);
 
     var name: gt.Uint = 0;
-    api.genSamplers(1, @ptrCast(&name));
-    api.samplerParameteri(name, c.texture_min_filter, @intCast(filterEnum(desc.min_filter)));
-    api.samplerParameteri(name, c.texture_mag_filter, @intCast(filterEnum(desc.mag_filter)));
-    api.samplerParameteri(name, c.texture_wrap_s, @intCast(wrapEnum(desc.wrap_u)));
-    api.samplerParameteri(name, c.texture_wrap_t, @intCast(wrapEnum(desc.wrap_v)));
+    const gen_samplers = if (is_gles) api.genSamplers.? else api.genSamplers;
+    const sampler_parameter_i = if (is_gles) api.samplerParameteri.? else api.samplerParameteri;
+    gen_samplers(1, @ptrCast(&name));
+    sampler_parameter_i(name, c.texture_min_filter, @intCast(filterEnum(desc.min_filter)));
+    sampler_parameter_i(name, c.texture_mag_filter, @intCast(filterEnum(desc.mag_filter)));
+    sampler_parameter_i(name, c.texture_wrap_s, @intCast(wrapEnum(desc.wrap_u)));
+    sampler_parameter_i(name, c.texture_wrap_t, @intCast(wrapEnum(desc.wrap_v)));
 
     res.* = .{ .name = name };
     return res;
@@ -460,7 +481,8 @@ fn wrapEnum(wrap: types.Wrap) gt.Enum {
 fn destroySampler(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(SamplerRes, native);
-    self.api.deleteSamplers(1, @ptrCast(&res.name));
+    const delete_samplers = if (is_gles) self.api.deleteSamplers.? else self.api.deleteSamplers;
+    delete_samplers(1, @ptrCast(&res.name));
     self.gpa.destroy(res);
 }
 
@@ -472,8 +494,10 @@ fn createShader(impl: backend.Impl, desc: types.ShaderDesc, log: *Io.Writer) Err
     const self = cast(impl);
     const api = &self.api;
 
-    const sources = desc.glsl orelse {
-        log.writeAll("fluxion-rhi: the OpenGL backend needs `ShaderDesc.glsl`, and none was given") catch {};
+    const sources = (if (is_gles) desc.glsl_es else desc.glsl) orelse {
+        log.print("fluxion-rhi: the {s} backend needs its GLSL source, and none was given", .{
+            if (is_gles) "OpenGL ES" else "OpenGL",
+        }) catch {};
         return error.ShaderFailed;
     };
 
@@ -503,7 +527,7 @@ fn createShader(impl: backend.Impl, desc: types.ShaderDesc, log: *Io.Writer) Err
     return res;
 }
 
-fn compileStage(api: *const opengl.Gl, kind: gt.Enum, source: [:0]const u8, log: *Io.Writer) Error!gt.Uint {
+fn compileStage(api: *const Api, kind: gt.Enum, source: [:0]const u8, log: *Io.Writer) Error!gt.Uint {
     const name = api.createShader(kind);
     errdefer api.deleteShader(name);
 
@@ -551,13 +575,15 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
 
     // The bindings GLSL 330 cannot state in the source, stated here once.
     api.useProgram(program);
+    const get_uniform_block_index = if (is_gles) api.getUniformBlockIndex.? else api.getUniformBlockIndex;
+    const uniform_block_binding = if (is_gles) api.uniformBlockBinding.? else api.uniformBlockBinding;
     for (desc.uniform_blocks, 0..) |name, slot| {
-        const index = api.getUniformBlockIndex(program, name.ptr);
+        const index = get_uniform_block_index(program, name.ptr);
         if (index == invalid_index) {
             log.print("uniform block `{s}` is not in the shader (or nothing reads it)", .{name}) catch {};
             return error.PipelineFailed;
         }
-        api.uniformBlockBinding(program, index, @intCast(slot));
+        uniform_block_binding(program, index, @intCast(slot));
     }
     for (desc.textures, 0..) |name, slot| {
         const location = api.getUniformLocation(program, name.ptr);
@@ -569,7 +595,8 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
     }
 
     var vao: gt.Uint = 0;
-    api.genVertexArrays(1, @ptrCast(&vao));
+    const gen_vertex_arrays = if (is_gles) api.genVertexArrays.? else api.genVertexArrays;
+    gen_vertex_arrays(1, @ptrCast(&vao));
 
     res.* = .{
         .program = program,
@@ -597,7 +624,8 @@ const invalid_index: gt.Uint = 0xFFFFFFFF;
 fn destroyPipeline(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(PipelineRes, native);
-    self.api.deleteVertexArrays(1, @ptrCast(&res.vao));
+    const delete_vertex_arrays = if (is_gles) self.api.deleteVertexArrays.? else self.api.deleteVertexArrays;
+    delete_vertex_arrays(1, @ptrCast(&res.vao));
     self.gpa.free(res.attributes);
     self.gpa.free(res.buffers);
     if (self.pipeline == res) self.pipeline = null;
@@ -668,7 +696,7 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
                 // Flipped: the top-left rectangle, measured from the bottom.
                 const y = @as(f32, @floatFromInt(self.target_height)) - v.y - v.height;
                 api.viewport(@intFromFloat(v.x), @intFromFloat(y), @intFromFloat(v.width), @intFromFloat(v.height));
-                api.depthRange(v.min_depth, v.max_depth);
+                if (is_gles) api.depthRangef(v.min_depth, v.max_depth) else api.depthRange(v.min_depth, v.max_depth);
             },
             .set_scissor => |maybe| if (maybe) |r| {
                 const y = @as(i32, @intCast(self.target_height)) - r.y - @as(i32, @intCast(r.height));
@@ -693,19 +721,22 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             },
             .set_uniform_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                api.bindBufferBase(c.uniform_buffer, b.slot, res.name);
+                const bind_buffer_base = if (is_gles) api.bindBufferBase.? else api.bindBufferBase;
+                bind_buffer_base(c.uniform_buffer, b.slot, res.name);
             },
             .set_texture => |b| {
                 const texture = as(TextureRes, device.textures.get(b.texture).?.native);
                 const sampler = as(SamplerRes, device.samplers.get(b.sampler).?.native);
                 api.activeTexture(c.texture0 + b.slot);
                 api.bindTexture(c.texture_2d, texture.name);
-                api.bindSampler(b.slot, sampler.name);
+                const bind_sampler = if (is_gles) api.bindSampler.? else api.bindSampler;
+                bind_sampler(b.slot, sampler.name);
             },
             .draw => |d| {
                 const pipeline = self.pipeline orelse return error.InvalidArgument;
                 flushBindings(self, pipeline);
-                api.drawArraysInstanced(pipeline.topology, @intCast(d.first_vertex), @intCast(d.vertex_count), @intCast(d.instance_count));
+                const draw_arrays_instanced = if (is_gles) api.drawArraysInstanced.? else api.drawArraysInstanced;
+                draw_arrays_instanced(pipeline.topology, @intCast(d.first_vertex), @intCast(d.vertex_count), @intCast(d.instance_count));
             },
             .draw_indexed => |d| {
                 const pipeline = self.pipeline orelse return error.InvalidArgument;
@@ -713,8 +744,9 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
                 const index = self.index orelse return error.InvalidArgument;
                 const offset = opengl.offset(@as(usize, d.first_index) * index.size);
                 if (d.base_vertex == 0) {
-                    api.drawElementsInstanced(pipeline.topology, @intCast(d.index_count), index.kind, offset, @intCast(d.instance_count));
-                } else if (d.instance_count == 1) {
+                    const draw_elements_instanced = if (is_gles) api.drawElementsInstanced.? else api.drawElementsInstanced;
+                    draw_elements_instanced(pipeline.topology, @intCast(d.index_count), index.kind, offset, @intCast(d.instance_count));
+                } else if (!is_gles and d.instance_count == 1) {
                     api.drawElementsBaseVertex(pipeline.topology, @intCast(d.index_count), index.kind, offset, d.base_vertex);
                 } else {
                     // `glDrawElementsInstancedBaseVertex` is OpenGL 4.2.
@@ -781,7 +813,7 @@ fn beginPass(self: *Gl, device: *Device, pass: types.RenderPassDesc) Error!void 
     }
     if (pass.depth) |depth| if (depth.load == .clear) {
         api.depthMask(gt.gl_true);
-        api.clearDepth(depth.clear_depth);
+        if (is_gles) api.clearDepthf(depth.clear_depth) else api.clearDepth(depth.clear_depth);
         api.clearStencil(depth.clear_stencil);
         mask |= c.depth_buffer_bit | c.stencil_buffer_bit;
     };
@@ -794,7 +826,8 @@ fn bindPipeline(self: *Gl, res: *PipelineRes) void {
     self.bindings_dirty = true;
 
     api.useProgram(res.program);
-    api.bindVertexArray(res.vao);
+    const bind_vertex_array = if (is_gles) api.bindVertexArray.? else api.bindVertexArray;
+    bind_vertex_array(res.vao);
 
     if (res.blend.enabled) {
         api.enable(c.blend);
@@ -832,6 +865,8 @@ fn flushBindings(self: *Gl, pipeline: *PipelineRes) void {
     if (!self.bindings_dirty) return;
     self.bindings_dirty = false;
     const api = &self.api;
+    const vertex_attrib_i_pointer = if (is_gles) api.vertexAttribIPointer.? else api.vertexAttribIPointer;
+    const vertex_attrib_divisor = if (is_gles) api.vertexAttribDivisor.? else api.vertexAttribDivisor;
 
     for (pipeline.attributes) |attribute| {
         const binding = self.vertex_bindings[attribute.buffer];
@@ -842,12 +877,12 @@ fn flushBindings(self: *Gl, pipeline: *PipelineRes) void {
         switch (attribute.format) {
             .float, .float2, .float3, .float4 => api.vertexAttribPointer(attribute.location, comps, c.float, gt.gl_false, @intCast(layout.stride), pointer),
             .ubyte4_norm => api.vertexAttribPointer(attribute.location, comps, c.unsigned_byte, gt.gl_true, @intCast(layout.stride), pointer),
-            .ubyte4 => api.vertexAttribIPointer(attribute.location, comps, c.unsigned_byte, @intCast(layout.stride), pointer),
-            .uint => api.vertexAttribIPointer(attribute.location, comps, c.unsigned_int, @intCast(layout.stride), pointer),
-            .int => api.vertexAttribIPointer(attribute.location, comps, c.int, @intCast(layout.stride), pointer),
+            .ubyte4 => vertex_attrib_i_pointer(attribute.location, comps, c.unsigned_byte, @intCast(layout.stride), pointer),
+            .uint => vertex_attrib_i_pointer(attribute.location, comps, c.unsigned_int, @intCast(layout.stride), pointer),
+            .int => vertex_attrib_i_pointer(attribute.location, comps, c.int, @intCast(layout.stride), pointer),
         }
         api.enableVertexAttribArray(attribute.location);
-        api.vertexAttribDivisor(attribute.location, if (layout.step == .instance) 1 else 0);
+        vertex_attrib_divisor(attribute.location, if (layout.step == .instance) 1 else 0);
     }
     if (self.index) |index| api.bindBuffer(c.element_array_buffer, index.name);
 }
