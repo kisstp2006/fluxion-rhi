@@ -72,9 +72,18 @@ const Gl = struct {
     vertex_bindings: [max_vertex_slots]VertexBinding = @splat(.{}),
     bindings_dirty: bool = false,
     index: ?IndexBinding = null,
+    /// A framebuffer made fresh for the multi-attachment pass in progress,
+    /// and torn down at `endPass` - unlike a single-attachment texture's own
+    /// framebuffer (`framebufferOf`), which is cached on the texture because
+    /// it is always the same one attachment; a texture written by more than
+    /// one target may appear in a different combination in a different pass.
+    mrt_framebuffer: ?gt.Uint = null,
 };
 
 const max_vertex_slots = 8;
+/// One more than any deferred pass here writes at once (geometry: colour and
+/// normal), with room to grow.
+const max_color_attachments = 4;
 
 const VertexBinding = struct {
     name: gt.Uint = 0,
@@ -686,6 +695,11 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             .begin_pass => |pass| try beginPass(self, device, pass),
             .end_pass => {
                 api.bindFramebuffer(c.framebuffer, 0);
+                if (self.mrt_framebuffer) |fbo| {
+                    var name = fbo;
+                    api.deleteFramebuffers(1, @ptrCast(&name));
+                    self.mrt_framebuffer = null;
+                }
                 self.pipeline = null;
             },
             .set_pipeline => |h| {
@@ -770,31 +784,41 @@ fn beginPass(self: *Gl, device: *Device, pass: types.RenderPassDesc) Error!void 
 
     var width: u32 = 0;
     var height: u32 = 0;
-    switch (pass.color.target) {
-        .surface => {
-            api.bindFramebuffer(c.framebuffer, 0);
-            const size = self.hooks.framebuffer_size(self.hooks.context);
-            width = size[0];
-            height = size[1];
-        },
-        .texture => |h| {
-            const res = as(TextureRes, device.textures.get(h).?.native);
-            api.bindFramebuffer(c.framebuffer, framebufferOf(self, res));
-            width = res.width;
-            height = res.height;
-            // Depth is attached to the colour texture's framebuffer for this
-            // pass, and detached after, so two passes into the same texture
-            // with different depth buffers do not see each other's.
-            if (pass.depth) |depth| {
-                const d = as(TextureRes, device.textures.get(depth.texture).?.native);
-                const attachment: gt.Enum = if (d.format.hasStencil()) c.depth_stencil_attachment else c.depth_attachment;
-                api.framebufferTexture2D(c.framebuffer, attachment, c.texture_2d, d.name, 0);
-            } else {
-                api.framebufferTexture2D(c.framebuffer, c.depth_stencil_attachment, c.texture_2d, 0, 0);
-            }
-            if (api.checkFramebufferStatus(c.framebuffer) != c.framebuffer_complete) return error.PipelineFailed;
-        },
+
+    if (pass.extra_colors.len > 0) {
+        if (pass.extra_colors.len + 1 > max_color_attachments) return error.Unsupported;
+        const size = try beginMrtPass(self, device, pass);
+        width = size[0];
+        height = size[1];
+    } else {
+        self.mrt_framebuffer = null;
+        switch (pass.color.target) {
+            .surface => {
+                api.bindFramebuffer(c.framebuffer, 0);
+                const size = self.hooks.framebuffer_size(self.hooks.context);
+                width = size[0];
+                height = size[1];
+            },
+            .texture => |h| {
+                const res = as(TextureRes, device.textures.get(h).?.native);
+                api.bindFramebuffer(c.framebuffer, framebufferOf(self, res));
+                width = res.width;
+                height = res.height;
+                // Depth is attached to the colour texture's framebuffer for
+                // this pass, and detached after, so two passes into the same
+                // texture with different depth buffers do not see each other's.
+                if (pass.depth) |depth| {
+                    const d = as(TextureRes, device.textures.get(depth.texture).?.native);
+                    const attachment: gt.Enum = if (d.format.hasStencil()) c.depth_stencil_attachment else c.depth_attachment;
+                    api.framebufferTexture2D(c.framebuffer, attachment, c.texture_2d, d.name, 0);
+                } else {
+                    api.framebufferTexture2D(c.framebuffer, c.depth_stencil_attachment, c.texture_2d, 0, 0);
+                }
+                if (api.checkFramebufferStatus(c.framebuffer) != c.framebuffer_complete) return error.PipelineFailed;
+            },
+        }
     }
+
     self.target_height = height;
     self.pipeline = null;
     self.bindings_dirty = true;
@@ -802,22 +826,72 @@ fn beginPass(self: *Gl, device: *Device, pass: types.RenderPassDesc) Error!void 
     api.viewport(0, 0, @intCast(width), @intCast(height));
     api.scissor(0, 0, @intCast(width), @intCast(height));
 
-    // A clear goes through the write masks, so they are opened first and the
-    // pipeline that follows sets them back.
-    var mask: gt.Bitfield = 0;
-    if (pass.color.load == .clear) {
-        api.colorMask(gt.gl_true, gt.gl_true, gt.gl_true, gt.gl_true);
-        const col = pass.color.clear_color;
-        api.clearColor(col[0], col[1], col[2], col[3]);
-        mask |= c.color_buffer_bit;
+    if (pass.extra_colors.len > 0) {
+        // A blanket `glClear` sets one colour for every draw buffer at once;
+        // each attachment here may want a different one, so each is cleared
+        // on its own.
+        const clear_buffer_fv = if (is_gles) api.clearBufferfv.? else api.clearBufferfv;
+        if (pass.color.load == .clear) clear_buffer_fv(c.color, 0, &pass.color.clear_color);
+        for (pass.extra_colors, 0..) |extra, i| {
+            if (extra.load == .clear) clear_buffer_fv(c.color, @intCast(i + 1), &extra.clear_color);
+        }
+        if (pass.depth) |depth| if (depth.load == .clear) {
+            const clear_buffer_fi = if (is_gles) api.clearBufferfi.? else api.clearBufferfi;
+            clear_buffer_fi(c.depth_stencil, 0, depth.clear_depth, @intCast(depth.clear_stencil));
+        };
+    } else {
+        // A clear goes through the write masks, so they are opened first and
+        // the pipeline that follows sets them back.
+        var mask: gt.Bitfield = 0;
+        if (pass.color.load == .clear) {
+            api.colorMask(gt.gl_true, gt.gl_true, gt.gl_true, gt.gl_true);
+            const col = pass.color.clear_color;
+            api.clearColor(col[0], col[1], col[2], col[3]);
+            mask |= c.color_buffer_bit;
+        }
+        if (pass.depth) |depth| if (depth.load == .clear) {
+            api.depthMask(gt.gl_true);
+            if (is_gles) api.clearDepthf(depth.clear_depth) else api.clearDepth(depth.clear_depth);
+            api.clearStencil(depth.clear_stencil);
+            mask |= c.depth_buffer_bit | c.stencil_buffer_bit;
+        };
+        if (mask != 0) api.clear(mask);
     }
-    if (pass.depth) |depth| if (depth.load == .clear) {
-        api.depthMask(gt.gl_true);
-        if (is_gles) api.clearDepthf(depth.clear_depth) else api.clearDepth(depth.clear_depth);
-        api.clearStencil(depth.clear_stencil);
-        mask |= c.depth_buffer_bit | c.stencil_buffer_bit;
-    };
-    if (mask != 0) api.clear(mask);
+}
+
+/// Builds the fresh framebuffer a multi-attachment pass draws into: `color`
+/// at attachment zero, `extra_colors` after it in order, `depth` shared by
+/// all of them. Returns the target size, taken from `color`'s texture.
+fn beginMrtPass(self: *Gl, device: *Device, pass: types.RenderPassDesc) Error![2]u32 {
+    const api = &self.api;
+
+    var fbo: gt.Uint = 0;
+    api.genFramebuffers(1, @ptrCast(&fbo));
+    api.bindFramebuffer(c.framebuffer, fbo);
+    self.mrt_framebuffer = fbo;
+
+    const primary = as(TextureRes, device.textures.get(pass.color.target.texture).?.native);
+    api.framebufferTexture2D(c.framebuffer, c.color_attachment0, c.texture_2d, primary.name, 0);
+
+    var draw_buffers: [max_color_attachments]gt.Enum = undefined;
+    draw_buffers[0] = c.color_attachment0;
+    for (pass.extra_colors, 0..) |extra, i| {
+        const res = as(TextureRes, device.textures.get(extra.target.texture).?.native);
+        const attachment = c.colorAttachment(@intCast(i + 1));
+        api.framebufferTexture2D(c.framebuffer, attachment, c.texture_2d, res.name, 0);
+        draw_buffers[i + 1] = attachment;
+    }
+    const draw_buffers_fn = if (is_gles) api.drawBuffers.? else api.drawBuffers;
+    draw_buffers_fn(@intCast(1 + pass.extra_colors.len), &draw_buffers);
+
+    if (pass.depth) |depth| {
+        const d = as(TextureRes, device.textures.get(depth.texture).?.native);
+        const attachment: gt.Enum = if (d.format.hasStencil()) c.depth_stencil_attachment else c.depth_attachment;
+        api.framebufferTexture2D(c.framebuffer, attachment, c.texture_2d, d.name, 0);
+    }
+
+    if (api.checkFramebufferStatus(c.framebuffer) != c.framebuffer_complete) return error.PipelineFailed;
+    return .{ primary.width, primary.height };
 }
 
 fn bindPipeline(self: *Gl, res: *PipelineRes) void {

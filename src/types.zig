@@ -43,6 +43,10 @@ pub const Backend = enum {
     /// only - and, under test, any build, where it talks to that library's
     /// stub instead of a page.
     webgl,
+    /// Vulkan 1.0, loaded at run time through `fluxion-vulkan`. Linux,
+    /// Windows and Android - wherever an ICD is installed, which is not
+    /// every machine with a GPU driver otherwise capable of it.
+    vulkan,
 
     pub fn clip(self: Backend) math.Clip {
         return switch (self) {
@@ -51,6 +55,11 @@ pub const Backend = enum {
             .d3d11 => .d3d,
             // OpenGL ES's, which is OpenGL's: depth from -1 to 1.
             .webgl => .gl,
+            // Zero to one like Direct3D, and - unlike it - NDC Y points
+            // down rather than up, which is `flip_y`. Unverified against a
+            // real driver in this port: no Vulkan ICD was available to
+            // check it on; see the port plan's open risks.
+            .vulkan => .{ .depth = .zero_to_one, .flip_y = true },
         };
     }
 };
@@ -66,6 +75,7 @@ pub const Select = enum {
     gl,
     d3d11,
     webgl,
+    vulkan,
 };
 
 pub const Error = error{
@@ -425,6 +435,9 @@ pub const PipelineDesc = struct {
     /// error on the backends that check and wrong pixels on the ones that
     /// do not, so it is stated here.
     color_format: Format = .rgba8_unorm,
+    /// The format of each of `RenderPassDesc.extra_colors`, in order, for a
+    /// pipeline meant to draw into a multi-attachment pass.
+    extra_color_formats: []const Format = &.{},
     depth_format: ?Format = null,
     label: []const u8 = "",
 };
@@ -482,6 +495,14 @@ pub const DepthAttachment = struct {
 
 pub const RenderPassDesc = struct {
     color: ColorAttachment,
+    /// Additional color attachments written by the same draws as `color`,
+    /// for a shader with more than one output - the geometry pass of a
+    /// deferred renderer, writing colour and normal in one draw over one
+    /// depth attachment. Every entry, and `color` itself once there are
+    /// any, must target a texture: multiple render targets into the
+    /// surface isn't something any backend supports, since there is
+    /// exactly one swapchain image.
+    extra_colors: []const ColorAttachment = &.{},
     depth: ?DepthAttachment = null,
 };
 

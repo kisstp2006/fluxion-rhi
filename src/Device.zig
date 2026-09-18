@@ -108,6 +108,7 @@ pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
         .gl => .gl,
         .d3d11 => .d3d11,
         .webgl => .webgl,
+        .vulkan => return error.Unsupported,
         .auto => if (desc.gl != null)
             .gl
         else if (builtin.os.tag == .windows)
@@ -123,6 +124,7 @@ pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
         .gl => if (!is_wasm) try gl_backend.open(gpa, desc) else return error.Unsupported,
         .d3d11 => if (builtin.os.tag == .windows) try d3d11_backend.open(gpa, desc) else return error.Unsupported,
         .webgl => if (is_wasm or builtin.is_test) try webgl_backend.open(gpa, desc) else return error.Unsupported,
+        .vulkan => return error.Unsupported,
     };
 
     return .{
@@ -386,6 +388,9 @@ fn validate(self: *Device, list: []const commands.Command) Error!void {
         switch (command) {
             .begin_pass => |pass| {
                 if (in_pass) return self.refuseAt(at, "beginPass inside a pass");
+                if (pass.extra_colors.len > 0 and pass.color.target != .texture) {
+                    return self.refuseAt(at, "beginPass: a multi-attachment pass cannot target the surface");
+                }
                 switch (pass.color.target) {
                     .surface => |h| if (!self.surfaces.contains(h)) return self.refuseAt(at, "beginPass: the surface is not alive"),
                     .texture => |h| {
@@ -393,6 +398,15 @@ fn validate(self: *Device, list: []const commands.Command) Error!void {
                         if (!texture.usage.render_target) return self.refuseAt(at, "beginPass: the colour texture was not made with usage.render_target");
                         if (texture.format.isDepth()) return self.refuseAt(at, "beginPass: a depth texture as the colour attachment");
                     },
+                }
+                for (pass.extra_colors) |extra| {
+                    const h = switch (extra.target) {
+                        .surface => return self.refuseAt(at, "beginPass: an extra color attachment cannot target the surface"),
+                        .texture => |h| h,
+                    };
+                    const texture = self.textures.get(h) orelse return self.refuseAt(at, "beginPass: an extra colour texture is not alive");
+                    if (!texture.usage.render_target) return self.refuseAt(at, "beginPass: an extra colour texture was not made with usage.render_target");
+                    if (texture.format.isDepth()) return self.refuseAt(at, "beginPass: a depth texture as an extra colour attachment");
                 }
                 if (pass.depth) |depth| {
                     const texture = self.textures.get(depth.texture) orelse return self.refuseAt(at, "beginPass: the depth texture is not alive");
@@ -617,5 +631,60 @@ test "a frame that makes sense goes through, and one that does not is named" {
         try cmd.beginPass(.{ .color = .{ .target = .{ .surface = surface } } });
         try cmd.endPass();
         try device.submit();
+    }
+}
+
+test "a multi-attachment pass validates every extra colour attachment too" {
+    var device = try nothing();
+    defer device.deinit();
+
+    const color = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const normal = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const not_a_target = try device.createTexture(.{ .width = 8, .height = 8 });
+    const surface = try device.createSurface(.{ .width = 8, .height = 8 });
+
+    // A good multi-attachment pass goes through.
+    {
+        const cmd = device.begin();
+        try cmd.beginPass(.{
+            .color = .{ .target = .{ .texture = color } },
+            .extra_colors = &.{.{ .target = .{ .texture = normal } }},
+        });
+        try cmd.endPass();
+        try device.submit();
+        try testing.expectEqual(@as(usize, 0), device.diagnostics().len);
+    }
+
+    // An extra attachment that isn't a render target is refused.
+    {
+        const cmd = device.begin();
+        try cmd.beginPass(.{
+            .color = .{ .target = .{ .texture = color } },
+            .extra_colors = &.{.{ .target = .{ .texture = not_a_target } }},
+        });
+        try cmd.endPass();
+        try testing.expectError(error.InvalidArgument, device.submit());
+        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "render_target") != null);
+    }
+
+    // A multi-attachment pass cannot target the surface, primary or extra.
+    {
+        const cmd = device.begin();
+        try cmd.beginPass(.{
+            .color = .{ .target = .{ .surface = surface } },
+            .extra_colors = &.{.{ .target = .{ .texture = normal } }},
+        });
+        try cmd.endPass();
+        try testing.expectError(error.InvalidArgument, device.submit());
+        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "surface") != null);
+    }
+    {
+        const cmd = device.begin();
+        try cmd.beginPass(.{
+            .color = .{ .target = .{ .texture = color } },
+            .extra_colors = &.{.{ .target = .{ .surface = surface } }},
+        });
+        try cmd.endPass();
+        try testing.expectError(error.InvalidArgument, device.submit());
     }
 }

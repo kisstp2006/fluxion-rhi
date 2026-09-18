@@ -140,6 +140,7 @@ pub const Window = struct {
                 // A browser's, and this is a desktop window: `Device` says
                 // `Unsupported`, which is the truth.
                 .webgl => .webgl,
+                .vulkan => .vulkan,
             },
             .gl = if (self.backend == .gl) self.hooks() else null,
             .debug = options.debug,
@@ -224,6 +225,8 @@ pub const TestDevice = struct {
             // There is no browser here to draw in. The backend's own suite
             // runs against the stub; the picture is `examples/web.zig`'s.
             .webgl => return error.SkipZigTest,
+            // No Vulkan backend exists yet.
+            .vulkan => return error.SkipZigTest,
         }
     }
 
