@@ -8,12 +8,12 @@
     .dependencies = .{
         // The three backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#aa40b987b6c787e23a17f6679f39c6e006c39da7",
-            .hash = "fluxion_gl-0.1.0-F9AI4lllBQDb6qQfOnn4WQc2om_ZQRYjwgi7UU8z4NzP",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#6de21b337c9a80721a1093a445b8691c8a92e84f",
+            .hash = "fluxion_gl-0.1.0-F9AI4lllBQDq5z6B6wmvCItf-G68zZivOMOiWLoeDItZ",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#5361f0659abac647634bff69a08a0dab6ccc9392",
-            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQDPLFfUJDTxq2EoMK1b9KdmHxgrw2tTFNDY",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#f3b12338fc7d673ea7ca5eb13cd452f714245ad0",
+            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQAupN9tRFPeKACcGN3skabmhH9_DUQXZvnc",
         },
         // Not lazy, though only a browser draws with it: off wasm it is the
         // stub the WebGL backend's tests run against, and it has no
@@ -41,8 +41,8 @@
         // `-Dexamples` is given. The library never opens a window and never
         // writes a file.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#f59b5bc8c504a1abb0fc0e1e5807f9cc364dc39a",
-            .hash = "fluxion_platform-0.1.0-WsOjUZ3mEwCC2n9VdBIhaYA07ujr8aTEpynZq4CSOmeR",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#65f360fa3484c241438def3856c5b48b4a3e8cc9",
+            .hash = "fluxion_platform-0.1.0-WsOjUR1ZFwANXOiIAk3n_vA70LebrBMH_PV2d4GPkjyB",
             .lazy = true,
         },
         .fluxion_image = .{
