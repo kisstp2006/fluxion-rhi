@@ -47,6 +47,10 @@ pub const Backend = enum {
     /// Windows and Android - wherever an ICD is installed, which is not
     /// every machine with a GPU driver otherwise capable of it.
     vulkan,
+    /// A backend the caller supplied to `Device.initWith`, none of the ones above.
+    /// `Info.name` says which it is, and `Device.clip` has its clip space, which
+    /// this function cannot know.
+    other,
 
     pub fn clip(self: Backend) math.Clip {
         return switch (self) {
@@ -60,6 +64,9 @@ pub const Backend = enum {
             // real driver in this port: no Vulkan ICD was available to
             // check it on; see the port plan's open risks.
             .vulkan => .{ .depth = .zero_to_one, .flip_y = true },
+            // Nothing to say about a backend this library has never seen; a
+            // device knows its own, see `Device.clip`.
+            .other => .gl,
         };
     }
 };
@@ -560,9 +567,12 @@ pub const Info = struct {
     /// What the driver calls itself. Points into the device; valid while it
     /// lives.
     renderer: []const u8,
+    /// What the backend is called: `gl`, `d3d11` and so on, or the name a caller
+    /// gave a backend of its own. `Device` fills it in, a backend need not.
+    name: []const u8 = "",
 
     pub fn format(self: Info, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("{t}: {s}", .{ self.backend, self.renderer });
+        try w.print("{s}: {s}", .{ if (self.name.len != 0) self.name else @tagName(self.backend), self.renderer });
     }
 };
 

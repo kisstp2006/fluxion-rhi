@@ -4,8 +4,11 @@
 //!
 //! A backend is a vtable and an opaque pointer, chosen when the device is made
 //! and never looked at again by anything outside `Device`. Adding one - Vulkan,
-//! Metal, Direct3D 12 - is a new file under `backend/` that fills this table,
-//! and one more arm in `Device.init`. Nothing a program calls changes.
+//! Metal, Direct3D 12 - is a new file that fills this table and an `Opener` that
+//! says how to open it. `Device.initWith` takes any opener, so a backend does not
+//! have to live in this library, and nothing has to be added to `Device`: the
+//! built-in ones are listed by `Device.opener`, and a program, or a registry it
+//! keeps, can hold openers of its own. Nothing a program calls changes.
 //!
 //! Every `native` here is whatever the backend allocated for a resource;
 //! `Device` stores it behind a handle and hands it back on every call. The
@@ -15,6 +18,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+
+const math = @import("fluxion_math");
 
 const types = @import("types.zig");
 const commands = @import("commands.zig");
@@ -60,5 +65,24 @@ pub const Vtable = struct {
     submit: *const fn (Impl, *Device, []const commands.Command) Error!void,
 };
 
-/// A backend's constructor: what `Device.init` calls.
-pub const Open = *const fn (gpa: Allocator, desc: types.DeviceDesc) Error!struct { Impl, *const Vtable };
+/// What opening a backend gives back: its state, and its table.
+pub const Opened = struct { Impl, *const Vtable };
+
+/// A backend's constructor: what `Device.init` and `Device.initWith` call.
+pub const Open = *const fn (gpa: Allocator, desc: types.DeviceDesc) Error!Opened;
+
+/// A way to open a device on one backend.
+///
+/// It is plain data, so a program can keep them in a list, or a registry can
+/// hold one per name. `Device.opener` has the ones this build brings; a backend
+/// written elsewhere - Metal, say - makes its own.
+pub const Opener = struct {
+    /// What it is called: "gl", "d3d11", "metal". Borrowed by every device it
+    /// opens, so it has to live as long as they do.
+    name: []const u8,
+    /// Which of the built-in backends this is, or `.other`.
+    tag: types.Backend = .other,
+    /// The clip space a projection for its devices is built for.
+    clip: math.Clip,
+    open: Open,
+};

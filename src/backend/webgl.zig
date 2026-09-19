@@ -136,7 +136,7 @@ const SurfaceRes = struct {
 // Opening
 // -------------------------------------------------------------------------
 
-pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!struct { backend.Impl, *const backend.Vtable } {
+pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     const gl: webgl.Context = .init();
     // Everything below is WebGL 2: vertex arrays, instancing, uniform blocks
     // and samplers are all core there, and the last two are in WebGL 1 in no

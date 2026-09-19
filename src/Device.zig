@@ -74,6 +74,9 @@ gpa: Allocator,
 impl: backend.Impl,
 vtable: *const backend.Vtable,
 tag: types.Backend,
+/// From the opener; borrowed.
+name: []const u8,
+clip_space: math.Clip,
 
 buffers: resources.BufferTable = .empty,
 textures: resources.TextureTable = .empty,
@@ -102,6 +105,37 @@ pub fn available() []const types.Backend {
         &.{ .gl, .none };
 }
 
+/// How to open one of the backends this build brings, or null if it does not
+/// bring it: `.vulkan` has no backend yet, `.other` is whatever a caller supplies,
+/// and the rest depend on the target.
+///
+/// A program that keeps its backends in a registry registers these by `name`.
+pub fn opener(which: types.Backend) ?backend.Opener {
+    return switch (which) {
+        .none => .{ .name = "none", .tag = .none, .clip = which.clip(), .open = none_backend.open },
+        .gl => if (!is_wasm) .{ .name = "gl", .tag = .gl, .clip = which.clip(), .open = gl_backend.open } else null,
+        .d3d11 => if (builtin.os.tag == .windows) .{ .name = "d3d11", .tag = .d3d11, .clip = which.clip(), .open = d3d11_backend.open } else null,
+        .webgl => if (is_wasm or builtin.is_test) .{ .name = "webgl", .tag = .webgl, .clip = which.clip(), .open = webgl_backend.open } else null,
+        .vulkan, .other => null,
+    };
+}
+
+/// Opens a device on the backend an opener describes: one of `opener`'s, or one
+/// the caller made. `desc.backend` is not looked at, the opener has already
+/// chosen. The opener's name is borrowed until `deinit`.
+pub fn initWith(gpa: Allocator, desc: types.DeviceDesc, how: backend.Opener) Error!Device {
+    const opened = try how.open(gpa, desc);
+    return .{
+        .gpa = gpa,
+        .impl = opened[0],
+        .vtable = opened[1],
+        .tag = how.tag,
+        .name = how.name,
+        .clip_space = how.clip,
+        .list = .init(gpa),
+    };
+}
+
 pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
     const chosen: types.Backend = switch (desc.backend) {
         .none => .none,
@@ -119,21 +153,7 @@ pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
             return error.Unsupported,
     };
 
-    const opened = switch (chosen) {
-        .none => try none_backend.open(gpa, desc),
-        .gl => if (!is_wasm) try gl_backend.open(gpa, desc) else return error.Unsupported,
-        .d3d11 => if (builtin.os.tag == .windows) try d3d11_backend.open(gpa, desc) else return error.Unsupported,
-        .webgl => if (is_wasm or builtin.is_test) try webgl_backend.open(gpa, desc) else return error.Unsupported,
-        .vulkan => return error.Unsupported,
-    };
-
-    return .{
-        .gpa = gpa,
-        .impl = opened[0],
-        .vtable = opened[1],
-        .tag = chosen,
-        .list = .init(gpa),
-    };
+    return initWith(gpa, desc, opener(chosen) orelse return error.Unsupported);
 }
 
 /// Destroy everything still alive, then the backend.
@@ -165,18 +185,23 @@ pub fn deinit(self: *Device) void {
     self.* = undefined;
 }
 
+/// Which of the built-in backends this is, or `.other` for one that came from
+/// `initWith`. `info().name` says which in either case.
 pub fn backendTag(self: *const Device) types.Backend {
     return self.tag;
 }
 
 pub fn info(self: *const Device) types.Info {
-    return self.vtable.info(self.impl);
+    var answer = self.vtable.info(self.impl);
+    answer.backend = self.tag;
+    answer.name = self.name;
+    return answer;
 }
 
 /// Which clip space a projection for this device is built for. Hand it to
 /// `fluxion-math`'s `perspective` and `orthographic`.
 pub fn clip(self: *const Device) math.Clip {
-    return self.tag.clip();
+    return self.clip_space;
 }
 
 /// The last shader log or validation message. Empty when nothing went wrong.
@@ -687,4 +712,66 @@ test "a multi-attachment pass validates every extra colour attachment too" {
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
     }
+}
+
+// -------------------------------------------------------------------------
+// Tests - choosing a backend
+// -------------------------------------------------------------------------
+
+test "every backend this build brings has an opener with its own name" {
+    for (available()) |tag| {
+        const how = opener(tag) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(@tagName(tag), how.name);
+        try testing.expectEqual(tag, how.tag);
+        try testing.expectEqual(tag.clip(), how.clip);
+    }
+    // there is no Vulkan backend yet, and `other` is whatever a caller makes
+    try testing.expect(opener(.vulkan) == null);
+    try testing.expect(opener(.other) == null);
+}
+
+test "a built-in opener opens the same device as init does" {
+    var by_init = try Device.init(testing.allocator, .{ .backend = .none });
+    defer by_init.deinit();
+    var by_opener = try Device.initWith(testing.allocator, .{}, opener(.none).?);
+    defer by_opener.deinit();
+
+    try testing.expectEqual(by_init.backendTag(), by_opener.backendTag());
+    try testing.expectEqual(types.Backend.none, by_opener.backendTag());
+    try testing.expectEqualStrings("none", by_opener.info().name);
+    try testing.expectEqualStrings(by_init.info().renderer, by_opener.info().renderer);
+    try testing.expectEqual(by_init.clip(), by_opener.clip());
+}
+
+test "initWith opens a backend the caller supplies, under its own name and clip space" {
+    const flipped: math.Clip = .{ .depth = .zero_to_one, .flip_y = true };
+    const mine: backend.Opener = .{ .name = "mine", .clip = flipped, .open = none_backend.open };
+
+    var device = try Device.initWith(testing.allocator, .{}, mine);
+    defer device.deinit();
+
+    try testing.expectEqual(types.Backend.other, device.backendTag());
+    try testing.expectEqualStrings("mine", device.info().name);
+    try testing.expectEqual(types.Backend.other, device.info().backend);
+    try testing.expectEqual(flipped, device.clip());
+
+    // it is a working device, not a label
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = 16 });
+    device.destroyBuffer(buffer);
+    try testing.expectError(error.InvalidHandle, device.updateBuffer(buffer, 0, &.{ 1, 2, 3, 4 }));
+
+    // and it prints under its name
+    var text: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&text);
+    try w.print("{f}", .{device.info()});
+    try testing.expectEqualStrings("mine: nothing at all", w.buffered());
+}
+
+fn refuses(_: Allocator, _: types.DeviceDesc) Error!backend.Opened {
+    return error.NoDevice;
+}
+
+test "an opener that refuses leaves nothing behind" {
+    const how: backend.Opener = .{ .name = "absent", .clip = .gl, .open = refuses };
+    try testing.expectError(error.NoDevice, Device.initWith(testing.allocator, .{}, how));
 }

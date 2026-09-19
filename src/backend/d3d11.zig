@@ -702,7 +702,7 @@ const SurfaceRes = struct {
     height: u32,
 };
 
-pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!struct { backend.Impl, *const backend.Vtable } {
+pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     var library = d3d.D3d11.load() catch return error.NoDevice;
     errdefer library.unload();
     var dxgi_library = d3d.Dxgi.load() catch return error.NoDevice;

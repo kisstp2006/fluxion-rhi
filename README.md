@@ -193,11 +193,22 @@ Fluxion WebGL's stub. The stub draws nothing, and a program that asked for
 `.webgl` on the desktop would get a device that answers every call and shows
 nothing - so outside a test it gets `error.Unsupported` instead.
 
-**Adding a backend** is one file under `src/backend/` that fills
-`backend.Vtable`, and one arm in `Device.init`. The list a backend receives
-has already been validated; what it has to get right is its own API, and the
-top-left origin. Vulkan and Direct3D 12 would record the same list into a
-real command buffer, which is why the list exists.
+**Choosing a backend without the enum.** `Device.init` picks from the backends
+above. A program that wants to decide some other way - by name, from a
+configuration file, from what a registry holds - uses openers: `Device.opener(tag)`
+returns the `Opener` of a built-in backend (`name`, `clip`, and the function that
+opens it), or null if this build does not bring it, and `Device.initWith(gpa,
+desc, opener)` opens a device on any opener. `Device.init` is `initWith` on the
+opener it chose.
+
+**Adding a backend** is one file that fills `backend.Vtable` and an `Opener`
+that says how to open it. It does not have to be in this library:
+`initWith` takes an opener from anywhere, and the device reports it as
+`Backend.other`, with the opener's `name` in `info()` and its `clip` from
+`Device.clip()`. The list a backend receives has already been validated; what
+it has to get right is its own API, and the top-left origin. Vulkan and Direct3D
+12 would record the same list into a real command buffer, which is why the
+list exists. A backend that lives here also gets a case in `Device.opener`.
 
 ## Examples
 

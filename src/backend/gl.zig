@@ -153,7 +153,7 @@ const SurfaceRes = struct {
 // Opening
 // -------------------------------------------------------------------------
 
-pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!struct { backend.Impl, *const backend.Vtable } {
+pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     const hooks = desc.gl orelse return error.NoDevice;
 
     const self = try gpa.create(Gl);

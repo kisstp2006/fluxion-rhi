@@ -67,6 +67,8 @@ pub const CommandList = commands.CommandList;
 pub const Command = commands.Command;
 
 pub const Backend = types.Backend;
+/// How to open a backend. See `backend.Opener` and `Device.initWith`.
+pub const Opener = backend.Opener;
 pub const Select = types.Select;
 pub const Error = types.Error;
 pub const Info = types.Info;
