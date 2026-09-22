@@ -624,6 +624,20 @@ fn closeExecuteAndWait(self: *D3d) Error!void {
     }
 }
 
+/// Blocks until the queue has finished everything submitted to it so far -
+/// including a `Present`, which `submit`'s own fence wait does not cover:
+/// that wait happens before `present` is ever called, and `Present` queues
+/// GPU-side work of its own (the flip, DWM's handoff) after it. Releasing a
+/// swap chain's back buffers while that work is still outstanding is a real
+/// Direct3D 12 debug-layer fault - "VerifyNotInUse" - not a false positive,
+/// so `destroySurface`/`resizeSurface` call this before touching any of
+/// them.
+fn waitForGpuIdle(self: *D3d) void {
+    self.fence_value += 1;
+    self.queue.vtable.Signal(self.queue, @ptrCast(self.fence), self.fence_value).check() catch return;
+    while (self.fence.vtable.GetCompletedValue(self.fence) < self.fence_value) {}
+}
+
 // -------------------------------------------------------------------------
 // Buffers
 // -------------------------------------------------------------------------
@@ -1099,6 +1113,7 @@ fn attachBackBuffers(self: *D3d, res: *SurfaceRes) Error!void {
 fn destroySurface(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(SurfaceRes, native);
+    waitForGpuIdle(self);
     for (res.back_buffers) |buf| _ = com.release(buf);
     _ = com.release(res.rtv_heap);
     _ = com.release(res.swap_chain);
@@ -1108,6 +1123,7 @@ fn destroySurface(impl: backend.Impl, native: backend.Native) void {
 fn resizeSurface(impl: backend.Impl, native: backend.Native, width: u32, height: u32) Error!void {
     const self = cast(impl);
     const res = as(SurfaceRes, native);
+    waitForGpuIdle(self);
     for (res.back_buffers) |buf| _ = com.release(buf);
     res.swap_chain.vtable.base.ResizeBuffers(@ptrCast(res.swap_chain), 0, width, height, .unknown, 0).check() catch return error.Failed;
     try attachBackBuffers(self, res);
