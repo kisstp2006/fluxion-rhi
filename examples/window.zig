@@ -160,7 +160,7 @@ pub const Window = struct {
             const handles = device.vulkanInstanceHandles() orelse return error.Unsupported;
             const surface = self.inner.win.createVulkanSurface(
                 handles.instance,
-                @ptrCast(handles.get_instance_proc_addr),
+                @ptrCast(@alignCast(handles.get_instance_proc_addr)),
                 null,
             ) catch return error.Unsupported;
             return device.createSurface(.{
