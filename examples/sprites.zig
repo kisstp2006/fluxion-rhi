@@ -250,15 +250,19 @@ const Renderer = struct {
         var log: Io.Writer.Allocating = .init(gpa);
         defer log.deinit();
 
-        var module = shader.compile(gpa, source, &log.writer) catch |err| {
+        var module = shader.compileWith(gpa, source, &log.writer, .{
+            .targets = shader.target.Set.text_targets.with(.spirv_vulkan),
+        }) catch |err| {
             std.debug.print("{s}\n", .{log.written()});
             return err;
         };
         errdefer module.deinit();
 
+        const spirv = module.output(.spirv_vulkan).words;
         const handle = device.createShader(.{
             .glsl = .{ .vertex = module.glsl.vertex, .fragment = module.glsl.fragment },
             .hlsl = .{ .vertex = module.hlsl.vertex, .fragment = module.hlsl.fragment },
+            .spirv = .{ .vertex = spirv.vertex, .fragment = spirv.fragment },
             .label = "sprites",
         }) catch |err| {
             std.debug.print("{s}\n", .{device.diagnostics()});

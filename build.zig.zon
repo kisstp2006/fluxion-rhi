@@ -62,9 +62,10 @@
         // once per backend. Lazy for the same reason as the rest: this
         // library takes shader source as text and does not care where the
         // text came from.
+        //
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#929418fd6bcdd887414d3cda2328684b50368bd8",
-            .hash = "fluxion_shader-0.1.0-FqFMEmaMAwA0kjWxXizOFk30I7U5UDuPgk-063ElX_5X",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#ab1646e71cc2b21aa147efb81e033bb35b8aaeb8",
+            .hash = "fluxion_shader-0.1.0-FqFMEv42BwDX3OTutO_2lx_Iv2EX8d-aDpq9abQEK-o2",
             .lazy = true,
         },
     },
