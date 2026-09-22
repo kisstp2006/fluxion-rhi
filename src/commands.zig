@@ -31,6 +31,10 @@ pub const Command = union(enum) {
     set_texture: TextureBinding,
     draw: Draw,
     draw_indexed: DrawIndexed,
+    /// Fill every mip level below the first from the first. Outside a pass,
+    /// and in list order: what an earlier pass drew into level zero is what
+    /// gets filtered.
+    generate_mips: types.Texture,
 
     pub const VertexBinding = struct {
         slot: u32,
@@ -141,6 +145,10 @@ pub const CommandList = struct {
     pub fn drawIndexed(self: *CommandList, args: Command.DrawIndexed) Allocator.Error!void {
         try self.push(.{ .draw_indexed = args });
     }
+
+    pub fn generateMips(self: *CommandList, texture: types.Texture) Allocator.Error!void {
+        try self.push(.{ .generate_mips = texture });
+    }
 };
 
 test "a list is the commands in the order they were recorded" {
@@ -151,9 +159,11 @@ test "a list is the commands in the order they were recorded" {
     try list.setPipeline(.none);
     try list.draw(.{ .vertex_count = 3 });
     try list.endPass();
+    try list.generateMips(.none);
 
     const recorded = list.commands();
-    try std.testing.expectEqual(@as(usize, 4), recorded.len);
+    try std.testing.expectEqual(@as(usize, 5), recorded.len);
+    try std.testing.expectEqual(std.meta.Tag(Command).generate_mips, std.meta.activeTag(recorded[4]));
     try std.testing.expectEqual(std.meta.Tag(Command).begin_pass, std.meta.activeTag(recorded[0]));
     try std.testing.expectEqual(@as(u32, 3), recorded[2].draw.vertex_count);
     try std.testing.expectEqual(@as(u32, 1), recorded[2].draw.instance_count);

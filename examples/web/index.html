@@ -38,21 +38,38 @@
   // what to load and where to say how the check went.
   import { Fluxion } from "./fluxion-webgl.js";
 
+  // The extensions the backend can see the effect of, and what it makes of
+  // them: fluxion-webgl has no getExtension, so the page switches them on
+  // before the module is instantiated, and the module's caps are computed from
+  // what then works - float colour targets when the first two are on, and
+  // anisotropic filtering when the third is. A browser without one is not an
+  // error; the module's caps say no and the check skips what needed it.
+  const extensions = [
+    "EXT_color_buffer_float",
+    "EXT_color_buffer_half_float",
+    "EXT_texture_filter_anisotropic",
+  ];
+
   const verdict = document.getElementById("verdict");
   try {
     const fluxion = new Fluxion(document.getElementById("canvas"));
     fluxion.resize();
+    // `?bare` leaves them off, to see what the caps make of a page that did not.
+    const wanted = new URLSearchParams(location.search).has("bare") ? [] : extensions;
+    const enabled = wanted.filter((name) => fluxion.gl.getExtension(name));
 
     const app = await fluxion.instantiate("./rhi-web.wasm");
     if (!app.init()) throw new Error("init failed - the console says why");
 
     const run = app.checks();
     const failed = app.failures();
+    const skipped = app.skipped();
     // Kept where a test driving the page can read it.
-    window.selfCheck = { run, failed, webgl2: fluxion.isWebGL2 };
+    window.selfCheck = { run, failed, skipped, enabled, webgl2: fluxion.isWebGL2 };
+    const left = skipped === 0 ? "" : `, ${skipped} skipped because the caps say no`;
     verdict.textContent = failed === 0
-      ? `self-check: all ${run} passed`
-      : `self-check: ${failed} of ${run} wrong - the console says which`;
+      ? `self-check: all ${run} passed${left}`
+      : `self-check: ${failed} of ${run} wrong${left} - the console says which`;
     verdict.className = failed === 0 ? "ok" : "bad";
 
     fluxion.run(app.frame);

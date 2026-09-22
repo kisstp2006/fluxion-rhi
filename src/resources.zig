@@ -23,10 +23,24 @@ pub const BufferEntry = struct {
 
 pub const TextureEntry = struct {
     native: *anyopaque,
+    dimension: types.Dimension = .d2,
     width: u32,
     height: u32,
+    /// The depth of a volume or the layers of an array; one otherwise, and
+    /// six for a cube - so it is always how many `z` values there are at
+    /// level zero.
+    depth_or_layers: u32 = 1,
+    /// Never zero: a request for the whole chain has been counted.
+    mip_levels: u32 = 1,
+    samples: u32 = 1,
     format: types.Format,
     usage: types.TextureUsage,
+
+    /// Layers, faces or slices at this mip level: a volume shrinks in depth
+    /// with everything else, and an array or a cube does not.
+    pub fn slices(self: TextureEntry, mip: u32) u32 {
+        return if (self.dimension == .d3) types.mipExtent(self.depth_or_layers, mip) else self.depth_or_layers;
+    }
 };
 
 pub const SamplerEntry = struct {
@@ -43,8 +57,9 @@ pub const PipelineEntry = struct {
     /// How many vertex buffer slots the pipeline reads, so a draw with fewer
     /// bound is caught before the driver reads memory that is not there.
     buffer_slots: u32,
-    color_format: types.Format,
+    color_format: ?types.Format,
     depth_format: ?types.Format,
+    samples: u32,
 };
 
 pub const SurfaceEntry = struct {

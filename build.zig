@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
 
     const gl = b.dependency("fluxion_gl", .{ .target = target, .optimize = optimize });
     const d3d = b.dependency("fluxion_d3d", .{ .target = target, .optimize = optimize });
+    const vulkan = b.dependency("fluxion_vulkan", .{ .target = target, .optimize = optimize });
     const math = b.dependency("fluxion_math", .{ .target = target, .optimize = optimize });
     const id = b.dependency("fluxion_id", .{ .target = target, .optimize = optimize });
     const webgl = b.dependency("fluxion_webgl", .{ .target = target, .optimize = optimize });
@@ -24,6 +25,7 @@ pub fn build(b: *std.Build) void {
             // refuses to compile anywhere else, and `Device` never names it
             // there.
             .{ .name = "fluxion_d3d", .module = d3d.module("fluxion_d3d") },
+            .{ .name = "fluxion_vulkan", .module = vulkan.module("fluxion_vulkan") },
             .{ .name = "fluxion_math", .module = math.module("fluxion_math") },
             .{ .name = "fluxion_id", .module = id.module("fluxion_id") },
             // A browser's WebGL on wasm, and a stub on every other target -

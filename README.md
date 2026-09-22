@@ -165,6 +165,7 @@ without the version as GLSL ES 1.00.
 | --- | --- | --- | --- |
 | `gl` | Anywhere with OpenGL 3.3 core | `DeviceDesc.gl`: a context, current on this thread | `GlHooks.swap_buffers`; one surface, the context's own framebuffer |
 | `d3d11` | Windows | Nothing; `d3d11.dll` is found at run time | A flip-model swap chain on the `HWND` in `SurfaceDesc` |
+| `vulkan` | Windows (in progress) | Vulkan loader plus `VK_KHR_surface`, `VK_KHR_win32_surface` and `VK_KHR_swapchain` | A Vulkan swapchain on the `HWND` and `HINSTANCE` in `SurfaceDesc` |
 | `webgl` | A browser, from a `wasm32` build | Nothing; the page made the context, and Fluxion WebGL's glue hands it over | Returning from the frame callback; one surface, the canvas |
 | `none` | Everywhere | Nothing | Nothing |
 

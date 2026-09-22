@@ -12,8 +12,16 @@
             .hash = "fluxion_gl-0.1.0-F9AI4lllBQBbpch-Fd-yQUDa-x6sReqCfoTP9-fGEsu2",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#0b280e51d6827220bd4013bc49f1fd0f3aab7362",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#b98b622667f32fc8344091131d76ffb60517918b",
             .hash = "fluxion_d3d-0.1.0-ufazEIAiBQCAfjkn2wJAWWvWZoLB2DgRJ3wOWw6cFfwC",
+        },
+        // The Vulkan loader and generated ABI. The RHI opens it at run time,
+        // just as the Direct3D backend opens its system DLLs. Pinned to the
+        // commit with `src/gen/` (every generated struct/command past the
+        // loader's own door) pushed.
+        .fluxion_vulkan = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-vulkan#7bec633080135d3891a15a53f3467058bd1b2b7e",
+            .hash = "fluxion_vulkan-0.1.0-8VC-cTC0EwBjdBAPtcHQiPoCbsJSPmfWRKr24UFq4U9Y",
         },
         // Not lazy, though only a browser draws with it: off wasm it is the
         // stub the WebGL backend's tests run against, and it has no

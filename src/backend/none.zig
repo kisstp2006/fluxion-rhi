@@ -43,15 +43,16 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) backend.Error!backend.Opened
     return .{ self, &vtable };
 }
 
-const vtable: backend.Vtable = .{
+pub const vtable: backend.Vtable = .{
     .deinit = deinit,
     .info = info,
+    .caps = caps,
     .createBuffer = createBuffer,
     .destroyBuffer = destroyResource,
     .updateBuffer = updateBuffer,
     .createTexture = createTexture,
     .destroyTexture = destroyResource,
-    .updateTexture = updateTexture,
+    .writeTexture = writeTexture,
     .readTexture = readTexture,
     .createSampler = createSampler,
     .destroySampler = destroyResource,
@@ -91,6 +92,36 @@ fn info(impl: backend.Impl) types.Info {
     return .{ .backend = .none, .renderer = "nothing at all" };
 }
 
+/// It accepts everything, so it says it can do everything a real device could
+/// be asked - which is what lets a test of render code run here and mean the
+/// same on every backend that says yes.
+fn caps(impl: backend.Impl) types.Caps {
+    _ = impl;
+    var answer: types.Caps = .{
+        .limits = .{
+            .max_texture_2d = 16384,
+            .max_texture_3d = 2048,
+            .max_texture_cube = 16384,
+            .max_texture_layers = 2048,
+            .max_anisotropy = 16,
+            .max_color_attachments = 8,
+        },
+        .features = .{ .sampler_border = true, .sampler_lod_bias = true, .compressed_partial_blocks = true },
+    };
+    for (std.enums.values(types.Format)) |format| {
+        const plain = !format.isCompressed();
+        answer.formats.set(format, .{
+            .sampled = true,
+            .filterable = true,
+            .render_target = plain,
+            .blendable = plain and !format.isDepth(),
+            .generate_mips = plain and !format.isDepth(),
+            .sample_counts = if (plain) 0b1111 else 0b1,
+        });
+    }
+    return answer;
+}
+
 fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) backend.Error!backend.Native {
     _ = desc;
     return make(cast(impl), .{});
@@ -111,17 +142,28 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) backend.Error!back
     return make(cast(impl), .{ .width = desc.width, .height = desc.height, .format = desc.format });
 }
 
-fn updateTexture(impl: backend.Impl, native: backend.Native, bytes: []const u8, row_pitch: usize) backend.Error!void {
+fn writeTexture(
+    impl: backend.Impl,
+    native: backend.Native,
+    region: types.TextureRegion,
+    bytes: []const u8,
+    row_pitch: usize,
+    slice_pitch: usize,
+) backend.Error!void {
     _ = impl;
     _ = native;
+    _ = region;
     _ = bytes;
     _ = row_pitch;
+    _ = slice_pitch;
 }
 
-fn readTexture(impl: backend.Impl, native: backend.Native, gpa: Allocator) backend.Error![]u8 {
+fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresource, gpa: Allocator) backend.Error![]u8 {
     _ = impl;
     const r = resource(native);
-    const pixels = try gpa.alloc(u8, @as(usize, r.width) * r.height * 4);
+    const width = types.mipExtent(r.width, sub.mip);
+    const height = types.mipExtent(r.height, sub.mip);
+    const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
     @memset(pixels, 0);
     return pixels;
 }
