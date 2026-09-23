@@ -8,12 +8,12 @@
     .dependencies = .{
         // The three backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#b21ef94e8f16529438a4fb156500ba9ceaf5223b",
-            .hash = "fluxion_gl-0.1.0-F9AI4lllBQBbpch-Fd-yQUDa-x6sReqCfoTP9-fGEsu2",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#a41181c8c949b44e76a10a864614e6f44f6608cb",
+            .hash = "fluxion_gl-0.1.0-F9AI4lllBQCLkFoAt8mv5nX1Ql2Coog5Bj2MRJIRO5kf",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#b98b622667f32fc8344091131d76ffb60517918b",
-            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQCAfjkn2wJAWWvWZoLB2DgRJ3wOWw6cFfwC",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#6e683e223ec04ea2c31cf9f800e3fc3463219c46",
+            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQBwS3hP4YpGg_IQ-2FFzZC8PXcqfpcB9ltL",
         },
         // The Vulkan loader and generated ABI. The RHI opens it at run time,
         // just as the Direct3D backend opens its system DLLs. Pinned to the
@@ -49,8 +49,8 @@
         // `-Dexamples` is given. The library never opens a window and never
         // writes a file.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#fa246b1be8b3edfe827422094d049ec75ef20929",
-            .hash = "fluxion_platform-0.1.0-WsOjUUdvFwBsx5RDEUqSL2wtPm-7WSZLQ9Hfh-Q5WEvP",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#a3f3707277d8a4fdc8100a6edd85bc779284de52",
+            .hash = "fluxion_platform-0.1.0-WsOjUUdvFwCsEYeB1XX5RhTBrRB3ElWncnw7VZ6cR99F",
             .lazy = true,
         },
         .fluxion_image = .{
