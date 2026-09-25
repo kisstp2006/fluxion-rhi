@@ -66,6 +66,7 @@ pub const Format = enum(u32) {
     r32_uint = 42,
     r32_sint = 43,
     r16_uint = 57,
+    r8_unorm = 61,
     b8g8r8a8_unorm = 87,
     _,
 };

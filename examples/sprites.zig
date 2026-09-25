@@ -600,19 +600,21 @@ test "the sprites on OpenGL" {
     try checkFrame(pixels, scene);
 }
 
-test "both backends draw the same picture" {
-    // Not pixel-identical - two rasterisers round differently at the edges of
-    // a disc - but the same picture: the great majority of pixels agree to
-    // within a little.
-    const a = frameOn(.d3d11, testing.allocator) catch |err| switch (err) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return err,
-    };
+test "the sprites on Direct3D 12" {
+    const pixels = try frameOn(.d3d12, testing.allocator);
+    defer testing.allocator.free(pixels);
+    var scene: Scene = .init(test_width, test_height);
+    scene.step(1.0);
+    try checkFrame(pixels, scene);
+}
+
+/// Whether two backends drew the same picture. Not pixel-identical - two
+/// rasterisers round differently at the edges of a disc - but the same
+/// picture: the great majority of pixels agree to within a little.
+fn expectSamePicture(first: rhi.Backend, second: rhi.Backend) !void {
+    const a = try frameOn(first, testing.allocator);
     defer testing.allocator.free(a);
-    const b = frameOn(.gl, testing.allocator) catch |err| switch (err) {
-        error.SkipZigTest => return error.SkipZigTest,
-        else => return err,
-    };
+    const b = try frameOn(second, testing.allocator);
     defer testing.allocator.free(b);
 
     var agree: usize = 0;
@@ -628,4 +630,24 @@ test "both backends draw the same picture" {
         if (close) agree += 1;
     }
     try testing.expect(agree * 100 / total >= 97);
+}
+
+test "Direct3D 11 and OpenGL draw the same picture" {
+    try expectSamePicture(.d3d11, .gl);
+}
+
+test "Direct3D 12 draws the picture Direct3D 11 does" {
+    try expectSamePicture(.d3d11, .d3d12);
+}
+
+test "the sprites on Vulkan" {
+    const pixels = try frameOn(.vulkan, testing.allocator);
+    defer testing.allocator.free(pixels);
+    var scene: Scene = .init(test_width, test_height);
+    scene.step(1.0);
+    try checkFrame(pixels, scene);
+}
+
+test "Vulkan draws the picture Direct3D 11 does, the same way up" {
+    try expectSamePicture(.d3d11, .vulkan);
 }

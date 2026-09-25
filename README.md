@@ -10,6 +10,8 @@ One way to draw, on whichever API the machine has. For Zig 0.16.
 | `backend` | What a backend has to answer to: a vtable of twenty calls. The seam a new one is written against. |
 | `backend/gl` | OpenGL 3.3 core, on a context somebody else made, through [Fluxion GL](https://github.com/kisstp2006/fluxion-gl). |
 | `backend/d3d11` | Direct3D 11 at feature level 11.0, through [Fluxion D3D](https://github.com/kisstp2006/fluxion-d3d). Windows only. |
+| `backend/d3d12` | Direct3D 12 at feature level 11.0, through Fluxion D3D. Windows only. Experimental: 2D textures, one level. |
+| `backend/vulkan` | Vulkan 1.0 with `VK_KHR_maintenance1`, through [Fluxion Vulkan](https://github.com/kisstp2006/fluxion-vulkan). Experimental: 2D textures, one level. |
 | `backend/webgl` | WebGL 2 in a browser, through [Fluxion WebGL](https://github.com/kisstp2006/fluxion-webgl). A `wasm32` build only. |
 | `backend/none` | Accepts everything, draws nothing. For build servers, headless programs and tests. |
 
@@ -80,10 +82,21 @@ both and read the same pixels back.
 
 **Nothing here opens a window.** A device is made from what somebody else
 made: a `getProcAddress` and a `swapBuffers` for OpenGL, an `HWND` for
-Direct3D, the page's canvas for WebGL. [Fluxion Platform](https://github.com/kisstp2006/fluxion-platform)
-provides the first two, and so do GLFW and SDL; the page and
+Direct3D, the window's way to make a `VkSurfaceKHR` for Vulkan
+(`SurfaceDesc.window`), the page's canvas for WebGL. [Fluxion Platform](https://github.com/kisstp2006/fluxion-platform)
+provides all but the last, and GLFW and SDL the same; the page and
 [Fluxion WebGL](https://github.com/kisstp2006/fluxion-webgl)'s glue provide
-the third. The library depends on none of them for that.
+the canvas. The library depends on none of them for that. A program that
+describes its window once - its handle and its hooks - opens a surface with
+the same `SurfaceDesc` on every backend.
+
+**One program for every backend.** The same calls, the same shader handed
+over in every language it is written in (Fluxion Shader writes them all from
+one source), the same picture: the origin at the top left everywhere, a
+texture drawn into sampled with the coordinates of one uploaded - except on
+OpenGL and WebGL, which `Features.render_target_origin_bottom_left` says -
+and clip space as `Device.clip()` says. Nothing above the library asks which
+backend it is on.
 
 Nothing here allocates except through the allocator handed to `Device.init`.
 
@@ -159,19 +172,31 @@ the two are not interchangeable, even where the text below the first line is
 the same: WebGL wants `#version 300 es` and a precision, and compiles a shader
 without the version as GLSL ES 1.00.
 
-## Three backends, and a fourth
+## The backends
 
 | Backend | Where | Needs | How it presents |
 | --- | --- | --- | --- |
 | `gl` | Anywhere with OpenGL 3.3 core | `DeviceDesc.gl`: a context, current on this thread | `GlHooks.swap_buffers`; one surface, the context's own framebuffer |
 | `d3d11` | Windows | Nothing; `d3d11.dll` is found at run time | A flip-model swap chain on the `HWND` in `SurfaceDesc` |
-| `vulkan` | Windows (in progress) | Vulkan loader plus `VK_KHR_surface`, `VK_KHR_win32_surface` and `VK_KHR_swapchain` | A Vulkan swapchain on the `HWND` and `HINSTANCE` in `SurfaceDesc` |
+| `d3d12` | Windows | Nothing; `d3d12.dll` and `d3dcompiler_47.dll` are found at run time | A flip-model swap chain on the `HWND` in `SurfaceDesc` |
+| `vulkan` | Windows, Linux, Android | A Vulkan loader, and a device with `VK_KHR_swapchain` and `VK_KHR_maintenance1` | A swapchain on the surface `SurfaceDesc.window` makes, or the one in `vulkan_surface` |
 | `webgl` | A browser, from a `wasm32` build | Nothing; the page made the context, and Fluxion WebGL's glue hands it over | Returning from the frame callback; one surface, the canvas |
 | `none` | Everywhere | Nothing | Nothing |
 
 `Device.init(.{})` with `.backend = .auto` takes OpenGL when hooks were given,
-Direct3D on Windows otherwise and WebGL on the web; it never chooses `none`
-on its own. `Device.available()` lists what this build could open.
+Direct3D 11 on Windows otherwise and WebGL on the web; it never chooses
+`none`, Direct3D 12 or Vulkan on its own. `Device.available()` lists what this
+build could open.
+
+**Direct3D 12 and Vulkan are experimental.** Both draw everything a 2D
+renderer asks - textures drawn into and sampled after, written in part and
+read back, `rgba8`, `bgra8` and `r8`, blending, instancing, scissors - and draw
+the picture Direct3D 11 does, which the sprites example's tests check. Both
+are narrower than it: 2D textures only, one mip level, one sample, no depth,
+no anisotropy, and every submit waits for the GPU. Vulkan gives every
+viewport a negative height, so its clip space is Direct3D's. With
+`DeviceDesc.debug` it turns the Khronos validation layer on, when one is
+installed.
 
 **What the OpenGL backend cannot do**, and says so: instancing and a base
 vertex in the same indexed draw (`glDrawElementsInstancedBaseVertex` is 4.2),
@@ -208,15 +233,15 @@ that says how to open it. It does not have to be in this library:
 `Backend.other`, with the opener's `name` in `info()` and its `clip` from
 `Device.clip()`. The list a backend receives has already been validated; what
 it has to get right is its own API, and the top-left origin. Vulkan and Direct3D
-12 would record the same list into a real command buffer, which is why the
-list exists. A backend that lives here also gets a case in `Device.opener`.
+12 record the same list into a real command buffer, which is why the list
+exists. A backend that lives here also gets a case in `Device.opener`.
 
 ## Examples
 
 | Example | What it shows |
 | --- | --- |
 | `zig build example` | Which backends this build has; a frame validated against `none`; a triangle through Direct3D's software rasteriser with no window anywhere, printed as text. |
-| `zig build example-sprites` | 2D: two dozen textured sprites bouncing in a window, in one instanced draw, with alpha blending and a top-left orthographic matrix, from one shader source compiled into both languages and an atlas read off the disk. `-- --backend gl` or `d3d11`; `-- --capture out.png` draws one frame to a file instead. |
+| `zig build example-sprites` | 2D: two dozen textured sprites bouncing in a window, in one instanced draw, with alpha blending and a top-left orthographic matrix, from one shader source compiled into every language and an atlas read off the disk. `-- --backend gl`, `d3d11`, `d3d12` or `vulkan`; `-- --capture out.png` draws one frame to a file instead. |
 | `zig build example-web` | The WebGL backend in a browser, built into `zig-out/web` with a page and Fluxion WebGL's glue. It checks its own work before drawing anything - a pattern drawn into a texture and read back - and puts the verdict on the page. Serve the directory and open it; see below. |
 
 The web example's check is the test a stub cannot be. Before the first frame

@@ -61,9 +61,8 @@ const none_backend = @import("backend/none.zig");
 const gl_backend = if (!is_wasm) @import("backend/gl.zig") else void;
 const d3d11_backend = if (builtin.os.tag == .windows) @import("backend/d3d11.zig") else void;
 const d3d12_backend = if (builtin.os.tag == .windows) @import("backend/d3d12.zig") else void;
-/// The Vulkan backend's loader is already used to distinguish a missing
-/// Vulkan installation from an RHI backend that has not been implemented; its
-/// `open` still answers `error.Unsupported` until it has a `Vtable`.
+/// Vulkan, wherever a loader can be; a machine without one answers
+/// `error.NoDevice` when it is opened.
 const vulkan_backend = if (!is_wasm) @import("backend/vulkan.zig") else void;
 /// On the web, and under test everywhere: off wasm, `fluxion-webgl` answers
 /// from its stub, which is what lets the backend's bookkeeping be checked on
@@ -105,10 +104,10 @@ log_len: usize = 0,
 
 /// Which backends this build could open. `.none` is always among them.
 ///
-/// `.vulkan` and `.d3d12` both genuinely open now: a real surface, swapchain,
-/// resources and `submit` - see `backend/vulkan.zig` and `backend/d3d12.zig`.
-/// Neither is `.auto`'s pick yet - `init` still resolves `.auto` to `.d3d11`/
-/// `.gl` on Windows - so a program gets either only by naming it.
+/// `.vulkan` and `.d3d12` are experimental - see `backend/vulkan.zig` and
+/// `backend/d3d12.zig` - and neither is `.auto`'s pick: `init` resolves
+/// `.auto` to `.d3d11`/`.gl` on Windows, so a program gets either only by
+/// naming it.
 pub fn available() []const types.Backend {
     return if (is_wasm)
         &.{ .webgl, .none }
@@ -1515,8 +1514,8 @@ test "every backend this build brings has an opener with its own name" {
 }
 
 test "probing the Vulkan loader is safe whether or not it is installed" {
-    // A machine without Vulkan is a supported deployment state until the
-    // backend exists, so this is deliberately only a no-crash probe.
+    // A machine without Vulkan is a supported deployment state, so this is
+    // deliberately only a no-crash probe.
     _ = vulkanLoaderAvailable();
 }
 

@@ -62,11 +62,9 @@ pub const Backend = enum {
             .d3d12 => .d3d,
             // OpenGL ES's, which is OpenGL's: depth from -1 to 1.
             .webgl => .gl,
-            // Zero to one like Direct3D, and - unlike it - NDC Y points
-            // down rather than up, which is `flip_y`. Unverified against a
-            // real driver in this port: no Vulkan ICD was available to
-            // check it on; see the port plan's open risks.
-            .vulkan => .{ .depth = .zero_to_one, .flip_y = true },
+            // Direct3D's: the backend gives every viewport a negative
+            // height, which turns Vulkan's downward NDC Y up the picture.
+            .vulkan => .d3d,
             // Nothing to say about a backend this library has never seen; a
             // device knows its own, see `Device.clip`.
             .other => .gl,
@@ -604,7 +602,7 @@ pub const ShaderDesc = struct {
     /// line, and a precision for `float` in the fragment stage.
     glsl_es: ?ShaderStages = null,
     /// HLSL for shader model 5.0, for the Direct3D 11 backend. It is also
-    /// what the Direct3D 12 backend compiles, for shader model 5.1 or 6.
+    /// what the Direct3D 12 backend compiles, for the same shader model.
     hlsl: ?ShaderStages = null,
     /// SPIR-V, one module per stage with an entry point named `main`, for the
     /// Vulkan backend. Vulkan 1.0's, so `Shader` capability and nothing later.
@@ -857,6 +855,18 @@ pub const GlHooks = struct {
     framebuffer_size: *const fn (*anyopaque) [2]u32,
 };
 
+/// What a window can make for a backend, asked for only by the backend that
+/// needs it: see `SurfaceDesc.window`. Fluxion Platform's `Window` has each of
+/// these.
+pub const WindowHooks = struct {
+    context: *anyopaque,
+    /// A `VkSurfaceKHR` for the window, as an integer, made with `instance`
+    /// and its `vkGetInstanceProcAddr` - the backend's own, which has every
+    /// surface extension the loader offers. Null when the window cannot make
+    /// one.
+    make_vulkan_surface: *const fn (context: *anyopaque, instance: usize, get_instance_proc_addr: *const anyopaque) ?u64,
+};
+
 pub const DeviceDesc = struct {
     backend: Select = .auto,
     /// Required for `.gl`; makes `.auto` choose it.
@@ -891,6 +901,12 @@ pub const SurfaceDesc = struct {
     /// than an integer. Once handed to `createSurface`, the surface belongs
     /// to the device: it is destroyed by `destroySurface`, not by the caller.
     vulkan_surface: u64 = 0,
+    /// The window's own way to make what a backend needs of it, for an API
+    /// that makes its surface from the window - Vulkan - when `vulkan_surface`
+    /// is not given. With it and `native_window` a caller describes its
+    /// window once, and the same `SurfaceDesc` opens a surface on every
+    /// backend.
+    window: ?WindowHooks = null,
     /// Zero means "the window's size".
     width: u32 = 0,
     height: u32 = 0,

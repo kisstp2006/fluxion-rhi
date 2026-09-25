@@ -16,22 +16,27 @@
 //!
 //! **Fully synchronous.** One command buffer, one fence, no frames in
 //! flight: `submit` records, submits, and blocks on the fence before
-//! returning: `present` waits on the render-finished semaphore (already
-//! signalled by the time it is checked) and then blocks on the queue too.
-//! Slower than double-buffering, and unambiguously correct - which is what
-//! the plan's Key Decision 2 asks a v1 backend for.
+//! returning, and so does every upload and readback. Slower than
+//! double-buffering, and unambiguously correct.
+//!
+//! **Up is up, as on Direct3D.** Every viewport is given to Vulkan with a
+//! negative height (`VK_KHR_maintenance1`), so clip-space Y points up the
+//! picture and a pass draws the top of it into the first row of its
+//! target - the Direct3D convention, `Backend.clip` `.d3d`. A shader written
+//! for either runs here the same way up, and a texture drawn into is sampled
+//! with the coordinates of one that was uploaded.
 //!
 //! **One shared pipeline layout.** Every pipeline this backend makes uses
 //! the same two descriptor sets - `set 0` four uniform-buffer slots, `set 1`
 //! four combined-image-sampler slots - so `setUniformBuffer`/`setTexture`
-//! and a draw never have to know which pipeline is bound. A descriptor pool
-//! reset once per `submit` and a pair of sets allocated fresh whenever a
-//! binding actually changes (`flushBindings`) is what makes that safe: a
+//! and a draw never have to know which pipeline is bound. Descriptor pools
+//! reset once per `submit`, and a pair of sets allocated fresh whenever a
+//! binding actually changes (`flushBindings`), is what makes that safe: a
 //! descriptor set's *content* is whatever the last `vkUpdateDescriptorSets`
 //! on it wrote, checked only when the GPU executes the draw that reads it -
 //! reusing one set across draws with different textures in the same list
 //! would silently make every earlier draw use the last texture, not the one
-//! it was recorded with.
+//! it was recorded with. A pool that runs out is followed by another.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -53,34 +58,38 @@ pub const ShaderRes = resources.ShaderRes;
 pub const PipelineRes = resources.PipelineRes;
 pub const SurfaceRes = swapchain.SurfaceRes;
 
-/// `set 0`'s width: four uniform-buffer bindings. See the plan's binding
-/// model (Key Decision 3).
+/// `set 0`'s width: four uniform-buffer bindings.
 pub const uniform_slots = 4;
 /// `set 1`'s width: four combined-image-sampler bindings.
 pub const texture_slots = 4;
 
-/// How many `(uniform, texture)` descriptor set pairs one `submit` can
-/// allocate - reset every `submit`, so this bounds "distinct binding states
-/// in one frame", not draws: consecutive draws that do not change what is
-/// bound share a pair.
-const max_binding_states = 256;
+/// How many `(uniform, texture)` descriptor set pairs one pool holds. A
+/// submit that changes its bindings more often than that takes another pool;
+/// every pool is reset at the next submit.
+const binding_states_per_pool = 256;
 
-/// How many distinct `(format, load op)` render passes `getRenderPass`
-/// caches - two colour formats times three load ops is six; eight leaves room.
-const max_render_passes = 8;
+/// How many distinct `(format, load op, layouts)` render passes
+/// `getRenderPass` caches: three formats, three load ops, and a swapchain's
+/// and a texture's layouts come to well under this.
+const max_render_passes = 32;
+
+/// The most surfaces one submit can draw into: each acquires its image, and
+/// the submit waits for every one it acquired.
+const max_surfaces_per_submit = 4;
 
 // -------------------------------------------------------------------------
 // Format mapping
 // -------------------------------------------------------------------------
 
-/// The only two colour formats in the MVP scope - everything else is
-/// `null`, so `Device`'s caps-driven pre-validation (from `caps` below never
-/// marking another format `sampled`) is what actually keeps requests for the
-/// rest from ever reaching this backend.
+/// The colour formats this backend makes textures and targets of -
+/// everything else is `null`, so `Device`'s caps-driven pre-validation (from
+/// `caps` below never marking another format `sampled`) is what actually
+/// keeps requests for the rest from ever reaching this backend.
 pub fn toVkFormat(format: types.Format) ?vk.gen.types.Format {
     return switch (format) {
         .rgba8_unorm => .r8g8b8a8_unorm,
         .bgra8_unorm => .b8g8r8a8_unorm,
+        .r8_unorm => .r8_unorm,
         else => null,
     };
 }
@@ -89,6 +98,7 @@ pub fn fromVkFormat(format: vk.gen.types.Format) ?types.Format {
     return switch (format) {
         .r8g8b8a8_unorm => .rgba8_unorm,
         .b8g8r8a8_unorm => .bgra8_unorm,
+        .r8_unorm => .r8_unorm,
         else => null,
     };
 }
@@ -119,8 +129,12 @@ pub const Runtime = struct {
     /// for `VK_KHR_surface` and every `VK_KHR_*_surface` extension the
     /// loader actually has (so this needs no platform `#ifdef` of its own -
     /// whichever the platform is, its extension is either there or is not
-    /// asked for), and the device requires `VK_KHR_swapchain`.
-    pub fn open(gpa: Allocator) types.Error!Runtime {
+    /// asked for), and the device requires `VK_KHR_swapchain` and
+    /// `VK_KHR_maintenance1`, whose negative viewport height turns the
+    /// picture the Direct3D way up. With `debug`, the Khronos validation
+    /// layer, when it is installed: what it finds goes to the standard
+    /// output.
+    pub fn open(gpa: Allocator, debug: bool) types.Error!Runtime {
         var loader = vk.Loader.init() catch return error.NoDevice;
         errdefer loader.deinit();
 
@@ -147,9 +161,21 @@ pub const Runtime = struct {
         }
         const enabled = enabled_buf[0..enabled_count];
 
+        const validation = "VK_LAYER_KHRONOS_validation";
+        const with_validation = debug and blk: {
+            const layers = loader.layers(gpa) catch break :blk false;
+            defer gpa.free(layers);
+            for (layers) |*layer| {
+                if (std.mem.eql(u8, layer.name(), validation)) break :blk true;
+            }
+            break :blk false;
+        };
+
         const app: vk.ApplicationInfo = .{ .application_name = "fluxion-rhi", .api_version = vk.v1_0.toInt() };
         var create_info: vk.InstanceCreateInfo = .{ .application_info = &app };
         create_info.setExtensions(enabled);
+        const layer_names = [_][*:0]const u8{validation};
+        if (with_validation) create_info.setLayers(&layer_names);
         const instance = loader.createInstance(&create_info, null) catch return error.NoDevice;
         const instance_commands = loader.instanceCommands(instance) catch return error.NoDevice;
         errdefer instance_commands.destroyInstance(instance, null);
@@ -175,6 +201,7 @@ pub const Runtime = struct {
         const device_extensions = vk.enumerate.deviceExtensions(gpa, vki, physical_device, null) catch return error.NoDevice;
         defer gpa.free(device_extensions);
         if (!vk.has(device_extensions, "VK_KHR_swapchain")) return error.Unsupported;
+        if (!vk.has(device_extensions, "VK_KHR_maintenance1")) return error.Unsupported;
 
         const families = vk.enumerate.queueFamilies(gpa, vki, physical_device) catch return error.NoDevice;
         defer gpa.free(families);
@@ -182,10 +209,10 @@ pub const Runtime = struct {
 
         const priorities = [_]f32{1.0};
         const queues = [_]vk.DeviceQueueCreateInfo{.queues(graphics_family, &priorities)};
-        const swapchain_ext = [_][*:0]const u8{"VK_KHR_swapchain"};
+        const device_ext = [_][*:0]const u8{ "VK_KHR_swapchain", "VK_KHR_maintenance1" };
         var device_info: vk.DeviceCreateInfo = .{};
         device_info.setQueues(&queues);
-        device_info.setExtensions(&swapchain_ext);
+        device_info.setExtensions(&device_ext);
 
         var device: vk.Device = undefined;
         _ = vki.createDevice(physical_device, &device_info, null, &device).check() catch return error.NoDevice;
@@ -225,8 +252,7 @@ pub const Runtime = struct {
 };
 
 /// True when the platform Vulkan loader can be opened. A loader alone is not a
-/// usable device; physical-device and surface selection belongs to `open` when
-/// this becomes a full `backend.Opener`.
+/// usable device; physical-device and surface selection belongs to `open`.
 pub fn loaderAvailable() bool {
     var loader = vk.Loader.init() catch return false;
     defer loader.deinit();
@@ -249,13 +275,14 @@ pub const Vk = struct {
     command_pool: vk.gen.types.CommandPool,
     command_buffer: vk.gen.types.CommandBuffer,
     fence: vk.gen.types.Fence,
-    sem_image_available: vk.gen.types.Semaphore,
-    sem_render_finished: vk.gen.types.Semaphore,
 
     pipeline_layout: vk.gen.types.PipelineLayout,
     set_layout_uniforms: vk.gen.types.DescriptorSetLayout,
     set_layout_textures: vk.gen.types.DescriptorSetLayout,
-    descriptor_pool: vk.gen.types.DescriptorPool,
+    /// The pools descriptor sets come from; `pool_index` is the one this
+    /// submit takes from now.
+    descriptor_pools: std.ArrayListUnmanaged(vk.gen.types.DescriptorPool) = .empty,
+    pool_index: usize = 0,
 
     /// What an unbound uniform or texture slot reads from - see
     /// `vulkan_resources.zig`'s "Dummy resources" section.
@@ -268,13 +295,20 @@ pub const Vk = struct {
     renderer: [256]u8 = undefined,
     renderer_len: usize = 0,
 
-    // --- state that only means something between `submit`'s first command
-    // and its last, reset at the top of every `submit` and every `beginPass` ---
-    current_surface: ?*SurfaceRes = null,
+    // --- state that only means something while a command buffer is being
+    // recorded, reset by `record` and by every `beginPass` ---
+    recording: bool = false,
+    in_pass: bool = false,
+    /// The surfaces whose images this submit acquired: it waits for each.
+    acquired: [max_surfaces_per_submit]vk.gen.types.Semaphore = undefined,
+    acquired_count: usize = 0,
+    pass_format: vk.gen.types.Format = .undefined,
+    pass_extent: [2]u32 = .{ 0, 0 },
+    current_pipeline: ?*PipelineRes = null,
+    pipeline_dirty: bool = false,
     current_ubo: [uniform_slots]?*BufferRes = @splat(null),
     current_tex: [texture_slots]?TexBinding = @splat(null),
     bindings_dirty: bool = true,
-    pass_extent: [2]u32 = .{ 0, 0 },
 
     pub fn cast(impl: backend.Impl) *Vk {
         return @ptrCast(@alignCast(impl));
@@ -289,13 +323,11 @@ fn as(comptime T: type, native: backend.Native) *T {
     return @ptrCast(@alignCast(native));
 }
 
-/// Opens `Runtime`, the shared pipeline layout and descriptor pool, and the
-/// dummy resources unbound slots read from, then returns the real `Vtable`
-/// below. What `Device.opener(.vulkan)` calls.
+/// Opens `Runtime`, the shared pipeline layout, and the dummy resources
+/// unbound slots read from, then returns the real `Vtable` below. What
+/// `Device.opener(.vulkan)` calls. `desc.software` has no meaning here.
 pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
-    _ = desc; // MVP: no debug layer toggle and no software-renderer preference yet.
-
-    var runtime = try Runtime.open(gpa);
+    var runtime = try Runtime.open(gpa, desc.debug);
     errdefer runtime.deinit();
     const vkd = runtime.vkd;
 
@@ -314,16 +346,8 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
     }, @ptrCast(&command_buffer)).check() catch return error.NoDevice;
 
     var fence: vk.gen.types.Fence = .none;
-    _ = vkd.createFence(runtime.device, &.{ .flags = .{ .signaled = true } }, null, &fence).check() catch return error.NoDevice;
+    _ = vkd.createFence(runtime.device, &.{}, null, &fence).check() catch return error.NoDevice;
     errdefer vkd.destroyFence(runtime.device, fence, null);
-
-    var sem_image_available: vk.gen.types.Semaphore = .none;
-    _ = vkd.createSemaphore(runtime.device, &.{}, null, &sem_image_available).check() catch return error.NoDevice;
-    errdefer vkd.destroySemaphore(runtime.device, sem_image_available, null);
-
-    var sem_render_finished: vk.gen.types.Semaphore = .none;
-    _ = vkd.createSemaphore(runtime.device, &.{}, null, &sem_render_finished).check() catch return error.NoDevice;
-    errdefer vkd.destroySemaphore(runtime.device, sem_render_finished, null);
 
     var ubo_bindings: [uniform_slots]vk.gen.types.DescriptorSetLayoutBinding = undefined;
     for (&ubo_bindings, 0..) |*b, i| b.* = .{
@@ -339,12 +363,13 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
     }, null, &set_layout_uniforms).check() catch return error.NoDevice;
     errdefer vkd.destroyDescriptorSetLayout(runtime.device, set_layout_uniforms, null);
 
+    // Every stage, as the Direct3D backends bind a texture to both.
     var tex_bindings: [texture_slots]vk.gen.types.DescriptorSetLayoutBinding = undefined;
     for (&tex_bindings, 0..) |*b, i| b.* = .{
         .binding = @intCast(i),
         .descriptor_type = .combined_image_sampler,
         .descriptor_count = 1,
-        .stage_flags = .{ .fragment = true },
+        .stage_flags = .{ .vertex = true, .fragment = true },
     };
     var set_layout_textures: vk.gen.types.DescriptorSetLayout = .none;
     _ = vkd.createDescriptorSetLayout(runtime.device, &.{
@@ -361,18 +386,6 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
     }, null, &pipeline_layout).check() catch return error.NoDevice;
     errdefer vkd.destroyPipelineLayout(runtime.device, pipeline_layout, null);
 
-    const pool_sizes = [_]vk.gen.types.DescriptorPoolSize{
-        .{ .type = .uniform_buffer, .descriptor_count = uniform_slots * max_binding_states },
-        .{ .type = .combined_image_sampler, .descriptor_count = texture_slots * max_binding_states },
-    };
-    var descriptor_pool: vk.gen.types.DescriptorPool = .none;
-    _ = vkd.createDescriptorPool(runtime.device, &.{
-        .max_sets = max_binding_states * 2,
-        .pool_size_count = pool_sizes.len,
-        .pool_sizes = &pool_sizes,
-    }, null, &descriptor_pool).check() catch return error.NoDevice;
-    errdefer vkd.destroyDescriptorPool(runtime.device, descriptor_pool, null);
-
     const self = try gpa.create(Vk);
     errdefer gpa.destroy(self);
     self.* = .{
@@ -381,16 +394,15 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
         .command_pool = command_pool,
         .command_buffer = command_buffer,
         .fence = fence,
-        .sem_image_available = sem_image_available,
-        .sem_render_finished = sem_render_finished,
         .pipeline_layout = pipeline_layout,
         .set_layout_uniforms = set_layout_uniforms,
         .set_layout_textures = set_layout_textures,
-        .descriptor_pool = descriptor_pool,
         .dummy_buffer = undefined,
         .dummy_texture = undefined,
         .dummy_sampler = undefined,
     };
+    errdefer self.descriptor_pools.deinit(gpa);
+    try addDescriptorPool(self);
 
     var props: vk.PhysicalDeviceProperties = undefined;
     self.runtime.vki.getPhysicalDeviceProperties(self.runtime.physical_device, &props);
@@ -450,12 +462,11 @@ fn deinit(impl: backend.Impl) void {
     resources.destroyDummyResources(self);
     for (self.render_passes) |maybe| if (maybe) |entry| vkd.destroyRenderPass(self.runtime.device, entry.pass, null);
 
-    vkd.destroyDescriptorPool(self.runtime.device, self.descriptor_pool, null);
+    for (self.descriptor_pools.items) |pool| vkd.destroyDescriptorPool(self.runtime.device, pool, null);
+    self.descriptor_pools.deinit(self.gpa);
     vkd.destroyPipelineLayout(self.runtime.device, self.pipeline_layout, null);
     vkd.destroyDescriptorSetLayout(self.runtime.device, self.set_layout_textures, null);
     vkd.destroyDescriptorSetLayout(self.runtime.device, self.set_layout_uniforms, null);
-    vkd.destroySemaphore(self.runtime.device, self.sem_render_finished, null);
-    vkd.destroySemaphore(self.runtime.device, self.sem_image_available, null);
     vkd.destroyFence(self.runtime.device, self.fence, null);
     // Frees `self.command_buffer` too.
     vkd.destroyCommandPool(self.runtime.device, self.command_pool, null);
@@ -473,11 +484,11 @@ fn info(impl: backend.Impl) types.Info {
 // Capabilities
 // -------------------------------------------------------------------------
 
-/// Reports narrowly, per the plan's MVP scope table: only `.d2`, one mip,
-/// one sample, `rgba8_unorm`/`bgra8_unorm`, never a render target. Every
-/// format not listed here defaults to `FormatSupport{}` - unsupported - so
-/// `Device`'s caps-driven pre-validation refuses the rest before this
-/// backend is ever asked.
+/// `.d2`, one mip, one sample, `rgba8_unorm`, `bgra8_unorm` and `r8_unorm`,
+/// each as the device says it can be sampled, filtered, drawn into and
+/// blended. Every format not listed here defaults to `FormatSupport{}` -
+/// unsupported - so `Device`'s caps-driven pre-validation refuses the rest
+/// before this backend is ever asked.
 fn caps(impl: backend.Impl) types.Caps {
     const self = cast(impl);
     const vki = self.runtime.vki;
@@ -492,16 +503,16 @@ fn caps(impl: backend.Impl) types.Caps {
             .max_texture_3d = limits.max_image_dimension_3d,
             .max_texture_cube = limits.max_image_dimension_cube,
             .max_texture_layers = limits.max_image_array_layers,
-            // Anisotropic filtering is out of the MVP scope, so one is the
-            // most `createSampler` will ever be asked to give.
+            // Anisotropic filtering is not here yet, so one is the most
+            // `createSampler` will ever be asked to give.
             .max_anisotropy = 1,
             // No `extra_colors`, so one colour attachment is all a pass has.
             .max_color_attachments = 1,
         },
-        .features = .{},
+        .features = .{ .sampler_border = true, .sampler_lod_bias = true },
     };
 
-    for ([_]types.Format{ .rgba8_unorm, .bgra8_unorm }) |format| {
+    for ([_]types.Format{ .rgba8_unorm, .bgra8_unorm, .r8_unorm }) |format| {
         const vk_format = toVkFormat(format).?;
         var fp: vk.gen.types.FormatProperties = undefined;
         vki.getPhysicalDeviceFormatProperties(self.runtime.physical_device, vk_format, &fp);
@@ -509,10 +520,10 @@ fn caps(impl: backend.Impl) types.Caps {
         answer.formats.set(format, .{
             .sampled = feats.sampled_image,
             .filterable = feats.sampled_image_filter_linear,
-            .render_target = false,
-            .blendable = false,
+            .render_target = feats.color_attachment,
+            .blendable = feats.color_attachment_blend,
             .generate_mips = false,
-            .sample_counts = 0,
+            .sample_counts = 0b1,
             .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
         });
     }
@@ -520,7 +531,63 @@ fn caps(impl: backend.Impl) types.Caps {
 }
 
 // -------------------------------------------------------------------------
-// Recording and submitting a frame
+// Recording: the command buffer every submit, upload and readback records
+// into, one after another
+// -------------------------------------------------------------------------
+
+const forever: u64 = ~@as(u64, 0);
+
+/// Start recording into the one command buffer.
+pub fn record(self: *Vk) types.Error!void {
+    const vkd = self.runtime.vkd;
+    _ = vkd.resetCommandBuffer(self.command_buffer, .{}).check() catch return error.Failed;
+    _ = vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit = true } }).check() catch return error.Failed;
+    self.recording = true;
+    self.in_pass = false;
+    self.acquired_count = 0;
+}
+
+/// Stop recording, submit - waiting for every image this recording
+/// acquired - and block until the GPU has done it all. The fence is reset
+/// only here, right before the submit that signals it, so a recording given
+/// up on never leaves it waiting for a signal that will not come.
+pub fn finish(self: *Vk) types.Error!void {
+    const vkd = self.runtime.vkd;
+    self.recording = false;
+    _ = vkd.endCommandBuffer(self.command_buffer).check() catch return error.Failed;
+
+    var wait_stages: [max_surfaces_per_submit]vk.gen.types.PipelineStageFlags = @splat(.{ .color_attachment_output = true });
+    const waits = self.acquired_count;
+    self.acquired_count = 0;
+    const cmd_buffers = [_]vk.gen.types.CommandBuffer{self.command_buffer};
+    const submit_info = [_]vk.gen.types.SubmitInfo{.{
+        .wait_semaphore_count = @intCast(waits),
+        .wait_semaphores = if (waits > 0) &self.acquired else null,
+        .wait_dst_stage_mask = if (waits > 0) &wait_stages else null,
+        .command_buffer_count = cmd_buffers.len,
+        .command_buffers = &cmd_buffers,
+    }};
+    _ = vkd.resetFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}).check() catch return error.Failed;
+    _ = vkd.queueSubmit(self.runtime.graphics_queue, 1, &submit_info, self.fence).check() catch |err| switch (err) {
+        error.DeviceLost => return error.DeviceLost,
+        else => return error.Failed,
+    };
+    _ = vkd.waitForFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}, vk.gen.types.vk_true, forever).check() catch return error.DeviceLost;
+}
+
+/// What a submit that failed part-way leaves: its pass ended and what was
+/// recorded submitted, so that every image it acquired is waited for, every
+/// texture is back in the layout it is sampled in, and the next recording
+/// starts clean.
+fn abandon(self: *Vk) void {
+    if (!self.recording) return;
+    if (self.in_pass) self.runtime.vkd.cmdEndRenderPass(self.command_buffer);
+    self.in_pass = false;
+    finish(self) catch {};
+}
+
+// -------------------------------------------------------------------------
+// Submitting a frame
 // -------------------------------------------------------------------------
 
 /// Walks the `Command` union once, recording into `self.command_buffer` -
@@ -531,16 +598,11 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
     const vkd = self.runtime.vkd;
     const cmd = self.command_buffer;
 
-    // The previous `submit` already waited on this same fence before it
-    // returned, so this is a formality on every call but the first - where
-    // it is what makes the pre-signalled fence from `open` harmless.
-    _ = vkd.waitForFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}, vk.gen.types.vk_true, forever).check() catch return error.DeviceLost;
-    _ = vkd.resetFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}).check() catch return error.Failed;
-    _ = vkd.resetDescriptorPool(self.runtime.device, self.descriptor_pool, 0).check() catch return error.Failed;
-    _ = vkd.resetCommandBuffer(cmd, .{}).check() catch return error.Failed;
-    _ = vkd.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit = true } }).check() catch return error.Failed;
-
-    self.current_surface = null;
+    try record(self);
+    errdefer abandon(self);
+    try resetDescriptorPools(self);
+    self.current_pipeline = null;
+    self.pipeline_dirty = false;
     self.current_ubo = @splat(null);
     self.current_tex = @splat(null);
     self.bindings_dirty = true;
@@ -548,33 +610,16 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
     for (list) |command| {
         switch (command) {
             .begin_pass => |pass| try beginPass(self, device, pass),
-            .end_pass => vkd.cmdEndRenderPass(cmd),
+            .end_pass => {
+                vkd.cmdEndRenderPass(cmd);
+                self.in_pass = false;
+            },
             .set_pipeline => |h| {
-                const res = as(PipelineRes, device.pipelines.get(h).?.native);
-                vkd.cmdBindPipeline(cmd, .graphics, res.pipeline);
+                self.current_pipeline = as(PipelineRes, device.pipelines.get(h).?.native);
+                self.pipeline_dirty = true;
             },
-            .set_viewport => |v| {
-                const viewport = [_]vk.gen.types.Viewport{.{
-                    .x = v.x,
-                    .y = v.y,
-                    .width = v.width,
-                    .height = v.height,
-                    .min_depth = v.min_depth,
-                    .max_depth = v.max_depth,
-                }};
-                vkd.cmdSetViewport(cmd, 0, 1, &viewport);
-            },
-            .set_scissor => |maybe| {
-                const r: vk.gen.types.Rect2D = if (maybe) |rect| .{
-                    .offset = .{ .x = rect.x, .y = rect.y },
-                    .extent = .{ .width = rect.width, .height = rect.height },
-                } else .{
-                    .offset = .{ .x = 0, .y = 0 },
-                    .extent = .{ .width = self.pass_extent[0], .height = self.pass_extent[1] },
-                };
-                const scissor = [_]vk.gen.types.Rect2D{r};
-                vkd.cmdSetScissor(cmd, 0, 1, &scissor);
-            },
+            .set_viewport => |v| setViewport(self, v),
+            .set_scissor => |maybe| setScissor(self, maybe),
             .set_vertex_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
                 const buffers = [_]vk.gen.types.Buffer{res.buffer};
@@ -599,108 +644,160 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
                 self.bindings_dirty = true;
             },
             .draw => |d| {
-                try flushBindings(self);
+                try prepareDraw(self);
                 vkd.cmdDraw(cmd, d.vertex_count, d.instance_count, d.first_vertex, 0);
             },
             .draw_indexed => |d| {
-                try flushBindings(self);
+                try prepareDraw(self);
                 vkd.cmdDrawIndexed(cmd, d.index_count, d.instance_count, d.first_index, d.base_vertex, 0);
             },
-            // Out of the MVP scope, and `caps.formats[*].generate_mips` is
-            // always false, so `Device` refuses this before it reaches here.
+            // `caps.formats[*].generate_mips` is always false, so `Device`
+            // refuses this before it reaches here.
             .generate_mips => return error.Unsupported,
         }
     }
 
-    _ = vkd.endCommandBuffer(cmd).check() catch return error.Failed;
-
-    var wait_semaphores: [1]vk.gen.types.Semaphore = undefined;
-    var wait_stages: [1]vk.gen.types.PipelineStageFlags = undefined;
-    const wait_count: u32 = if (self.current_surface != null) blk: {
-        wait_semaphores[0] = self.sem_image_available;
-        wait_stages[0] = .{ .color_attachment_output = true };
-        break :blk 1;
-    } else 0;
-
-    const cmd_buffers = [_]vk.gen.types.CommandBuffer{cmd};
-    const signal_semaphores = [_]vk.gen.types.Semaphore{self.sem_render_finished};
-    const submit_info = [_]vk.gen.types.SubmitInfo{.{
-        .wait_semaphore_count = wait_count,
-        .wait_semaphores = if (wait_count > 0) &wait_semaphores else null,
-        .wait_dst_stage_mask = if (wait_count > 0) &wait_stages else null,
-        .command_buffer_count = cmd_buffers.len,
-        .command_buffers = &cmd_buffers,
-        .signal_semaphore_count = signal_semaphores.len,
-        .signal_semaphores = &signal_semaphores,
-    }};
-    _ = vkd.queueSubmit(self.runtime.graphics_queue, 1, &submit_info, self.fence).check() catch return error.Failed;
-
-    // Fully synchronous: block right here, so the descriptor pool, the
-    // command buffer and every resource this list touched are safe to
-    // reuse - or to destroy - the moment this call returns.
-    _ = vkd.waitForFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}, vk.gen.types.vk_true, forever).check() catch return error.DeviceLost;
+    try finish(self);
 }
 
-const forever: u64 = ~@as(u64, 0);
-
 fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error!void {
-    // The MVP scope is a pass into the surface and nothing else - no depth,
-    // no extra colours, and a colour texture is never reached because
-    // `caps` never lets one be made with `usage.render_target`.
     if (pass.depth != null or pass.extra_colors.len > 0) return error.Unsupported;
     const color = pass.color orelse return error.Unsupported;
-    const surface_h = switch (color.target) {
-        .surface => |h| h,
-        .texture => return error.Unsupported,
-    };
-    const surface = as(SurfaceRes, device.surfaces.get(surface_h).?.native);
-
-    if (self.current_surface != surface) {
-        try swapchain.acquire(self, surface);
-        self.current_surface = surface;
-    }
-
     const load = swapchain.mapLoadOp(color.load);
-    const render_pass = try swapchain.getRenderPass(self, surface.format, load);
-    const framebuffer = surface.framebuffers[surface.image_index];
+
+    var framebuffer: vk.gen.types.Framebuffer = .none;
+    var render_pass: vk.gen.types.RenderPass = .none;
+    var format: vk.gen.types.Format = .undefined;
+    var extent: [2]u32 = undefined;
+    switch (color.target) {
+        .surface => |h| {
+            const surface = as(SurfaceRes, device.surfaces.get(h).?.native);
+            if (try swapchain.acquire(self, surface)) {
+                if (self.acquired_count >= max_surfaces_per_submit) return error.Unsupported;
+                self.acquired[self.acquired_count] = surface.acquired_signal;
+                self.acquired_count += 1;
+            }
+            const index = surface.acquired.?;
+            // An image drawn into before is presentable; one that never was
+            // has nothing in it to keep.
+            const initial: vk.gen.types.ImageLayout = if (load == .load and surface.drawn[index]) .present_src_khr else .undefined;
+            surface.drawn[index] = true;
+            render_pass = try swapchain.getRenderPass(self, surface.format, load, initial, .present_src_khr);
+            framebuffer = surface.framebuffers[index];
+            format = surface.format;
+            extent = .{ surface.width, surface.height };
+        },
+        .texture => |h| {
+            const texture = as(TextureRes, device.textures.get(h).?.native);
+            if (texture.framebuffer == .none) return error.Unsupported;
+            const initial: vk.gen.types.ImageLayout = if (load == .load) .shader_read_only_optimal else .undefined;
+            render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .shader_read_only_optimal);
+            framebuffer = texture.framebuffer;
+            format = texture.vk_format;
+            extent = .{ texture.width, texture.height };
+        },
+    }
 
     const clears = [_]vk.gen.types.ClearValue{.{ .color = .{ .float32 = color.clear_color } }};
     self.runtime.vkd.cmdBeginRenderPass(self.command_buffer, &.{
         .render_pass = render_pass,
         .framebuffer = framebuffer,
-        .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = surface.width, .height = surface.height } },
+        .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = extent[0], .height = extent[1] } },
         .clear_value_count = clears.len,
         .clear_values = &clears,
     }, .@"inline");
-
-    self.pass_extent = .{ surface.width, surface.height };
+    self.in_pass = true;
+    self.pass_format = format;
+    self.pass_extent = extent;
 
     // A pass begins covering the whole attachment, like every other
     // backend - `set_viewport`/`set_scissor` override this afterwards.
-    const viewport = [_]vk.gen.types.Viewport{.{
-        .x = 0,
-        .y = 0,
-        .width = @floatFromInt(surface.width),
-        .height = @floatFromInt(surface.height),
-        .min_depth = 0,
-        .max_depth = 1,
-    }};
-    self.runtime.vkd.cmdSetViewport(self.command_buffer, 0, 1, &viewport);
-    const scissor = [_]vk.gen.types.Rect2D{.{
-        .offset = .{ .x = 0, .y = 0 },
-        .extent = .{ .width = surface.width, .height = surface.height },
-    }};
-    self.runtime.vkd.cmdSetScissor(self.command_buffer, 0, 1, &scissor);
+    setViewport(self, .{ .width = @floatFromInt(extent[0]), .height = @floatFromInt(extent[1]) });
+    setScissor(self, null);
 
+    self.current_pipeline = null;
+    self.pipeline_dirty = false;
     self.current_ubo = @splat(null);
     self.current_tex = @splat(null);
     self.bindings_dirty = true;
 }
 
-/// Allocates a fresh `(set 0, set 1)` pair from the pool `submit` resets
-/// every frame, writes it from `self.current_ubo`/`current_tex` - an unbound
-/// slot reads the dummy resource, see `vulkan_resources.zig` - and binds it,
-/// but only when a binding actually changed since the last draw.
+/// A viewport given to Vulkan from its bottom edge, with a negative height:
+/// clip-space Y then points up the picture, as it does on Direct3D. See the
+/// module doc.
+fn setViewport(self: *Vk, v: types.Viewport) void {
+    const viewport = [_]vk.gen.types.Viewport{.{
+        .x = v.x,
+        .y = v.y + v.height,
+        .width = v.width,
+        .height = -v.height,
+        .min_depth = v.min_depth,
+        .max_depth = v.max_depth,
+    }};
+    self.runtime.vkd.cmdSetViewport(self.command_buffer, 0, 1, &viewport);
+}
+
+/// Null is the whole attachment. Vulkan takes no negative offset, so a
+/// rectangle that starts outside the target is cut to what is inside it.
+fn setScissor(self: *Vk, maybe: ?types.Rect) void {
+    const r: vk.gen.types.Rect2D = if (maybe) |rect| blk: {
+        const left = @max(rect.x, 0);
+        const top = @max(rect.y, 0);
+        const right = @max(rect.x + @as(i32, @intCast(rect.width)), left);
+        const bottom = @max(rect.y + @as(i32, @intCast(rect.height)), top);
+        break :blk .{
+            .offset = .{ .x = left, .y = top },
+            .extent = .{ .width = @intCast(right - left), .height = @intCast(bottom - top) },
+        };
+    } else .{
+        .offset = .{ .x = 0, .y = 0 },
+        .extent = .{ .width = self.pass_extent[0], .height = self.pass_extent[1] },
+    };
+    const scissor = [_]vk.gen.types.Rect2D{r};
+    self.runtime.vkd.cmdSetScissor(self.command_buffer, 0, 1, &scissor);
+}
+
+/// What a draw needs bound: the pipeline made for this pass's format, and
+/// the descriptor sets for what is bound now.
+fn prepareDraw(self: *Vk) types.Error!void {
+    if (self.pipeline_dirty) {
+        const res = self.current_pipeline orelse return error.InvalidArgument;
+        const pipeline = try resources.pipelineFor(self, res, self.pass_format);
+        self.runtime.vkd.cmdBindPipeline(self.command_buffer, .graphics, pipeline);
+        self.pipeline_dirty = false;
+    }
+    try flushBindings(self);
+}
+
+fn addDescriptorPool(self: *Vk) types.Error!void {
+    const pool_sizes = [_]vk.gen.types.DescriptorPoolSize{
+        .{ .type = .uniform_buffer, .descriptor_count = uniform_slots * binding_states_per_pool },
+        .{ .type = .combined_image_sampler, .descriptor_count = texture_slots * binding_states_per_pool },
+    };
+    var pool: vk.gen.types.DescriptorPool = .none;
+    _ = self.runtime.vkd.createDescriptorPool(self.runtime.device, &.{
+        .max_sets = binding_states_per_pool * 2,
+        .pool_size_count = pool_sizes.len,
+        .pool_sizes = &pool_sizes,
+    }, null, &pool).check() catch return error.OutOfMemory;
+    self.descriptor_pools.append(self.gpa, pool) catch {
+        self.runtime.vkd.destroyDescriptorPool(self.runtime.device, pool, null);
+        return error.OutOfMemory;
+    };
+}
+
+fn resetDescriptorPools(self: *Vk) types.Error!void {
+    for (self.descriptor_pools.items) |pool| {
+        _ = self.runtime.vkd.resetDescriptorPool(self.runtime.device, pool, 0).check() catch return error.Failed;
+    }
+    self.pool_index = 0;
+}
+
+/// Allocates a fresh `(set 0, set 1)` pair, writes it from
+/// `self.current_ubo`/`current_tex` - an unbound slot reads the dummy
+/// resource, see `vulkan_resources.zig` - and binds it, but only when a
+/// binding actually changed since the last draw. A pool that is full is
+/// followed by the next, made when there is none.
 fn flushBindings(self: *Vk) types.Error!void {
     if (!self.bindings_dirty) return;
     self.bindings_dirty = false;
@@ -721,11 +818,21 @@ fn flushBindings(self: *Vk) types.Error!void {
 
     const set_layouts = [_]vk.gen.types.DescriptorSetLayout{ self.set_layout_uniforms, self.set_layout_textures };
     var sets: [2]vk.gen.types.DescriptorSet = undefined;
-    _ = vkd.allocateDescriptorSets(self.runtime.device, &.{
-        .descriptor_pool = self.descriptor_pool,
-        .descriptor_set_count = set_layouts.len,
-        .set_layouts = &set_layouts,
-    }, &sets).check() catch return error.OutOfMemory;
+    while (true) {
+        if (self.pool_index >= self.descriptor_pools.items.len) try addDescriptorPool(self);
+        _ = vkd.allocateDescriptorSets(self.runtime.device, &.{
+            .descriptor_pool = self.descriptor_pools.items[self.pool_index],
+            .descriptor_set_count = set_layouts.len,
+            .set_layouts = &set_layouts,
+        }, &sets).check() catch |err| switch (err) {
+            error.OutOfPoolMemory, error.FragmentedPool => {
+                self.pool_index += 1;
+                continue;
+            },
+            else => return error.OutOfMemory,
+        };
+        break;
+    }
 
     // Binding zero of each set, with `descriptorCount` wider than that one
     // binding's array: Vulkan overflows the write into bindings one, two and
@@ -741,13 +848,16 @@ fn flushBindings(self: *Vk) types.Error!void {
 }
 
 // -------------------------------------------------------------------------
-// Tests
+// Tests. Skipped on a machine with no Vulkan device. What a pass drew is read
+// back from the texture it drew into; the sprites example's tests draw a
+// whole textured, blended, instanced frame here and compare it with
+// Direct3D's.
 // -------------------------------------------------------------------------
 
 const testing = std.testing;
 
 test "a Vulkan runtime opens and closes when the machine has a graphics device" {
-    var runtime = Runtime.open(std.testing.allocator) catch |err| switch (err) {
+    var runtime = Runtime.open(std.testing.allocator, false) catch |err| switch (err) {
         error.NoDevice, error.Unsupported => return error.SkipZigTest,
         else => return err,
     };
@@ -773,7 +883,7 @@ test "the backend opens, reports itself, and hands back a live instance" {
     try testing.expect(handles.instance != 0);
 }
 
-test "the caps-scoped resources create: buffer, texture, sampler, shader, pipeline" {
+test "resources create: buffer, texture, target, sampler, shader, pipeline" {
     var device = try openTestDevice();
     defer device.deinit();
 
@@ -783,9 +893,10 @@ test "the caps-scoped resources create: buffer, texture, sampler, shader, pipeli
 
     var pixel = [4]u8{ 10, 20, 30, 255 };
     const texture = try device.createTexture(.{ .width = 1, .height = 1, .data = &pixel });
+    const target = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
     const sampler = try device.createSampler(.linear);
-    _ = texture;
-    _ = sampler;
+    const border = try device.createSampler(.{ .wrap_u = .border, .border = .opaque_white });
+    _ = .{ texture, target, sampler, border };
 
     const shader = try device.createShader(.{ .spirv = .{ .vertex = triangle_vertex, .fragment = triangle_fragment } });
     const pipeline = try device.createPipeline(.{
@@ -796,7 +907,69 @@ test "the caps-scoped resources create: buffer, texture, sampler, shader, pipeli
     _ = pipeline;
 }
 
-test "out-of-scope requests are refused as Unsupported, which proves caps is scoped" {
+test "a texture reads back as it was made, and a box written into it changes that box" {
+    var device = try openTestDevice();
+    defer device.deinit();
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    for (0..16) |i| pixels[i * 4 ..][0..4].* = .{ @intCast(i * 10), 20, 30, 255 };
+    const texture = try device.createTexture(.{ .width = 4, .height = 4, .data = &pixels });
+    {
+        const back = try device.readTexture(texture, testing.allocator);
+        defer testing.allocator.free(back);
+        try testing.expectEqualSlices(u8, &pixels, back);
+    }
+
+    const green = [_]u8{ 0, 255, 0, 255 } ** 4;
+    try device.writeTexture(texture, .{ .x = 1, .y = 1, .width = 2, .height = 2 }, &green, 8, 0);
+    const back = try device.readTexture(texture, testing.allocator);
+    defer testing.allocator.free(back);
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, back[(1 * 4 + 1) * 4 ..][0..4].*);
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, back[(2 * 4 + 2) * 4 ..][0..4].*);
+    try testing.expectEqual([4]u8{ 0, 20, 30, 255 }, back[0..4].*);
+}
+
+test "bgra8 and r8 read back as RGBA" {
+    var device = try openTestDevice();
+    defer device.deinit();
+
+    const bgra = try device.createTexture(.{ .width = 1, .height = 1, .format = .bgra8_unorm, .data = &.{ 10, 20, 30, 40 } });
+    const from_bgra = try device.readTexture(bgra, testing.allocator);
+    defer testing.allocator.free(from_bgra);
+    try testing.expectEqualSlices(u8, &.{ 30, 20, 10, 40 }, from_bgra);
+
+    const r8 = try device.createTexture(.{ .width = 3, .height = 2, .format = .r8_unorm, .data = &.{ 1, 2, 3, 4, 5, 6 } });
+    try device.writeTexture(r8, .{ .y = 1, .width = 3, .height = 1 }, &.{ 7, 8, 9 }, 3, 0);
+    const from_r8 = try device.readTexture(r8, testing.allocator);
+    defer testing.allocator.free(from_r8);
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 1, 255 }, from_r8[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 255 }, from_r8[5 * 4 ..][0..4]);
+}
+
+test "passes clear textures, submit after submit, and each reads back its colour" {
+    var device = try openTestDevice();
+    defer device.deinit();
+
+    const first = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const second = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    for (0..3) |round| {
+        const red: f32 = if (round % 2 == 0) 1 else 0;
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = first }, .clear_color = .{ red, 0, 0, 1 } } });
+        try cmd.endPass();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = second }, .clear_color = .{ 0, 0, 1, 1 } } });
+        try cmd.endPass();
+        try device.submit();
+    }
+    const a = try device.readTexture(first, testing.allocator);
+    defer testing.allocator.free(a);
+    const b = try device.readTexture(second, testing.allocator);
+    defer testing.allocator.free(b);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, a[0..4].*);
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, b[(7 * 8 + 7) * 4 ..][0..4].*);
+}
+
+test "what is not here yet is refused as Unsupported" {
     var device = try openTestDevice();
     defer device.deinit();
 
@@ -806,16 +979,13 @@ test "out-of-scope requests are refused as Unsupported, which proves caps is sco
         .width = 4,
         .height = 4,
     }));
-
-    // A render target - `caps` never marks any format `render_target`, and
-    // multisampling needs one.
+    // Multisampling.
     try testing.expectError(error.Unsupported, device.createTexture(.{
         .width = 4,
         .height = 4,
         .samples = 4,
-        .usage = .{ .render_target = true },
+        .usage = .{ .sampled = false, .render_target = true },
     }));
-
     // A depth pipeline: not a `caps` rejection (`Device.createPipeline` has
     // no caps check for it), but the backend's own - see
     // `vulkan_resources.createPipeline`.
@@ -836,9 +1006,9 @@ test "out-of-scope requests are refused as Unsupported, which proves caps is sco
 // every test above it a test of nothing. Assembled by hand, the same way
 // `fluxion-vulkan`'s own examples do (`examples/spirv.zig`, not reachable
 // from this module): a header, then a stream of `(word_count << 16) |
-// opcode` instructions. Neither shader is ever executed here - there is no
-// window in this file's tests - so both are the plainest thing that is
-// still a real module: the vertex stage writes a fixed `gl_Position`, the
+// opcode` instructions. Neither shader draws anything anyone looks at -
+// the textured draws are the sprites example's - so both are the plainest
+// thing that is still a real module: the vertex stage writes a fixed `gl_Position`, the
 // fragment stage writes a fixed colour.
 // -------------------------------------------------------------------------
 

@@ -151,29 +151,26 @@ pub const Window = struct {
         });
     }
 
-    /// The device's surface for this window. On `.vulkan`, the `VkSurfaceKHR`
-    /// is made here - `fluxion-rhi` has no windowing code of its own to make
-    /// one with - from the device's own instance and this window's own
-    /// `createVulkanSurface`, then handed in as `SurfaceDesc.vulkan_surface`.
+    /// The device's surface for this window: the window described once -
+    /// its handle, and its hooks for a backend that makes its surface from
+    /// it - whichever backend the device is.
     pub fn createSurface(self: Window, device: *rhi.Device) rhi.Error!rhi.Surface {
-        if (device.tag == .vulkan) {
-            const handles = device.vulkanInstanceHandles() orelse return error.Unsupported;
-            const surface = self.inner.win.createVulkanSurface(
-                handles.instance,
-                @ptrCast(@alignCast(handles.get_instance_proc_addr)),
-                null,
-            ) catch return error.Unsupported;
-            return device.createSurface(.{
-                .vulkan_surface = surface,
-                .width = self.width,
-                .height = self.height,
-            });
-        }
         return device.createSurface(.{
             .native_window = self.nativeHandle(),
+            .window = self.windowHooks(),
             .width = self.width,
             .height = self.height,
         });
+    }
+
+    /// What the window makes for a backend that asks: a Vulkan surface.
+    pub fn windowHooks(self: Window) rhi.WindowHooks {
+        return .{ .context = self.inner, .make_vulkan_surface = makeVulkanSurface };
+    }
+
+    fn makeVulkanSurface(context: *anyopaque, instance: usize, get_instance_proc_addr: *const anyopaque) ?u64 {
+        const inner: *Inner = @ptrCast(@alignCast(context));
+        return inner.win.createVulkanSurface(instance, @ptrCast(@alignCast(get_instance_proc_addr)), null) catch null;
     }
 
     /// Drain the events and answer whether the window is still there.
@@ -233,8 +230,9 @@ pub const TestDevice = struct {
                 };
                 return .{ .window = window, .device = device };
             },
-            .d3d11 => {
-                const device = rhi.Device.init(std.testing.allocator, .{ .backend = .d3d11, .software = true }) catch |err| switch (err) {
+            .d3d11, .d3d12 => {
+                const select: rhi.Select = if (backend == .d3d12) .d3d12 else .d3d11;
+                const device = rhi.Device.init(std.testing.allocator, .{ .backend = select, .software = true }) catch |err| switch (err) {
                     error.NoDevice, error.Unsupported => return error.SkipZigTest,
                     else => return err,
                 };
@@ -244,10 +242,14 @@ pub const TestDevice = struct {
             // There is no browser here to draw in. The backend's own suite
             // runs against the stub; the picture is `examples/web.zig`'s.
             .webgl => return error.SkipZigTest,
-            // No Vulkan backend exists yet.
-            .vulkan => return error.SkipZigTest,
-            // No Direct3D 12 backend exists yet.
-            .d3d12 => return error.SkipZigTest,
+            // No window: a pass into a texture needs no surface.
+            .vulkan => {
+                const device = rhi.Device.init(std.testing.allocator, .{ .backend = .vulkan, .debug = true }) catch |err| switch (err) {
+                    error.NoDevice, error.Unsupported => return error.SkipZigTest,
+                    else => return err,
+                };
+                return .{ .window = null, .device = device };
+            },
             // A backend the caller supplies has no glue here.
             .other => return error.SkipZigTest,
         }

@@ -8,11 +8,12 @@
 //! `*const anyopaque` placeholders. `d3d12_resource.zig`, `d3d12_command.zig`
 //! and `d3d12_pipeline.zig`, siblings of this file, are those declarations -
 //! typed fresh here, the way `IFactory2` below is typed fresh over
-//! `fluxion-d3d`'s `dxgi.IDXGIFactory1`. The MVP scope table in the plan this
-//! implements is narrow on purpose: `.d2` textures only, one mip, one
-//! sample, no render-target texture, no depth, no compute. What that buys is
-//! simplicity in the parts a real Direct3D 12 renderer usually spends the
-//! most code on:
+//! `fluxion-d3d`'s `dxgi.IDXGIFactory1`. It is narrower than the Direct3D 11
+//! backend on purpose: `.d2` textures in `rgba8`, `bgra8` and `r8`, one mip,
+//! one sample, no depth, no compute - and within that, everything a 2D
+//! renderer asks: textures drawn into and sampled after, written in part and
+//! read back. What the narrowness buys is simplicity in the parts a real
+//! Direct3D 12 renderer usually spends the most code on:
 //!
 //! **Buffers are always upload-heap.** CPU-writable, mapped once at creation
 //! and kept mapped for the buffer's life - `updateBuffer` is a `memcpy` into
@@ -25,21 +26,25 @@
 //! (`s0`-`s3`), built once in `open`. A pipeline is a `D3D12_GRAPHICS_PIPELINE_STATE_DESC`
 //! that names it; nothing about binding is per-pipeline.
 //!
-//! **Two heaps per binding kind: permanent and binding-window.** Every
-//! texture's SRV and every sampler's descriptor is written once, at creation,
-//! into a plain (non-shader-visible) heap that never moves. A separate,
-//! small, shader-visible heap - four slots, one per texture/sampler slot -
-//! is what the root descriptor tables actually point at; `set_texture`
-//! copies the one descriptor a slot needs from the permanent heap into that
-//! window with `CopyDescriptorsSimple`, right before the draw that reads it.
-//! This is the ordinary way an engine assembles descriptors that were made
-//! at unrelated times into the one contiguous range a table call needs.
+//! **Two heaps per binding kind: permanent and a ring.** Every texture's SRV
+//! and every sampler's descriptor is written once, at creation, into a plain
+//! (non-shader-visible) heap that never moves. The root descriptor tables
+//! point into a shader-visible ring instead: a draw whose textures or
+//! samplers changed since the last one takes the next four slots of the
+//! ring, has the four descriptors copied there with `CopyDescriptorsSimple`,
+//! and points its table at them - so each draw reads the textures it was
+//! given, not whatever the last `set_texture` of the list left. The ring
+//! starts over at every submit, which is safe because a submit has waited for
+//! the GPU before the next one records; one that runs out of ring executes
+//! what it has, waits, and records on from the same state.
 //!
 //! **Fully synchronous.** `submit` records the whole command list, executes
 //! it, signals a fence and spins on `GetCompletedValue` until the GPU has
 //! caught up, every time. No double-buffering, no multiple frames in flight.
 //! Slower than a real engine would want, and simple enough that nothing here
-//! has to reason about what the GPU might still be reading.
+//! has to reason about what the GPU might still be reading. A texture's state
+//! is therefore known on the CPU: it is sampled-from between submits, and a
+//! pass, a write or a read moves it and moves it back.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -69,7 +74,7 @@ comptime {
 }
 
 // -------------------------------------------------------------------------
-// Limits this MVP holds itself to. Not hardware limits - the real device
+// Limits this backend holds itself to. Not hardware limits - the real device
 // allows far more - but the shapes this file's fixed root signature and
 // fixed-size descriptor heaps were built for.
 // -------------------------------------------------------------------------
@@ -79,11 +84,18 @@ const max_attributes = 16;
 /// `t0`..`t3` and `s0`..`s3`: the width of the one descriptor table of each
 /// kind the shared root signature has.
 const max_binding_slots = 4;
-/// How many textures/samplers this device can have alive at once. A fixed
-/// heap size, because a descriptor heap cannot be resized - see the module
-/// comment on the permanent/binding-window split.
-const max_srv_descriptors = 1024;
+/// How many textures/samplers this device can have alive at once, and how
+/// many textures can be drawn into. A fixed heap size, because a descriptor
+/// heap cannot be resized - see the module comment on the permanent heaps
+/// and the ring.
+const max_srv_descriptors = 4096;
 const max_sampler_descriptors = 256;
+const max_rtv_descriptors = 256;
+/// The shader-visible rings, in descriptors: four for every draw whose
+/// textures changed, and four for every draw whose samplers did. A sampler
+/// heap that shaders see holds at most 2048.
+const ring_srv_descriptors = 65536;
+const ring_sampler_descriptors = 2048;
 
 const root_param_cbv0 = 0;
 const root_param_srv_table = 4;
@@ -238,20 +250,54 @@ const D3d = struct {
     sampler_next: u32 = 0,
     sampler_free: std.ArrayListUnmanaged(u32) = .empty,
 
-    /// The four-slot, shader-visible windows the root descriptor tables
-    /// point at. `set_texture` copies into these; they are never resized and
-    /// never re-bound mid-frame.
-    binding_srv_heap: *rc.ID3D12DescriptorHeap,
-    binding_sampler_heap: *rc.ID3D12DescriptorHeap,
+    /// A texture's render target view, for the textures a pass draws into:
+    /// made when the texture is, kept with it.
+    rtv_heap: *rc.ID3D12DescriptorHeap,
+    rtv_next: u32 = 0,
+    rtv_free: std.ArrayListUnmanaged(u32) = .empty,
+    /// What an empty slot of a table reads: a null SRV and a plain sampler,
+    /// in the permanent heaps.
+    null_srv: rc.CpuDescriptorHandle,
+    plain_sampler: rc.CpuDescriptorHandle,
+
+    /// The shader-visible rings the root descriptor tables point into; see
+    /// the module comment. `*_used` is how far into each the recording that is
+    /// open has come.
+    ring_srv_heap: *rc.ID3D12DescriptorHeap,
+    ring_sampler_heap: *rc.ID3D12DescriptorHeap,
+    ring_srv_used: u32 = 0,
+    ring_sampler_used: u32 = 0,
 
     debug: bool,
     renderer: [128]u8 = undefined,
     renderer_len: usize = 0,
 
-    // Per-submit recording state.
+    // Per-submit recording state, kept so that a recording that runs out of
+    // ring can be executed and picked up again where it was.
+    recording: bool = false,
     current_pipeline: ?*PipelineRes = null,
     vertex_bindings: [max_vertex_slots]VertexBinding = @splat(.{}),
     bindings_dirty: bool = false,
+    index_view: ?cmdmod.IndexBufferView = null,
+    uniforms: [max_binding_slots]u64 = @splat(0),
+    textures: [max_binding_slots]rc.CpuDescriptorHandle = undefined,
+    samplers: [max_binding_slots]rc.CpuDescriptorHandle = undefined,
+    textures_dirty: bool = true,
+    samplers_dirty: bool = true,
+    target: ?Target = null,
+    viewport: cmdmod.Viewport = .{ .width = 0, .height = 0 },
+    scissor: cmdmod.Rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+};
+
+/// What the pass that is open draws into.
+const Target = struct {
+    rtv: rc.CpuDescriptorHandle,
+    width: u32,
+    height: u32,
+    /// What it goes back to when the pass ends: the back buffer to
+    /// presenting, a texture to being sampled.
+    resource: *rc.ID3D12Resource,
+    texture: ?*TextureRes,
 };
 
 const VertexBinding = struct {
@@ -272,10 +318,20 @@ const TextureRes = struct {
     resource: *rc.ID3D12Resource,
     width: u32,
     height: u32,
-    format: rc.Format,
+    format: types.Format,
     srv_index: u32,
     srv_cpu: rc.CpuDescriptorHandle,
+    /// Its render target view, for a texture made to be drawn into.
+    rtv_index: ?u32 = null,
+    rtv_cpu: rc.CpuDescriptorHandle = .{},
+    /// Where it is now, as the recording that is open has left it: `sampled`
+    /// between submits.
+    state: rc.ResourceStates = sampled,
 };
+
+/// What a texture is between submits: readable by any stage, since the root
+/// signature lets every stage see the tables.
+const sampled: rc.ResourceStates = .{ .pixel_shader_resource = true, .non_pixel_shader_resource = true };
 
 const SamplerRes = struct {
     index: u32,
@@ -305,11 +361,6 @@ const SurfaceRes = struct {
     rtv_heap: *rc.ID3D12DescriptorHeap,
     back_buffers: [2]*rc.ID3D12Resource,
     rtv_handles: [2]rc.CpuDescriptorHandle,
-    /// Whether back buffer `i` is `RENDER_TARGET` right now rather than
-    /// `PRESENT` - so `end_pass` knows whether there is a transition to
-    /// undo, and `resizeSurface`/`destroySurface` never release a resource
-    /// the GPU might still be transitioning.
-    in_render_target: [2]bool = .{ false, false },
     width: u32,
     height: u32,
 };
@@ -389,18 +440,34 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     errdefer _ = com.release(srv_heap);
     const sampler_heap = rc.createDescriptorHeap(device, .{ .type = .sampler, .num_descriptors = max_sampler_descriptors }) catch return error.NoDevice;
     errdefer _ = com.release(sampler_heap);
-    const binding_srv_heap = rc.createDescriptorHeap(device, .{
+    const rtv_heap = rc.createDescriptorHeap(device, .{ .type = .rtv, .num_descriptors = max_rtv_descriptors }) catch return error.NoDevice;
+    errdefer _ = com.release(rtv_heap);
+    const ring_srv_heap = rc.createDescriptorHeap(device, .{
         .type = .cbv_srv_uav,
-        .num_descriptors = max_binding_slots,
+        .num_descriptors = ring_srv_descriptors,
         .flags = .{ .shader_visible = true },
     }) catch return error.NoDevice;
-    errdefer _ = com.release(binding_srv_heap);
-    const binding_sampler_heap = rc.createDescriptorHeap(device, .{
+    errdefer _ = com.release(ring_srv_heap);
+    const ring_sampler_heap = rc.createDescriptorHeap(device, .{
         .type = .sampler,
-        .num_descriptors = max_binding_slots,
+        .num_descriptors = ring_sampler_descriptors,
         .flags = .{ .shader_visible = true },
     }) catch return error.NoDevice;
-    errdefer _ = com.release(binding_sampler_heap);
+    errdefer _ = com.release(ring_sampler_heap);
+
+    // The first slot of each permanent heap is what an empty table slot
+    // reads: a null SRV samples as zero, as an unbound one does on Direct3D
+    // 11, and a plain sampler is always a valid one.
+    const srv_increment = rc.descriptorHandleIncrementSize(device, .cbv_srv_uav);
+    const sampler_increment = rc.descriptorHandleIncrementSize(device, .sampler);
+    const null_srv = rc.cpuHeapStart(srv_heap);
+    rc.createShaderResourceView(device, null, &.{
+        .format = .r8g8b8a8_unorm,
+        .dimension = .texture2d,
+        .u = .{ .texture2d = .{ .mip_levels = 1 } },
+    }, null_srv);
+    const plain_sampler = rc.cpuHeapStart(sampler_heap);
+    rc.createSampler(device, &.{ .min_lod = 0, .max_lod = 0 }, plain_sampler);
 
     const self = try gpa.create(D3d);
     errdefer gpa.destroy(self);
@@ -416,12 +483,17 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .fence = fence,
         .root_signature = root_signature,
         .rtv_increment = rc.descriptorHandleIncrementSize(device, .rtv),
-        .cbv_srv_uav_increment = rc.descriptorHandleIncrementSize(device, .cbv_srv_uav),
-        .sampler_increment = rc.descriptorHandleIncrementSize(device, .sampler),
+        .cbv_srv_uav_increment = srv_increment,
+        .sampler_increment = sampler_increment,
         .srv_heap = srv_heap,
+        .srv_next = 1,
         .sampler_heap = sampler_heap,
-        .binding_srv_heap = binding_srv_heap,
-        .binding_sampler_heap = binding_sampler_heap,
+        .sampler_next = 1,
+        .rtv_heap = rtv_heap,
+        .null_srv = null_srv,
+        .plain_sampler = plain_sampler,
+        .ring_srv_heap = ring_srv_heap,
+        .ring_sampler_heap = ring_sampler_heap,
         .debug = desc.debug,
     };
 
@@ -485,8 +557,9 @@ fn deinit(impl: backend.Impl) void {
     // outstanding needs a flush here.
     if (self.compiler) |*c| c.unload();
     com.releaseAll(.{
-        self.binding_sampler_heap,
-        self.binding_srv_heap,
+        self.ring_sampler_heap,
+        self.ring_srv_heap,
+        self.rtv_heap,
         self.sampler_heap,
         self.srv_heap,
         self.root_signature,
@@ -498,6 +571,7 @@ fn deinit(impl: backend.Impl) void {
     });
     self.srv_free.deinit(self.gpa);
     self.sampler_free.deinit(self.gpa);
+    self.rtv_free.deinit(self.gpa);
     _ = com.release(self.factory);
     self.dxgi_library.unload();
     self.library.unload();
@@ -510,9 +584,9 @@ fn info(impl: backend.Impl) types.Info {
 }
 
 // -------------------------------------------------------------------------
-// Capabilities: the MVP scope table, as data. `.d2` only, one sample, one
-// mip, `rgba8_unorm`/`bgra8_unorm`, sampled but never a render target -
-// `Device` refuses everything this does not claim before this file is asked.
+// Capabilities, as data. `.d2` only, one sample, one mip, `rgba8_unorm`,
+// `bgra8_unorm` and `r8_unorm`, each sampled and drawn into - `Device`
+// refuses everything this does not claim before this file is asked.
 // -------------------------------------------------------------------------
 
 fn caps(impl: backend.Impl) types.Caps {
@@ -524,18 +598,18 @@ fn caps(impl: backend.Impl) types.Caps {
             .max_texture_cube = 16384,
             .max_texture_layers = 2048,
             // Clamped to one: `Device.createSampler` clamps every request to
-            // this, so the MVP's "no anisotropy above one" is enforced here
-            // rather than by this file refusing a sampler by hand.
+            // this, so "no anisotropy above one" is enforced here rather than
+            // by this file refusing a sampler by hand.
             .max_anisotropy = 1,
             .max_color_attachments = 1,
         },
-        .features = .{},
+        .features = .{ .sampler_border = true, .sampler_lod_bias = true },
     };
-    const sampled: types.FormatSupport = .{
+    const support: types.FormatSupport = .{
         .sampled = true,
         .filterable = true,
-        .render_target = false,
-        .blendable = false,
+        .render_target = true,
+        .blendable = true,
         .generate_mips = false,
         .sample_counts = 0b1,
         .dimensions = blk: {
@@ -544,8 +618,9 @@ fn caps(impl: backend.Impl) types.Caps {
             break :blk set;
         },
     };
-    answer.formats.set(.rgba8_unorm, sampled);
-    answer.formats.set(.bgra8_unorm, sampled);
+    answer.formats.set(.rgba8_unorm, support);
+    answer.formats.set(.bgra8_unorm, support);
+    answer.formats.set(.r8_unorm, support);
     return answer;
 }
 
@@ -553,6 +628,7 @@ fn textureFormat(format: types.Format) ?rc.Format {
     return switch (format) {
         .rgba8_unorm => .r8g8b8a8_unorm,
         .bgra8_unorm => .b8g8r8a8_unorm,
+        .r8_unorm => .r8_unorm,
         else => null,
     };
 }
@@ -602,6 +678,22 @@ fn samplerHandle(self: *D3d, i: u32) rc.CpuDescriptorHandle {
     return rc.cpuHeapStart(self.sampler_heap).offsetBy(i, self.sampler_increment);
 }
 
+fn allocRtv(self: *D3d) Error!u32 {
+    if (takeFree(&self.rtv_free)) |i| return i;
+    if (self.rtv_next >= max_rtv_descriptors) return error.Failed;
+    const i = self.rtv_next;
+    self.rtv_next += 1;
+    return i;
+}
+
+fn freeRtv(self: *D3d, i: u32) void {
+    self.rtv_free.append(self.gpa, i) catch {};
+}
+
+fn rtvHandle(self: *D3d, i: u32) rc.CpuDescriptorHandle {
+    return rc.cpuHeapStart(self.rtv_heap).offsetBy(i, self.rtv_increment);
+}
+
 // -------------------------------------------------------------------------
 // Recording and waiting: the two halves every submit - a frame's, or a
 // texture upload's - is built from.
@@ -610,9 +702,11 @@ fn samplerHandle(self: *D3d, i: u32) rc.CpuDescriptorHandle {
 fn beginRecording(self: *D3d) Error!void {
     self.cmd_allocator.vtable.Reset(self.cmd_allocator).check() catch return error.Failed;
     self.list.vtable.Reset(self.list, self.cmd_allocator, null).check() catch return error.Failed;
+    self.recording = true;
 }
 
 fn closeExecuteAndWait(self: *D3d) Error!void {
+    self.recording = false;
     self.list.vtable.Close(self.list).check() catch return error.Failed;
     const lists = [_]*cmdmod.ID3D12GraphicsCommandList{self.list};
     cmdmod.executeCommandLists(self.queue, &lists);
@@ -636,6 +730,26 @@ fn waitForGpuIdle(self: *D3d) void {
     self.fence_value += 1;
     self.queue.vtable.Signal(self.queue, @ptrCast(self.fence), self.fence_value).check() catch return;
     while (self.fence.vtable.GetCompletedValue(self.fence) < self.fence_value) {}
+}
+
+/// Record a texture's move to `to`, if it is not there already, and keep
+/// where it is now. Every recording executes in full before the next begins,
+/// so the state kept here is the state the GPU will find.
+fn transition(self: *D3d, res: *TextureRes, to: rc.ResourceStates) void {
+    if (@as(u32, @bitCast(res.state)) == @as(u32, @bitCast(to))) return;
+    const barrier = cmdmod.ResourceBarrier.transition(res.resource, res.state, to);
+    self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{barrier});
+    res.state = to;
+}
+
+/// What a submit that failed part-way leaves: the pass that was open ended -
+/// its target back where the next submit and `present` expect it - and what
+/// was recorded executed, so that the states kept on the CPU stay true and
+/// the list is closed for the next `Reset`.
+fn abandonRecording(self: *D3d) void {
+    if (!self.recording) return;
+    endTarget(self);
+    closeExecuteAndWait(self) catch {};
 }
 
 // -------------------------------------------------------------------------
@@ -690,21 +804,17 @@ fn updateBuffer(impl: backend.Impl, native: backend.Native, offset: usize, bytes
 fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Native {
     const self = cast(impl);
     // `Device` has already checked `caps`, so this is defence in depth: a
-    // shape or a format outside the MVP never reaches here in practice.
+    // shape or a format outside what `caps` claims never reaches here.
     if (desc.dimension != .d2 or desc.samples != 1 or desc.mip_levels != 1) return error.Unsupported;
     const format = textureFormat(desc.format) orelse return error.Unsupported;
 
     const res = try self.gpa.create(TextureRes);
     errdefer self.gpa.destroy(res);
 
-    const rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{});
-    const has_data = desc.data != null;
-    const initial_state: rc.ResourceStates = if (has_data) .{ .copy_dest = true } else .{ .pixel_shader_resource = true };
-
-    const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, initial_state, null) catch return error.Failed;
+    const target = desc.usage.render_target;
+    const rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_render_target = target });
+    const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, sampled, null) catch return error.Failed;
     errdefer _ = com.release(obj);
-
-    if (desc.data) |data| try uploadTexture(self, obj, rdesc, desc, data);
 
     const slot = try allocSrv(self);
     errdefer freeSrv(self, slot);
@@ -715,66 +825,123 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
         .u = .{ .texture2d = .{ .mip_levels = 1 } },
     }, cpu);
 
-    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = format, .srv_index = slot, .srv_cpu = cpu };
-    return res;
-}
-
-/// Level zero, uploaded through a one-off staging buffer:
-/// `GetCopyableFootprints` says how the driver wants the rows padded, the
-/// staging buffer is filled to that layout, and `CopyTextureRegion` reads it
-/// - the standard shape of an upload onto a `DEFAULT`-heap texture. Runs its
-/// own record/execute/wait, sharing the one command list and allocator
-/// `submit` also uses: creation always happens between frames, never while
-/// one is being recorded.
-fn uploadTexture(self: *D3d, obj: *rc.ID3D12Resource, rdesc: rc.ResourceDesc, desc: types.TextureDesc, data: []const u8) Error!void {
-    var footprint: rc.PlacedSubresourceFootprint = undefined;
-    var total_bytes: u64 = 0;
-    rc.getCopyableFootprints(self.device, &rdesc, 0, 1, 0, @ptrCast(&footprint), null, null, &total_bytes);
-
-    const staging = rc.createCommittedResource(self.device, .of(.upload), rc.heap_flags_none, .buffer(total_bytes), .generic_read, null) catch return error.Failed;
-    defer _ = com.release(staging);
-
-    var mapped: ?*anyopaque = null;
-    staging.vtable.Map(staging, 0, &rc.Range.nothing_read, &mapped).check() catch return error.Failed;
-    const dst: [*]u8 = @ptrCast(mapped.?);
-
-    const src_pitch = desc.effectiveRowPitch();
-    const row_bytes = desc.format.rowBytes(desc.width);
-    const rows = desc.format.rowCount(desc.height);
-    var y: u32 = 0;
-    while (y < rows) : (y += 1) {
-        const src_row = data[y * src_pitch ..][0..row_bytes];
-        const dst_row = dst[footprint.offset + y * footprint.footprint.row_pitch ..][0..row_bytes];
-        @memcpy(dst_row, src_row);
+    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu };
+    if (target) {
+        const rtv = try allocRtv(self);
+        res.rtv_index = rtv;
+        res.rtv_cpu = rtvHandle(self, rtv);
+        rc.createRenderTargetView(self.device, obj, null, res.rtv_cpu);
     }
-    staging.vtable.Unmap(staging, 0, null);
+    errdefer if (res.rtv_index) |rtv| freeRtv(self, rtv);
 
-    try beginRecording(self);
-    const dst_loc = cmdmod.TextureCopyLocation.subresource(obj, 0);
-    const src_loc = cmdmod.TextureCopyLocation.placed(staging, footprint);
-    self.list.vtable.CopyTextureRegion(self.list, &dst_loc, 0, 0, 0, &src_loc, null);
-    const barrier = cmdmod.ResourceBarrier.transition(obj, .{ .copy_dest = true }, .{ .pixel_shader_resource = true });
-    self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{barrier});
-    try closeExecuteAndWait(self);
+    // Level zero, the way `writeTexture` fills any box of it.
+    if (desc.data) |data| try writeTexture(impl, res, .{ .width = desc.width, .height = desc.height, .depth = 1 }, data, desc.effectiveRowPitch(), 0);
+    return res;
 }
 
 fn destroyTexture(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(TextureRes, native);
     freeSrv(self, res.srv_index);
+    if (res.rtv_index) |rtv| freeRtv(self, rtv);
     _ = com.release(res.resource);
     self.gpa.destroy(res);
 }
 
-/// Outside the MVP scope: see the module comment and the plan's scope table.
-fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.TextureRegion, bytes: []const u8, row_pitch: usize, slice_pitch: usize) Error!void {
-    _ = .{ impl, native, region, bytes, row_pitch, slice_pitch };
-    return error.Unsupported;
+/// Where rows of `width` texels go in a buffer a copy reads or writes: the
+/// pitch a copy wants, a multiple of `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`.
+fn footprintOf(res: *const TextureRes, width: u32, height: u32) rc.PlacedSubresourceFootprint {
+    return .{ .offset = 0, .footprint = .{
+        .format = textureFormat(res.format).?,
+        .width = width,
+        .height = height,
+        .depth = 1,
+        .row_pitch = @intCast(std.mem.alignForward(usize, res.format.rowBytes(width), 256)),
+    } };
 }
 
+/// A buffer the CPU writes and a copy reads, or the other way round.
+fn transferBuffer(self: *D3d, heap: rc.HeapType, size: u64) Error!*rc.ID3D12Resource {
+    const state: rc.ResourceStates = if (heap == .readback) .{ .copy_dest = true } else .generic_read;
+    return rc.createCommittedResource(self.device, .of(heap), rc.heap_flags_none, .buffer(size), state, null) catch return error.Failed;
+}
+
+/// Any box of level zero, through a one-off staging buffer laid out the way
+/// a copy wants its rows padded, and `CopyTextureRegion` onto the texture.
+/// Runs its own record/execute/wait, sharing the one command list and
+/// allocator `submit` also uses: writing happens between submits, never
+/// while one is being recorded.
+fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.TextureRegion, bytes: []const u8, row_pitch: usize, slice_pitch: usize) Error!void {
+    _ = slice_pitch;
+    const self = cast(impl);
+    const res = as(TextureRes, native);
+    const footprint = footprintOf(res, region.width, region.height);
+    const row_bytes = res.format.rowBytes(region.width);
+
+    const staging = try transferBuffer(self, .upload, @as(u64, footprint.footprint.row_pitch) * region.height);
+    defer _ = com.release(staging);
+    var mapped: ?*anyopaque = null;
+    staging.vtable.Map(staging, 0, &rc.Range.nothing_read, &mapped).check() catch return error.Failed;
+    const dst: [*]u8 = @ptrCast(mapped.?);
+    for (0..region.height) |y| {
+        @memcpy(dst[y * footprint.footprint.row_pitch ..][0..row_bytes], bytes[y * row_pitch ..][0..row_bytes]);
+    }
+    staging.vtable.Unmap(staging, 0, null);
+
+    try beginRecording(self);
+    errdefer abandonRecording(self);
+    transition(self, res, .{ .copy_dest = true });
+    const dst_loc = cmdmod.TextureCopyLocation.subresource(res.resource, 0);
+    const src_loc = cmdmod.TextureCopyLocation.placed(staging, footprint);
+    self.list.vtable.CopyTextureRegion(self.list, &dst_loc, region.x, region.y, 0, &src_loc, null);
+    transition(self, res, sampled);
+    try closeExecuteAndWait(self);
+}
+
+/// Level zero, copied into a readback buffer and handed back as RGBA, eight
+/// bits a channel, top row first - as Direct3D keeps a texture - with one
+/// channel repeated into red, green and blue as the Direct3D 11 backend does.
 fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresource, gpa: Allocator) Error![]u8 {
-    _ = .{ impl, native, sub, gpa };
-    return error.Unsupported;
+    _ = sub;
+    const self = cast(impl);
+    const res = as(TextureRes, native);
+    const footprint = footprintOf(res, res.width, res.height);
+    const size = @as(u64, footprint.footprint.row_pitch) * res.height;
+
+    const readback = try transferBuffer(self, .readback, size);
+    defer _ = com.release(readback);
+
+    try beginRecording(self);
+    errdefer abandonRecording(self);
+    transition(self, res, .{ .copy_source = true });
+    const dst_loc = cmdmod.TextureCopyLocation.placed(readback, footprint);
+    const src_loc = cmdmod.TextureCopyLocation.subresource(res.resource, 0);
+    self.list.vtable.CopyTextureRegion(self.list, &dst_loc, 0, 0, 0, &src_loc, null);
+    transition(self, res, sampled);
+    try closeExecuteAndWait(self);
+
+    var mapped: ?*anyopaque = null;
+    const everything: rc.Range = .{ .begin = 0, .end = @intCast(size) };
+    readback.vtable.Map(readback, 0, &everything, &mapped).check() catch return error.Failed;
+    defer readback.vtable.Unmap(readback, 0, &rc.Range.nothing_read);
+    const data: [*]const u8 = @ptrCast(mapped.?);
+
+    const out_row = @as(usize, res.width) * 4;
+    const pixels = try gpa.alloc(u8, out_row * res.height);
+    for (0..res.height) |y| {
+        const source = data[y * footprint.footprint.row_pitch ..];
+        const destination = pixels[y * out_row ..][0..out_row];
+        for (0..res.width) |x| {
+            const texel = destination[x * 4 ..][0..4];
+            switch (res.format) {
+                .rgba8_unorm => @memcpy(texel, source[x * 4 ..][0..4]),
+                .bgra8_unorm => texel.* = .{ source[x * 4 + 2], source[x * 4 + 1], source[x * 4], source[x * 4 + 3] },
+                .r8_unorm => texel.* = .{ source[x], source[x], source[x], 255 },
+                else => unreachable,
+            }
+        }
+    }
+    return pixels;
 }
 
 // -------------------------------------------------------------------------
@@ -786,22 +953,42 @@ fn addressMode(w: types.Wrap) rc.TextureAddressMode {
         .repeat => .wrap,
         .clamp_to_edge => .clamp,
         .mirror => .mirror,
-        // `Features.sampler_border` is false, so `Device.createSampler`
-        // refuses this before it reaches here.
-        .border => .clamp,
+        .border => .border,
     };
 }
 
 fn samplerFilter(desc: types.SamplerDesc) rc.Filter {
     // `D3D12_FILTER`'s bit encoding: bit 0x10 linear-minifies, 0x04
-    // linear-magnifies, 0x01 linear-filters between mips. `max_anisotropy`
-    // is always clamped to one by `Device`, so the anisotropic encoding is
-    // never needed here.
+    // linear-magnifies, 0x01 linear-filters between mips, 0x80 compares.
+    // `max_anisotropy` is always clamped to one by `Device`, so the
+    // anisotropic encoding is never needed here.
     var bits: u32 = 0;
     if (desc.min_filter == .linear) bits |= 0x10;
     if (desc.mag_filter == .linear) bits |= 0x04;
     if (desc.mip_filter == .linear) bits |= 0x01;
+    if (desc.compare != null) bits |= 0x80;
     return @enumFromInt(bits);
+}
+
+fn comparison(compare: ?types.CompareFn) rc.ComparisonFunc {
+    return switch (compare orelse return .never) {
+        .never => .never,
+        .less => .less,
+        .equal => .equal,
+        .less_equal => .less_equal,
+        .greater => .greater,
+        .not_equal => .not_equal,
+        .greater_equal => .greater_equal,
+        .always => .always,
+    };
+}
+
+fn borderColor(border: types.BorderColor) [4]f32 {
+    return switch (border) {
+        .transparent_black => .{ 0, 0, 0, 0 },
+        .opaque_black => .{ 0, 0, 0, 1 },
+        .opaque_white => .{ 1, 1, 1, 1 },
+    };
 }
 
 fn createSampler(impl: backend.Impl, desc: types.SamplerDesc) Error!backend.Native {
@@ -821,9 +1008,10 @@ fn createSampler(impl: backend.Impl, desc: types.SamplerDesc) Error!backend.Nati
         .address_u = addressMode(desc.wrap_u),
         .address_v = addressMode(desc.wrap_v),
         .address_w = addressMode(desc.wrap_w),
-        .mip_lod_bias = 0,
+        .mip_lod_bias = desc.lod_bias,
         .max_anisotropy = @max(1, desc.max_anisotropy),
-        .comparison_func = .never,
+        .comparison_func = comparison(desc.compare),
+        .border_color = borderColor(desc.border),
         .min_lod = if (level_zero_only) 0 else desc.lod_min,
         .max_lod = if (level_zero_only) 0 else desc.lod_max,
     }, cpu);
@@ -1106,7 +1294,6 @@ fn attachBackBuffers(self: *D3d, res: *SurfaceRes) Error!void {
         rc.createRenderTargetView(self.device, buf, null, handle);
         res.back_buffers[i] = buf;
         res.rtv_handles[i] = handle;
-        res.in_render_target[i] = false;
     }
 }
 
@@ -1151,63 +1338,57 @@ fn present(impl: backend.Impl, native: backend.Native, vsync: bool) Error!void {
 fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Command) Error!void {
     const self = cast(impl);
     try beginRecording(self);
+    errdefer abandonRecording(self);
 
-    const cmd_list = self.list;
-    cmd_list.vtable.SetGraphicsRootSignature(cmd_list, self.root_signature);
-    const heaps = [_]*rc.ID3D12DescriptorHeap{ self.binding_srv_heap, self.binding_sampler_heap };
-    cmd_list.vtable.SetDescriptorHeaps(cmd_list, heaps.len, &heaps);
-    cmd_list.vtable.SetGraphicsRootDescriptorTable(cmd_list, root_param_srv_table, rc.gpuHeapStart(self.binding_srv_heap));
-    cmd_list.vtable.SetGraphicsRootDescriptorTable(cmd_list, root_param_sampler_table, rc.gpuHeapStart(self.binding_sampler_heap));
-
+    self.ring_srv_used = 0;
+    self.ring_sampler_used = 0;
     self.current_pipeline = null;
     self.vertex_bindings = @splat(.{});
     self.bindings_dirty = false;
-    var current_surface: ?*SurfaceRes = null;
+    self.index_view = null;
+    self.uniforms = @splat(0);
+    self.textures = @splat(self.null_srv);
+    self.samplers = @splat(self.plain_sampler);
+    self.textures_dirty = true;
+    self.samplers_dirty = true;
+    self.target = null;
+    setUpList(self);
 
+    const cmd_list = self.list;
     for (list_cmds) |command| {
         switch (command) {
             .begin_pass => |pass| {
                 if (pass.depth != null or pass.extra_colors.len > 0) return error.Unsupported;
                 const color = pass.color orelse return error.Unsupported;
-                switch (color.target) {
-                    .surface => |h| {
+                const target: Target = switch (color.target) {
+                    .surface => |h| blk: {
                         const surf = as(SurfaceRes, device.surfaces.get(h).?.native);
                         const idx = surf.swap_chain.vtable.GetCurrentBackBufferIndex(surf.swap_chain);
                         const to_rt = cmdmod.ResourceBarrier.transition(surf.back_buffers[idx], .{}, .{ .render_target = true });
                         cmd_list.vtable.ResourceBarrier(cmd_list, 1, &[_]cmdmod.ResourceBarrier{to_rt});
-                        surf.in_render_target[idx] = true;
-
-                        const rtv = surf.rtv_handles[idx];
-                        cmd_list.vtable.OMSetRenderTargets(cmd_list, 1, @ptrCast(&rtv), 0, null);
-                        if (color.load == .clear) cmd_list.vtable.ClearRenderTargetView(cmd_list, rtv, &color.clear_color, 0, null);
-
-                        const vp: cmdmod.Viewport = .{ .width = @floatFromInt(surf.width), .height = @floatFromInt(surf.height) };
-                        cmd_list.vtable.RSSetViewports(cmd_list, 1, &[_]cmdmod.Viewport{vp});
-                        const sc: cmdmod.Rect = .{ .left = 0, .top = 0, .right = @intCast(surf.width), .bottom = @intCast(surf.height) };
-                        cmd_list.vtable.RSSetScissorRects(cmd_list, 1, &[_]cmdmod.Rect{sc});
-
-                        current_surface = surf;
+                        break :blk .{ .rtv = surf.rtv_handles[idx], .width = surf.width, .height = surf.height, .resource = surf.back_buffers[idx], .texture = null };
                     },
-                    // Structurally unreachable: no texture this backend
-                    // makes ever has `usage.render_target = true`, since
-                    // `caps` never advertises it.
-                    .texture => return error.Unsupported,
-                }
+                    .texture => |h| blk: {
+                        const res = as(TextureRes, device.textures.get(h).?.native);
+                        if (res.rtv_index == null) return error.Unsupported;
+                        transition(self, res, .{ .render_target = true });
+                        break :blk .{ .rtv = res.rtv_cpu, .width = res.width, .height = res.height, .resource = res.resource, .texture = res };
+                    },
+                };
+                self.target = target;
+                cmd_list.vtable.OMSetRenderTargets(cmd_list, 1, @ptrCast(&target.rtv), 0, null);
+                if (color.load == .clear) cmd_list.vtable.ClearRenderTargetView(cmd_list, target.rtv, &color.clear_color, 0, null);
+
+                self.viewport = .{ .width = @floatFromInt(target.width), .height = @floatFromInt(target.height) };
+                self.scissor = .{ .left = 0, .top = 0, .right = @intCast(target.width), .bottom = @intCast(target.height) };
+                cmd_list.vtable.RSSetViewports(cmd_list, 1, &[_]cmdmod.Viewport{self.viewport});
+                cmd_list.vtable.RSSetScissorRects(cmd_list, 1, &[_]cmdmod.Rect{self.scissor});
+
                 self.current_pipeline = null;
                 self.vertex_bindings = @splat(.{});
                 self.bindings_dirty = false;
             },
-            .end_pass => {
-                if (current_surface) |surf| {
-                    const idx = surf.swap_chain.vtable.GetCurrentBackBufferIndex(surf.swap_chain);
-                    if (surf.in_render_target[idx]) {
-                        const to_present = cmdmod.ResourceBarrier.transition(surf.back_buffers[idx], .{ .render_target = true }, .{});
-                        cmd_list.vtable.ResourceBarrier(cmd_list, 1, &[_]cmdmod.ResourceBarrier{to_present});
-                        surf.in_render_target[idx] = false;
-                    }
-                    current_surface = null;
-                }
-            },
+            .end_pass => endTarget(self),
             .set_pipeline => |h| {
                 const res = as(PipelineRes, device.pipelines.get(h).?.native);
                 self.current_pipeline = res;
@@ -1216,22 +1397,22 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                 cmd_list.vtable.IASetPrimitiveTopology(cmd_list, res.topology);
             },
             .set_viewport => |v| {
-                const vp: cmdmod.Viewport = .{ .top_left_x = v.x, .top_left_y = v.y, .width = v.width, .height = v.height, .min_depth = v.min_depth, .max_depth = v.max_depth };
-                cmd_list.vtable.RSSetViewports(cmd_list, 1, &[_]cmdmod.Viewport{vp});
+                self.viewport = .{ .top_left_x = v.x, .top_left_y = v.y, .width = v.width, .height = v.height, .min_depth = v.min_depth, .max_depth = v.max_depth };
+                cmd_list.vtable.RSSetViewports(cmd_list, 1, &[_]cmdmod.Viewport{self.viewport});
             },
             .set_scissor => |maybe| {
-                const r: cmdmod.Rect = if (maybe) |rect| .{
+                self.scissor = if (maybe) |rect| .{
                     .left = rect.x,
                     .top = rect.y,
                     .right = rect.x + @as(i32, @intCast(rect.width)),
                     .bottom = rect.y + @as(i32, @intCast(rect.height)),
-                } else if (current_surface) |surf| .{
+                } else if (self.target) |target| .{
                     .left = 0,
                     .top = 0,
-                    .right = @intCast(surf.width),
-                    .bottom = @intCast(surf.height),
+                    .right = @intCast(target.width),
+                    .bottom = @intCast(target.height),
                 } else .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-                cmd_list.vtable.RSSetScissorRects(cmd_list, 1, &[_]cmdmod.Rect{r});
+                cmd_list.vtable.RSSetScissorRects(cmd_list, 1, &[_]cmdmod.Rect{self.scissor});
             },
             .set_vertex_buffer => |b| {
                 if (b.slot >= max_vertex_slots) return error.Unsupported;
@@ -1241,36 +1422,41 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
             },
             .set_index_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                const view: cmdmod.IndexBufferView = .{
+                self.index_view = .{
                     .buffer_location = res.resource.vtable.GetGPUVirtualAddress(res.resource),
                     .size_in_bytes = res.size,
                     .format = if (b.format == .u16) .r16_uint else .r32_uint,
                 };
-                cmd_list.vtable.IASetIndexBuffer(cmd_list, &view);
+                cmd_list.vtable.IASetIndexBuffer(cmd_list, &self.index_view.?);
             },
             .set_uniform_buffer => |b| {
                 if (b.slot >= max_binding_slots) return error.Unsupported;
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                cmd_list.vtable.SetGraphicsRootConstantBufferView(cmd_list, root_param_cbv0 + b.slot, res.resource.vtable.GetGPUVirtualAddress(res.resource));
+                self.uniforms[b.slot] = res.resource.vtable.GetGPUVirtualAddress(res.resource);
+                cmd_list.vtable.SetGraphicsRootConstantBufferView(cmd_list, root_param_cbv0 + b.slot, self.uniforms[b.slot]);
             },
             .set_texture => |b| {
                 if (b.slot >= max_binding_slots) return error.Unsupported;
                 const texture = as(TextureRes, device.textures.get(b.texture).?.native);
                 const sampler = as(SamplerRes, device.samplers.get(b.sampler).?.native);
-                const srv_dest = rc.cpuHeapStart(self.binding_srv_heap).offsetBy(b.slot, self.cbv_srv_uav_increment);
-                rc.copyDescriptorsSimple(self.device, 1, srv_dest, texture.srv_cpu, .cbv_srv_uav);
-                const sampler_dest = rc.cpuHeapStart(self.binding_sampler_heap).offsetBy(b.slot, self.sampler_increment);
-                rc.copyDescriptorsSimple(self.device, 1, sampler_dest, sampler.cpu, .sampler);
+                if (self.textures[b.slot].ptr != texture.srv_cpu.ptr) {
+                    self.textures[b.slot] = texture.srv_cpu;
+                    self.textures_dirty = true;
+                }
+                if (self.samplers[b.slot].ptr != sampler.cpu.ptr) {
+                    self.samplers[b.slot] = sampler.cpu;
+                    self.samplers_dirty = true;
+                }
             },
             .draw => |d| {
-                flushBindings(self);
+                try prepareDraw(self);
                 cmd_list.vtable.DrawInstanced(cmd_list, d.vertex_count, d.instance_count, d.first_vertex, 0);
             },
             .draw_indexed => |d| {
-                flushBindings(self);
+                try prepareDraw(self);
                 cmd_list.vtable.DrawIndexedInstanced(cmd_list, d.index_count, d.instance_count, d.first_index, d.base_vertex, 0);
             },
-            // Unreachable in practice: every MVP texture has one mip level,
+            // Unreachable in practice: every texture here has one mip level,
             // and `Device.submit`'s own validation refuses `generateMips` on
             // one before any backend sees it.
             .generate_mips => return error.Unsupported,
@@ -1278,6 +1464,85 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
     }
 
     try closeExecuteAndWait(self);
+}
+
+/// What every recording starts with: the one root signature, and the rings
+/// its tables point into.
+fn setUpList(self: *D3d) void {
+    self.list.vtable.SetGraphicsRootSignature(self.list, self.root_signature);
+    const heaps = [_]*rc.ID3D12DescriptorHeap{ self.ring_srv_heap, self.ring_sampler_heap };
+    self.list.vtable.SetDescriptorHeaps(self.list, heaps.len, &heaps);
+}
+
+/// End the pass that is open: its texture back to being sampled, or its back
+/// buffer back to being presented.
+fn endTarget(self: *D3d) void {
+    const target = self.target orelse return;
+    self.target = null;
+    if (target.texture) |res| {
+        transition(self, res, sampled);
+    } else {
+        const to_present = cmdmod.ResourceBarrier.transition(target.resource, .{ .render_target = true }, .{});
+        self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{to_present});
+    }
+}
+
+/// The tables a draw reads, made where its textures or samplers changed, and
+/// its vertex buffers bound.
+fn prepareDraw(self: *D3d) Error!void {
+    const out_of_srvs = self.textures_dirty and self.ring_srv_used + max_binding_slots > ring_srv_descriptors;
+    const out_of_samplers = self.samplers_dirty and self.ring_sampler_used + max_binding_slots > ring_sampler_descriptors;
+    if (out_of_srvs or out_of_samplers) try restartRecording(self);
+
+    if (self.textures_dirty) {
+        const at = self.ring_srv_used;
+        self.ring_srv_used += max_binding_slots;
+        const start = rc.cpuHeapStart(self.ring_srv_heap);
+        for (self.textures, 0..) |source, i| {
+            rc.copyDescriptorsSimple(self.device, 1, start.offsetBy(at + @as(u32, @intCast(i)), self.cbv_srv_uav_increment), source, .cbv_srv_uav);
+        }
+        self.list.vtable.SetGraphicsRootDescriptorTable(self.list, root_param_srv_table, rc.gpuHeapStart(self.ring_srv_heap).offsetBy(at, self.cbv_srv_uav_increment));
+        self.textures_dirty = false;
+    }
+    if (self.samplers_dirty) {
+        const at = self.ring_sampler_used;
+        self.ring_sampler_used += max_binding_slots;
+        const start = rc.cpuHeapStart(self.ring_sampler_heap);
+        for (self.samplers, 0..) |source, i| {
+            rc.copyDescriptorsSimple(self.device, 1, start.offsetBy(at + @as(u32, @intCast(i)), self.sampler_increment), source, .sampler);
+        }
+        self.list.vtable.SetGraphicsRootDescriptorTable(self.list, root_param_sampler_table, rc.gpuHeapStart(self.ring_sampler_heap).offsetBy(at, self.sampler_increment));
+        self.samplers_dirty = false;
+    }
+    flushBindings(self);
+}
+
+/// Execute what has been recorded, wait for it, and record on from the same
+/// state with the rings empty again: what a submit that draws with more
+/// changes of texture than the ring holds does. The target stays where the
+/// pass put it; nothing is cleared again.
+fn restartRecording(self: *D3d) Error!void {
+    try closeExecuteAndWait(self);
+    try beginRecording(self);
+    self.ring_srv_used = 0;
+    self.ring_sampler_used = 0;
+    setUpList(self);
+
+    const cmd_list = self.list;
+    if (self.target) |target| cmd_list.vtable.OMSetRenderTargets(cmd_list, 1, @ptrCast(&target.rtv), 0, null);
+    cmd_list.vtable.RSSetViewports(cmd_list, 1, &[_]cmdmod.Viewport{self.viewport});
+    cmd_list.vtable.RSSetScissorRects(cmd_list, 1, &[_]cmdmod.Rect{self.scissor});
+    if (self.current_pipeline) |p| {
+        cmd_list.vtable.SetPipelineState(cmd_list, p.pso);
+        cmd_list.vtable.IASetPrimitiveTopology(cmd_list, p.topology);
+    }
+    if (self.index_view) |*view| cmd_list.vtable.IASetIndexBuffer(cmd_list, view);
+    for (self.uniforms, 0..) |address, slot| {
+        if (address != 0) cmd_list.vtable.SetGraphicsRootConstantBufferView(cmd_list, root_param_cbv0 + @as(u32, @intCast(slot)), address);
+    }
+    self.bindings_dirty = true;
+    self.textures_dirty = true;
+    self.samplers_dirty = true;
 }
 
 /// Bind the vertex buffers set since the last flush, now that the pipeline
@@ -1304,12 +1569,10 @@ fn flushBindings(self: *D3d) void {
 }
 
 // -------------------------------------------------------------------------
-// Tests. WARP needs no window and no card. A window is out of scope for
-// this file - `readTexture` is `error.Unsupported`, so there is no way to
-// look at what a pass drew without one - so these check what can be checked
-// without a window: that every kind of resource is made correctly, and that
-// a request outside the MVP scope table comes back as `error.Unsupported`
-// through `Device`'s own caps-driven rejection rather than a crash.
+// Tests. WARP needs no window and no card: what a pass drew is read back
+// from the texture it drew into. A request outside what `caps` claims comes
+// back as `error.Unsupported` through `Device`'s own caps-driven rejection
+// rather than a crash.
 // -------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -1331,23 +1594,23 @@ test "opening on WARP, and what it reports" {
     try testing.expect(information.renderer.len > 0);
 }
 
-test "caps: only .d2 rgba8/bgra8, one sample, no render target" {
+test "caps: .d2 rgba8, bgra8 and r8, sampled and drawn into, one sample" {
     var device = try warpDevice();
     defer device.deinit();
 
     const c = device.caps();
-    const rgba = c.formatSupport(.rgba8_unorm);
-    try testing.expect(rgba.sampled);
-    try testing.expect(!rgba.render_target);
-    try testing.expect(rgba.dimensions.contains(.d2));
-    try testing.expect(!rgba.dimensions.contains(.cube));
-    try testing.expect(!rgba.dimensions.contains(.d3));
-    try testing.expect(rgba.supportsSamples(1));
-    try testing.expect(!rgba.supportsSamples(4));
+    for ([_]types.Format{ .rgba8_unorm, .bgra8_unorm, .r8_unorm }) |format| {
+        const support = c.formatSupport(format);
+        try testing.expect(support.sampled);
+        try testing.expect(support.render_target);
+        try testing.expect(support.dimensions.contains(.d2));
+        try testing.expect(!support.dimensions.contains(.cube));
+        try testing.expect(!support.dimensions.contains(.d3));
+        try testing.expect(support.supportsSamples(1));
+        try testing.expect(!support.supportsSamples(4));
+    }
     try testing.expectEqual(@as(u32, 1), c.limits.max_anisotropy);
-
-    const bgra = c.formatSupport(.bgra8_unorm);
-    try testing.expect(bgra.sampled);
+    try testing.expect(c.features.sampler_border);
 
     // Never claimed: a depth format, and a compressed one.
     try testing.expect(!c.formatSupport(.depth32_float).sampled);
@@ -1363,20 +1626,215 @@ test "a buffer is created, updated, and its bytes are what was written" {
     device.destroyBuffer(buffer);
 }
 
-test "a texture with initial data, and a sampler" {
+test "a texture reads back as it was made, and a box written into it changes that box" {
     var device = try warpDevice();
     defer device.deinit();
 
-    const pixels = [_]u8{ 255, 0, 0, 255 } ** (4 * 4);
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    for (0..16) |i| pixels[i * 4 ..][0..4].* = .{ @intCast(i * 10), 20, 30, 255 };
     const texture = try device.createTexture(.{ .width = 4, .height = 4, .data = &pixels });
     defer device.destroyTexture(texture);
+    {
+        const back = try device.readTexture(texture, testing.allocator);
+        defer testing.allocator.free(back);
+        try testing.expectEqualSlices(u8, &pixels, back);
+    }
 
+    // Two by two, one texel in from the top left.
+    const green = [_]u8{ 0, 255, 0, 255 } ** 4;
+    try device.writeTexture(texture, .{ .x = 1, .y = 1, .width = 2, .height = 2 }, &green, 8, 0);
+    const back = try device.readTexture(texture, testing.allocator);
+    defer testing.allocator.free(back);
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, back[(1 * 4 + 1) * 4 ..][0..4].*);
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, back[(2 * 4 + 2) * 4 ..][0..4].*);
+    try testing.expectEqual([4]u8{ 0, 20, 30, 255 }, back[0..4].*);
+    try testing.expectEqual(pixels[(3 * 4 + 3) * 4 ..][0..4].*, back[(3 * 4 + 3) * 4 ..][0..4].*);
+}
+
+test "bgra8 and r8 read back as RGBA" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    const bgra = try device.createTexture(.{ .width = 1, .height = 1, .format = .bgra8_unorm, .data = &.{ 10, 20, 30, 40 } });
+    defer device.destroyTexture(bgra);
+    const from_bgra = try device.readTexture(bgra, testing.allocator);
+    defer testing.allocator.free(from_bgra);
+    try testing.expectEqualSlices(u8, &.{ 30, 20, 10, 40 }, from_bgra);
+
+    // An atlas of coverage, 3 wide: rows of one byte a texel, written again
+    // one row at a time.
+    const r8 = try device.createTexture(.{ .width = 3, .height = 2, .format = .r8_unorm, .data = &.{ 1, 2, 3, 4, 5, 6 } });
+    defer device.destroyTexture(r8);
+    try device.writeTexture(r8, .{ .y = 1, .width = 3, .height = 1 }, &.{ 7, 8, 9 }, 3, 0);
+    const from_r8 = try device.readTexture(r8, testing.allocator);
+    defer testing.allocator.free(from_r8);
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 1, 255 }, from_r8[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 255 }, from_r8[5 * 4 ..][0..4]);
+}
+
+/// Clip-space corners and a shader that samples slot 0 across them, top of
+/// the picture at the top: what the pass tests draw with.
+const Quad = struct {
+    shader: types.Shader,
+    pipeline: types.Pipeline,
+    corners: types.Buffer,
+
+    const vs =
+        \\struct In { float2 position : ATTR0; };
+        \\struct Out { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
+        \\Out main(In i) { Out o; o.position = float4(i.position, 0, 1); o.uv = i.position * float2(0.5, -0.5) + 0.5; return o; }
+    ;
+    const ps =
+        \\Texture2D picture : register(t0);
+        \\SamplerState picture_sampler : register(s0);
+        \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET { return picture.Sample(picture_sampler, uv); }
+    ;
+
+    /// The same, with uv running to 2 across the quad rather than 1.
+    const vs_twice =
+        \\struct In { float2 position : ATTR0; };
+        \\struct Out { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
+        \\Out main(In i) { Out o; o.position = float4(i.position, 0, 1); o.uv = i.position * float2(1, -1) + 1; return o; }
+    ;
+
+    fn init(device: *Device) !Quad {
+        return initWith(device, vs);
+    }
+
+    fn initWith(device: *Device, vertex: [:0]const u8) !Quad {
+        const shader = device.createShader(.{ .hlsl = .{ .vertex = vertex, .fragment = ps } }) catch |err| {
+            std.debug.print("{s}\n", .{device.diagnostics()});
+            return err;
+        };
+        const pipeline = try device.createPipeline(.{
+            .shader = shader,
+            .attributes = &.{.{ .location = 0, .format = .float2, .offset = 0 }},
+            .buffers = &.{.{ .stride = 8 }},
+            .topology = .triangle_strip,
+        });
+        const corners = [_][2]f32{ .{ -1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 } };
+        const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) });
+        return .{ .shader = shader, .pipeline = pipeline, .corners = buffer };
+    }
+};
+
+fn texelAt(pixels: []const u8, width: usize, x: usize, y: usize) [4]u8 {
+    return pixels[(y * width + x) * 4 ..][0..4].*;
+}
+
+test "a pass clears and draws into a texture, which reads back and is sampled after" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const quad = try Quad.init(&device);
+
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 1, 0, 0, 1 } } });
+    try cmd.endPass();
+    try device.submit();
+    const cleared = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(cleared);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, texelAt(cleared, 8, 3, 5));
+
+    // Sampled into a second target: the first one's red, drawn over blue.
+    const second = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
     const sampler = try device.createSampler(.nearest);
-    defer device.destroySampler(sampler);
+    const again = device.begin();
+    try again.beginPass(.{ .color = .{ .target = .{ .texture = second }, .clear_color = .{ 0, 0, 1, 1 } } });
+    try again.setPipeline(quad.pipeline);
+    try again.setVertexBuffer(0, quad.corners, 0);
+    try again.setTexture(0, target, sampler);
+    try again.draw(.{ .vertex_count = 4 });
+    try again.endPass();
+    try device.submit();
+    const drawn = try device.readTexture(second, testing.allocator);
+    defer testing.allocator.free(drawn);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, texelAt(drawn, 8, 4, 4));
+}
 
-    // Outside the MVP: writing after creation, and reading back at all.
-    try testing.expectError(error.Unsupported, device.writeTexture(texture, .{}, &pixels, 0, 0));
-    try testing.expectError(error.Unsupported, device.readTexture(texture, testing.allocator));
+test "each draw of one submit samples the texture it was given" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const quad = try Quad.init(&device);
+
+    const red = try device.createTexture(.{ .width = 1, .height = 1, .data = &.{ 255, 0, 0, 255 } });
+    const green = try device.createTexture(.{ .width = 1, .height = 1, .data = &.{ 0, 255, 0, 255 } });
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const sampler = try device.createSampler(.nearest);
+
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+    try cmd.setPipeline(quad.pipeline);
+    try cmd.setVertexBuffer(0, quad.corners, 0);
+    try cmd.setViewport(.{ .width = 4, .height = 8 });
+    try cmd.setTexture(0, red, sampler);
+    try cmd.draw(.{ .vertex_count = 4 });
+    try cmd.setViewport(.{ .x = 4, .width = 4, .height = 8 });
+    try cmd.setTexture(0, green, sampler);
+    try cmd.draw(.{ .vertex_count = 4 });
+    try cmd.endPass();
+    try device.submit();
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, texelAt(pixels, 8, 1, 4));
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, texelAt(pixels, 8, 6, 4));
+}
+
+test "a submit with more changes of sampler than the ring holds draws them all" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const quad = try Quad.init(&device);
+
+    const texture = try device.createTexture(.{ .width = 1, .height = 1, .data = &.{ 0, 0, 255, 255 } });
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const nearest = try device.createSampler(.nearest);
+    const linear = try device.createSampler(.linear);
+
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+    try cmd.setPipeline(quad.pipeline);
+    try cmd.setVertexBuffer(0, quad.corners, 0);
+    // One draw into each column, each with the other sampler: more tables
+    // than the sampler ring has room for.
+    const draws = ring_sampler_descriptors / max_binding_slots + 40;
+    for (0..draws) |i| {
+        try cmd.setViewport(.{ .x = @floatFromInt(i % 8), .width = 1, .height = 8 });
+        try cmd.setTexture(0, texture, if (i % 2 == 0) nearest else linear);
+        try cmd.draw(.{ .vertex_count = 4 });
+    }
+    try cmd.endPass();
+    try device.submit();
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    for (0..8) |x| try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, texelAt(pixels, 8, x, 4));
+}
+
+test "a border sampler reads its colour outside the texture" {
+    var device = try warpDevice();
+    defer device.deinit();
+    // Across the target, uv runs from 0 to 2: the left half reads the
+    // texture, which is black, and the right half reads past its edge.
+    const quad = try Quad.initWith(&device, Quad.vs_twice);
+
+    const texture = try device.createTexture(.{ .width = 1, .height = 1, .data = &.{ 0, 0, 0, 255 } });
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const border = try device.createSampler(.{ .wrap_u = .border, .wrap_v = .border, .border = .opaque_white, .min_filter = .nearest, .mag_filter = .nearest });
+
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+    try cmd.setPipeline(quad.pipeline);
+    try cmd.setVertexBuffer(0, quad.corners, 0);
+    try cmd.setTexture(0, texture, border);
+    try cmd.draw(.{ .vertex_count = 4 });
+    try cmd.endPass();
+    try device.submit();
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, texelAt(pixels, 8, 1, 1));
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, texelAt(pixels, 8, 6, 6));
 }
 
 test "a shader compiles, and a pipeline is made from it" {
@@ -1418,22 +1876,19 @@ test "a shader that does not compile says why" {
     try testing.expect(device.diagnostics().len > 0);
 }
 
-test "requests outside the MVP scope come back as error.Unsupported" {
+test "what is not here yet comes back as error.Unsupported" {
     var device = try warpDevice();
     defer device.deinit();
 
     // No cube, volume or array textures.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .cube, .width = 4, .height = 4 }));
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4 }));
-    // No multisampled render targets.
+    // No multisampled render targets, and no chains of levels.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .samples = 4, .usage = .{ .sampled = false, .render_target = true } }));
-    // No render-target texture of any kind.
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .sampled = false, .render_target = true } }));
+    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 2 }));
     // No compressed or depth formats.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .bc1_rgba_unorm }));
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .sampled = false, .render_target = true } }));
-    // No sampler border colour or anisotropy above what `caps` allows.
-    try testing.expectError(error.Unsupported, device.createSampler(.{ .wrap_u = .border }));
 }
 
 test "a surface with no window is refused" {

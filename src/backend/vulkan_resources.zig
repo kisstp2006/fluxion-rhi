@@ -8,14 +8,21 @@
 //! uniform - is host-visible, host-coherent memory, mapped once at creation
 //! and never unmapped until it is destroyed. `updateBuffer` is a `memcpy`.
 //! Nothing here is the fastest a driver could do; it is the smallest thing
-//! that is unambiguously correct, which is what the MVP scope in the plan
-//! asks for.
+//! that is unambiguously correct.
 //!
-//! **Textures are device-local**, uploaded once through a staging buffer and
-//! a one-shot command buffer the backend already owns (see `vulkan.zig`'s
-//! `command_buffer`/`fence`) - reused here exactly as `submit` reuses it,
+//! **Textures are device-local** and always `shader_read_only_optimal`
+//! between one command buffer and the next: a write or a read moves one to a
+//! transfer layout and back inside its own command buffer, and a pass into
+//! one ends it where it began. Uploads and readbacks record into the one
+//! command buffer the backend owns (see `vulkan.zig`'s `record`/`finish`),
 //! because the backend is fully synchronous and the two are never in flight
 //! at once.
+//!
+//! **A pipeline is made again for each format it draws into.** A Vulkan
+//! pipeline is tied to the format of its render pass, and a swapchain's may be
+//! BGRA where the pipeline said RGBA, so a pipeline keeps what it was made
+//! from, with shader modules of its own, and makes a variant the first time it
+//! is bound in a pass of another format.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -64,18 +71,27 @@ pub const BufferRes = struct {
 
 pub fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) types.Error!backend.Native {
     const self = vulkan.cast(impl);
-    const vkd = self.runtime.vkd;
-
     var usage: vk.gen.types.BufferUsageFlags = .{};
     switch (desc.kind) {
         .vertex => usage.vertex_buffer = true,
         .index => usage.index_buffer = true,
         .uniform => usage.uniform_buffer = true,
     }
+    // A uniform block is read in whole vec4s, as on the other backends.
+    const size = if (desc.kind == .uniform) std.mem.alignForward(usize, desc.size, 16) else desc.size;
+    const res = try hostBuffer(self, size, usage, .{});
+    if (desc.data) |data| @memcpy(res.mapped[0..data.len], data);
+    return res;
+}
 
+/// A buffer the CPU writes and reads through a mapping kept for its life:
+/// every buffer here, and the staging and readback ones. `cached` is asked
+/// for where the CPU reads it back, when the driver has such memory.
+fn hostBuffer(self: *Vk, size: usize, usage: vk.gen.types.BufferUsageFlags, extra: vk.gen.types.MemoryPropertyFlags) types.Error!*BufferRes {
+    const vkd = self.runtime.vkd;
     var buffer: vk.gen.types.Buffer = .none;
     _ = vkd.createBuffer(self.runtime.device, &.{
-        .size = desc.size,
+        .size = @max(size, 1),
         .usage = usage,
         .sharing_mode = .exclusive,
     }, null, &buffer).check() catch return error.Failed;
@@ -83,10 +99,11 @@ pub fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) types.Error!back
 
     var requirements: vk.gen.types.MemoryRequirements = undefined;
     vkd.getBufferMemoryRequirements(self.runtime.device, buffer, &requirements);
-    const type_index = memoryTypeIndex(self, requirements.memory_type_bits, .{
-        .host_visible = true,
-        .host_coherent = true,
-    }) orelse return error.NoDevice;
+    var wanted: vk.gen.types.MemoryPropertyFlags = .{ .host_visible = true, .host_coherent = true };
+    const plain = wanted;
+    if (extra.host_cached) wanted.host_cached = true;
+    const type_index = memoryTypeIndex(self, requirements.memory_type_bits, wanted) orelse
+        memoryTypeIndex(self, requirements.memory_type_bits, plain) orelse return error.NoDevice;
 
     var memory: vk.gen.types.DeviceMemory = .none;
     _ = vkd.allocateMemory(self.runtime.device, &.{
@@ -100,8 +117,7 @@ pub fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) types.Error!back
     _ = vkd.mapMemory(self.runtime.device, memory, 0, vk.gen.types.whole_size, .{}, &mapped).check() catch return error.Failed;
 
     const res = try self.gpa.create(BufferRes);
-    res.* = .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped.?), .size = desc.size };
-    if (desc.data) |data| @memcpy(res.mapped[0..data.len], data);
+    res.* = .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped.?), .size = size };
     return res;
 }
 
@@ -130,18 +146,21 @@ pub const TextureRes = struct {
     view: vk.gen.types.ImageView,
     width: u32,
     height: u32,
+    format: types.Format,
+    vk_format: vk.gen.types.Format,
+    /// For a texture made to be drawn into: the framebuffer a pass begins.
+    framebuffer: vk.gen.types.Framebuffer = .none,
 };
 
 pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!backend.Native {
     const self = vulkan.cast(impl);
     const vkd = self.runtime.vkd;
 
-    // `Device` already filters most of the MVP scope (dimension, usage,
-    // format) through `caps`; a mip chain and multisampling are not caps,
-    // so they are refused here.
+    // `Device` already filters the dimension, the usage and the format
+    // through `caps`; a mip chain and multisampling are not caps, so they are
+    // refused here.
     if (desc.mip_levels != 1) return error.Unsupported;
     if (desc.samples != 1) return error.Unsupported;
-    if (desc.usage.render_target) return error.Unsupported;
     const vk_format = vulkan.toVkFormat(desc.format) orelse return error.Unsupported;
 
     var image: vk.gen.types.Image = .none;
@@ -153,7 +172,7 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
         .array_layers = 1,
         .samples = .{ .x1 = true },
         .tiling = .optimal,
-        .usage = .{ .transfer_dst = true, .sampled = true },
+        .usage = .{ .transfer_src = true, .transfer_dst = true, .sampled = true, .color_attachment = desc.usage.render_target },
         .sharing_mode = .exclusive,
         .initial_layout = .undefined,
     }, null, &image).check() catch return error.Failed;
@@ -182,10 +201,32 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     }, null, &view).check() catch return error.Failed;
     errdefer vkd.destroyImageView(self.runtime.device, view, null);
 
-    try uploadTexture(self, image, desc);
-
     const res = try self.gpa.create(TextureRes);
-    res.* = .{ .image = image, .memory = memory, .view = view, .width = desc.width, .height = desc.height };
+    errdefer self.gpa.destroy(res);
+    res.* = .{ .image = image, .memory = memory, .view = view, .width = desc.width, .height = desc.height, .format = desc.format, .vk_format = vk_format };
+
+    if (desc.usage.render_target) {
+        const render_pass = try swapchain.getRenderPass(self, vk_format, .clear, .undefined, .shader_read_only_optimal);
+        const attachments = [_]vk.gen.types.ImageView{view};
+        _ = vkd.createFramebuffer(self.runtime.device, &.{
+            .render_pass = render_pass,
+            .attachment_count = attachments.len,
+            .attachments = &attachments,
+            .width = desc.width,
+            .height = desc.height,
+            .layers = 1,
+        }, null, &res.framebuffer).check() catch return error.Failed;
+    }
+    errdefer if (res.framebuffer != .none) vkd.destroyFramebuffer(self.runtime.device, res.framebuffer, null);
+
+    // Into the layout it is sampled in, with its texels if it was given any.
+    if (desc.data) |data| {
+        try write(self, res, .{ .width = desc.width, .height = desc.height, .depth = 1 }, data, desc.effectiveRowPitch(), .undefined);
+    } else {
+        try vulkan.record(self);
+        barrier(self, image, .undefined, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .top_of_pipe = true }, .{ .fragment_shader = true });
+        try vulkan.finish(self);
+    }
     return res;
 }
 
@@ -193,130 +234,124 @@ fn colorRange() vk.gen.types.ImageSubresourceRange {
     return .{ .aspect_mask = .{ .color = true }, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 };
 }
 
-/// Uploads `desc.data`, if there is any, through a staging buffer and one
-/// barrier-copy-barrier command buffer - and either way leaves `image` in
-/// `shader_read_only_optimal`, the layout every draw assumes it is in.
-///
-/// Reuses the backend's own `command_buffer`/`fence`: safe because the
-/// backend is fully synchronous, so nothing else is ever mid-flight on them.
-fn uploadTexture(self: *Vk, image: vk.gen.types.Image, desc: types.TextureDesc) types.Error!void {
-    const vkd = self.runtime.vkd;
-
-    var staging_buffer: vk.gen.types.Buffer = .none;
-    var staging_memory: vk.gen.types.DeviceMemory = .none;
-    if (desc.data) |data| {
-        const tight_size = desc.format.imageBytes(desc.width, desc.height);
-        _ = vkd.createBuffer(self.runtime.device, &.{
-            .size = tight_size,
-            .usage = .{ .transfer_src = true },
-            .sharing_mode = .exclusive,
-        }, null, &staging_buffer).check() catch return error.Failed;
-
-        var requirements: vk.gen.types.MemoryRequirements = undefined;
-        vkd.getBufferMemoryRequirements(self.runtime.device, staging_buffer, &requirements);
-        const type_index = memoryTypeIndex(self, requirements.memory_type_bits, .{
-            .host_visible = true,
-            .host_coherent = true,
-        }) orelse return error.NoDevice;
-        _ = vkd.allocateMemory(self.runtime.device, &.{
-            .allocation_size = requirements.size,
-            .memory_type_index = type_index,
-        }, null, &staging_memory).check() catch return error.OutOfMemory;
-        _ = vkd.bindBufferMemory(self.runtime.device, staging_buffer, staging_memory, 0).check() catch return error.Failed;
-
-        var mapped: ?*anyopaque = null;
-        _ = vkd.mapMemory(self.runtime.device, staging_memory, 0, vk.gen.types.whole_size, .{}, &mapped).check() catch return error.Failed;
-        const dst: [*]u8 = @ptrCast(mapped.?);
-        const pitch = desc.effectiveRowPitch();
-        const tight = desc.tightRowPitch();
-        var y: u32 = 0;
-        while (y < desc.height) : (y += 1) {
-            @memcpy(dst[y * tight ..][0..tight], data[y * pitch ..][0..tight]);
-        }
-        vkd.unmapMemory(self.runtime.device, staging_memory);
-    }
-    defer if (desc.data != null) {
-        vkd.destroyBuffer(self.runtime.device, staging_buffer, null);
-        vkd.freeMemory(self.runtime.device, staging_memory, null);
-    };
-
-    _ = vkd.waitForFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}, vk.gen.types.vk_true, forever).check() catch return error.DeviceLost;
-    _ = vkd.resetFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}).check() catch return error.Failed;
-    _ = vkd.resetCommandBuffer(self.command_buffer, .{}).check() catch return error.Failed;
-    _ = vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit = true } }).check() catch return error.Failed;
-
-    const to_transfer = [_]vk.gen.types.ImageMemoryBarrier{.{
-        .src_access_mask = .{},
-        .dst_access_mask = .{ .transfer_write = true },
-        .old_layout = .undefined,
-        .new_layout = .transfer_dst_optimal,
+/// One image layout barrier, recorded into the backend's command buffer.
+fn barrier(
+    self: *Vk,
+    image: vk.gen.types.Image,
+    old: vk.gen.types.ImageLayout,
+    new: vk.gen.types.ImageLayout,
+    src_access: vk.gen.types.AccessFlags,
+    dst_access: vk.gen.types.AccessFlags,
+    src_stage: vk.gen.types.PipelineStageFlags,
+    dst_stage: vk.gen.types.PipelineStageFlags,
+) void {
+    const barriers = [_]vk.gen.types.ImageMemoryBarrier{.{
+        .src_access_mask = src_access,
+        .dst_access_mask = dst_access,
+        .old_layout = old,
+        .new_layout = new,
         .src_queue_family_index = vk.gen.types.queue_family_ignored,
         .dst_queue_family_index = vk.gen.types.queue_family_ignored,
         .image = image,
         .subresource_range = colorRange(),
     }};
-    vkd.cmdPipelineBarrier(self.command_buffer, .{ .top_of_pipe = true }, .{ .transfer = true }, .{}, 0, null, 0, null, to_transfer.len, &to_transfer);
-
-    if (desc.data != null) {
-        const region = [_]vk.gen.types.BufferImageCopy{.{
-            .buffer_offset = 0,
-            .buffer_row_length = 0,
-            .buffer_image_height = 0,
-            .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
-            .image_offset = .{ .x = 0, .y = 0, .z = 0 },
-            .image_extent = .{ .width = desc.width, .height = desc.height, .depth = 1 },
-        }};
-        vkd.cmdCopyBufferToImage(self.command_buffer, staging_buffer, image, .transfer_dst_optimal, region.len, &region);
-    }
-
-    const to_shader_read = [_]vk.gen.types.ImageMemoryBarrier{.{
-        .src_access_mask = .{ .transfer_write = true },
-        .dst_access_mask = .{ .shader_read = true },
-        .old_layout = .transfer_dst_optimal,
-        .new_layout = .shader_read_only_optimal,
-        .src_queue_family_index = vk.gen.types.queue_family_ignored,
-        .dst_queue_family_index = vk.gen.types.queue_family_ignored,
-        .image = image,
-        .subresource_range = colorRange(),
-    }};
-    vkd.cmdPipelineBarrier(self.command_buffer, .{ .transfer = true }, .{ .fragment_shader = true }, .{}, 0, null, 0, null, to_shader_read.len, &to_shader_read);
-
-    _ = vkd.endCommandBuffer(self.command_buffer).check() catch return error.Failed;
-    const cmd_buffers = [_]vk.gen.types.CommandBuffer{self.command_buffer};
-    const submit_info = [_]vk.gen.types.SubmitInfo{.{ .command_buffer_count = 1, .command_buffers = &cmd_buffers }};
-    _ = vkd.queueSubmit(self.runtime.graphics_queue, 1, &submit_info, self.fence).check() catch return error.Failed;
-    _ = vkd.waitForFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}, vk.gen.types.vk_true, forever).check() catch return error.DeviceLost;
+    self.runtime.vkd.cmdPipelineBarrier(self.command_buffer, src_stage, dst_stage, .{}, 0, null, 0, null, barriers.len, &barriers);
 }
-
-const forever: u64 = ~@as(u64, 0);
 
 pub fn destroyTexture(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
     const res = as(TextureRes, native);
+    if (res.framebuffer != .none) self.runtime.vkd.destroyFramebuffer(self.runtime.device, res.framebuffer, null);
     self.runtime.vkd.destroyImageView(self.runtime.device, res.view, null);
     self.runtime.vkd.destroyImage(self.runtime.device, res.image, null);
     self.runtime.vkd.freeMemory(self.runtime.device, res.memory, null);
     self.gpa.destroy(res);
 }
 
-/// Out of scope for v1 - see the plan's MVP table.
 pub fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.TextureRegion, bytes: []const u8, row_pitch: usize, slice_pitch: usize) types.Error!void {
-    _ = impl;
-    _ = native;
-    _ = region;
-    _ = bytes;
-    _ = row_pitch;
     _ = slice_pitch;
-    return error.Unsupported;
+    const self = vulkan.cast(impl);
+    return write(self, as(TextureRes, native), region, bytes, row_pitch, .shader_read_only_optimal);
 }
 
-/// Out of scope for v1 - see the plan's MVP table.
+/// A box of level zero, through a staging buffer its rows are packed into
+/// tightly, copied onto the texture, which is left sampled-from. `from` is
+/// the layout it is in now: undefined only while it is being made.
+fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []const u8, row_pitch: usize, from: vk.gen.types.ImageLayout) types.Error!void {
+    const row_bytes = res.format.rowBytes(region.width);
+    const staging = try hostBuffer(self, row_bytes * region.height, .{ .transfer_src = true }, .{});
+    defer destroyBuffer(self, staging);
+    for (0..region.height) |y| @memcpy(staging.mapped[y * row_bytes ..][0..row_bytes], bytes[y * row_pitch ..][0..row_bytes]);
+
+    try vulkan.record(self);
+    barrier(self, res.image, from, .transfer_dst_optimal, .{}, .{ .transfer_write = true }, .{ .fragment_shader = true, .color_attachment_output = true }, .{ .transfer = true });
+    const copy = [_]vk.gen.types.BufferImageCopy{.{
+        .buffer_offset = 0,
+        .buffer_row_length = 0,
+        .buffer_image_height = 0,
+        .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+        .image_offset = .{ .x = @intCast(region.x), .y = @intCast(region.y), .z = 0 },
+        .image_extent = .{ .width = region.width, .height = region.height, .depth = 1 },
+    }};
+    self.runtime.vkd.cmdCopyBufferToImage(self.command_buffer, staging.buffer, res.image, .transfer_dst_optimal, copy.len, &copy);
+    barrier(self, res.image, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
+    try vulkan.finish(self);
+}
+
+/// Level zero, copied into a buffer the CPU reads and handed back as RGBA,
+/// eight bits a channel, top row first - a Vulkan image is stored top row
+/// first, and a pass draws into it that way up, see `vulkan.zig`'s viewport -
+/// with one channel repeated into red, green and blue as the Direct3D 11
+/// backend does.
 pub fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresource, gpa: Allocator) types.Error![]u8 {
-    _ = impl;
-    _ = native;
     _ = sub;
-    _ = gpa;
-    return error.Unsupported;
+    const self = vulkan.cast(impl);
+    const res = as(TextureRes, native);
+    const texel = res.format.rowBytes(1);
+    const row_bytes = res.format.rowBytes(res.width);
+    const readback = try hostBuffer(self, row_bytes * res.height, .{ .transfer_dst = true }, .{ .host_cached = true });
+    defer destroyBuffer(self, readback);
+
+    try vulkan.record(self);
+    barrier(self, res.image, .shader_read_only_optimal, .transfer_src_optimal, .{ .color_attachment_write = true }, .{ .transfer_read = true }, .{ .color_attachment_output = true, .fragment_shader = true }, .{ .transfer = true });
+    const copy = [_]vk.gen.types.BufferImageCopy{.{
+        .buffer_offset = 0,
+        .buffer_row_length = 0,
+        .buffer_image_height = 0,
+        .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+        .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .image_extent = .{ .width = res.width, .height = res.height, .depth = 1 },
+    }};
+    self.runtime.vkd.cmdCopyImageToBuffer(self.command_buffer, res.image, .transfer_src_optimal, readback.buffer, copy.len, &copy);
+    barrier(self, res.image, .transfer_src_optimal, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
+    const to_host = [_]vk.gen.types.BufferMemoryBarrier{.{
+        .src_access_mask = .{ .transfer_write = true },
+        .dst_access_mask = .{ .host_read = true },
+        .src_queue_family_index = vk.gen.types.queue_family_ignored,
+        .dst_queue_family_index = vk.gen.types.queue_family_ignored,
+        .buffer = readback.buffer,
+        .offset = 0,
+        .size = vk.gen.types.whole_size,
+    }};
+    self.runtime.vkd.cmdPipelineBarrier(self.command_buffer, .{ .transfer = true }, .{ .host = true }, .{}, 0, null, to_host.len, &to_host, 0, null);
+    try vulkan.finish(self);
+
+    const out_row = @as(usize, res.width) * 4;
+    const pixels = try gpa.alloc(u8, out_row * res.height);
+    for (0..res.height) |y| {
+        const source = readback.mapped[y * row_bytes ..];
+        const destination = pixels[y * out_row ..][0..out_row];
+        for (0..res.width) |x| {
+            const at = source[x * texel ..];
+            destination[x * 4 ..][0..4].* = switch (res.format) {
+                .rgba8_unorm => at[0..4].*,
+                .bgra8_unorm => .{ at[2], at[1], at[0], at[3] },
+                .r8_unorm => .{ at[0], at[0], at[0], 255 },
+                else => unreachable,
+            };
+        }
+    }
+    return pixels;
 }
 
 // -------------------------------------------------------------------------
@@ -329,28 +364,27 @@ pub const SamplerRes = struct {
 
 pub fn createSampler(impl: backend.Impl, desc: types.SamplerDesc) types.Error!backend.Native {
     const self = vulkan.cast(impl);
-    // `Device` already refuses `wrap == .border` and `lod_bias != 0` against
-    // `caps.features`, which this backend never sets - what is left for this
-    // function to refuse itself is what `Device` has no caps flag for.
-    if (desc.mip_filter != .none) return error.Unsupported;
-    if (desc.compare != null) return error.Unsupported;
-
     var sampler: vk.gen.types.Sampler = .none;
     _ = self.runtime.vkd.createSampler(self.runtime.device, &.{
         .mag_filter = vkFilter(desc.mag_filter),
         .min_filter = vkFilter(desc.min_filter),
-        .mipmap_mode = .nearest,
+        .mipmap_mode = if (desc.mip_filter == .linear) .linear else .nearest,
         .address_mode_u = vkWrap(desc.wrap_u),
         .address_mode_v = vkWrap(desc.wrap_v),
         .address_mode_w = vkWrap(desc.wrap_w),
-        .mip_lod_bias = 0,
+        .mip_lod_bias = desc.lod_bias,
         .anisotropy_enable = vk.gen.types.vk_false,
         .max_anisotropy = 1,
-        .compare_enable = vk.gen.types.vk_false,
-        .compare_op = .always,
-        .min_lod = desc.lod_min,
-        .max_lod = desc.lod_max,
-        .border_color = .float_transparent_black,
+        .compare_enable = if (desc.compare != null) vk.gen.types.vk_true else vk.gen.types.vk_false,
+        .compare_op = vkCompare(desc.compare orelse .always),
+        // "Level zero only" is a range with one level in it, as on Direct3D.
+        .min_lod = if (desc.mip_filter == .none) 0 else desc.lod_min,
+        .max_lod = if (desc.mip_filter == .none) 0 else desc.lod_max,
+        .border_color = switch (desc.border) {
+            .transparent_black => .float_transparent_black,
+            .opaque_black => .float_opaque_black,
+            .opaque_white => .float_opaque_white,
+        },
         .unnormalized_coordinates = vk.gen.types.vk_false,
     }, null, &sampler).check() catch return error.Failed;
 
@@ -382,13 +416,28 @@ fn vkWrap(w: types.Wrap) vk.gen.types.SamplerAddressMode {
     };
 }
 
+fn vkCompare(c: types.CompareFn) vk.gen.types.CompareOp {
+    return switch (c) {
+        .never => .never,
+        .less => .less,
+        .equal => .equal,
+        .less_equal => .less_or_equal,
+        .greater => .greater,
+        .not_equal => .not_equal,
+        .greater_equal => .greater_or_equal,
+        .always => .always,
+    };
+}
+
 // -------------------------------------------------------------------------
 // Shaders
 // -------------------------------------------------------------------------
 
+/// The two stages' SPIR-V, kept: a pipeline makes modules of its own from
+/// them, so that it can make variants after the shader is gone.
 pub const ShaderRes = struct {
-    vertex: vk.gen.types.ShaderModule,
-    fragment: vk.gen.types.ShaderModule,
+    vertex: []u32,
+    fragment: []u32,
 };
 
 pub fn createShader(impl: backend.Impl, desc: types.ShaderDesc, log: *Io.Writer) types.Error!backend.Native {
@@ -398,18 +447,24 @@ pub fn createShader(impl: backend.Impl, desc: types.ShaderDesc, log: *Io.Writer)
         return error.ShaderFailed;
     };
 
+    // Made once here, so that SPIR-V the driver will not take is said now
+    // rather than when a pipeline is.
     const vertex = createModule(self, words.vertex) catch {
         log.writeAll("fluxion-rhi: vkCreateShaderModule failed for the vertex stage") catch {};
         return error.ShaderFailed;
     };
-    errdefer self.runtime.vkd.destroyShaderModule(self.runtime.device, vertex, null);
+    self.runtime.vkd.destroyShaderModule(self.runtime.device, vertex, null);
     const fragment = createModule(self, words.fragment) catch {
         log.writeAll("fluxion-rhi: vkCreateShaderModule failed for the fragment stage") catch {};
         return error.ShaderFailed;
     };
+    self.runtime.vkd.destroyShaderModule(self.runtime.device, fragment, null);
 
     const res = try self.gpa.create(ShaderRes);
-    res.* = .{ .vertex = vertex, .fragment = fragment };
+    errdefer self.gpa.destroy(res);
+    const kept_vertex = try self.gpa.dupe(u32, words.vertex);
+    errdefer self.gpa.free(kept_vertex);
+    res.* = .{ .vertex = kept_vertex, .fragment = try self.gpa.dupe(u32, words.fragment) };
     return res;
 }
 
@@ -425,8 +480,8 @@ fn createModule(self: *Vk, words: []const u32) !vk.gen.types.ShaderModule {
 pub fn destroyShader(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
     const res = as(ShaderRes, native);
-    self.runtime.vkd.destroyShaderModule(self.runtime.device, res.vertex, null);
-    self.runtime.vkd.destroyShaderModule(self.runtime.device, res.fragment, null);
+    self.gpa.free(res.vertex);
+    self.gpa.free(res.fragment);
     self.gpa.destroy(res);
 }
 
@@ -434,15 +489,31 @@ pub fn destroyShader(impl: backend.Impl, native: backend.Native) void {
 // Pipelines
 // -------------------------------------------------------------------------
 
-pub const PipelineRes = struct {
-    pipeline: vk.gen.types.Pipeline,
-};
-
 const max_vertex_bindings = 8;
 const max_vertex_attributes = 16;
+/// Formats one pipeline is made for before it refuses another: RGBA and
+/// BGRA and a one-channel target leave room.
+const max_variants = 4;
+
+pub const PipelineRes = struct {
+    vertex: vk.gen.types.ShaderModule,
+    fragment: vk.gen.types.ShaderModule,
+    bindings: [max_vertex_bindings]vk.gen.types.VertexInputBindingDescription,
+    binding_count: u32,
+    attributes: [max_vertex_attributes]vk.gen.types.VertexInputAttributeDescription,
+    attribute_count: u32,
+    topology: vk.gen.types.PrimitiveTopology,
+    cull: vk.gen.types.CullModeFlags,
+    front_face: vk.gen.types.FrontFace,
+    blend: vk.gen.types.PipelineColorBlendAttachmentState,
+    variants: [max_variants]?Variant = @splat(null),
+
+    const Variant = struct { format: vk.gen.types.Format, pipeline: vk.gen.types.Pipeline };
+};
 
 pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_native: backend.Native, log: *Io.Writer) types.Error!backend.Native {
     const self = vulkan.cast(impl);
+    const vkd = self.runtime.vkd;
     if (desc.depth_format != null) {
         log.writeAll("fluxion-rhi: the Vulkan backend has no depth attachments yet") catch {};
         return error.Unsupported;
@@ -460,55 +531,96 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
     if (desc.buffers.len > max_vertex_bindings or desc.attributes.len > max_vertex_attributes) return error.Unsupported;
 
     const shader = as(ShaderRes, shader_native);
+    const vertex = createModule(self, shader.vertex) catch return error.PipelineFailed;
+    errdefer vkd.destroyShaderModule(self.runtime.device, vertex, null);
+    const fragment = createModule(self, shader.fragment) catch return error.PipelineFailed;
+    errdefer vkd.destroyShaderModule(self.runtime.device, fragment, null);
 
-    var bindings: [max_vertex_bindings]vk.gen.types.VertexInputBindingDescription = undefined;
-    for (desc.buffers, 0..) |buf, i| bindings[i] = .{
+    const res = try self.gpa.create(PipelineRes);
+    errdefer self.gpa.destroy(res);
+    res.* = .{
+        .vertex = vertex,
+        .fragment = fragment,
+        .bindings = undefined,
+        .binding_count = @intCast(desc.buffers.len),
+        .attributes = undefined,
+        .attribute_count = @intCast(desc.attributes.len),
+        .topology = vkTopology(desc.topology),
+        .cull = switch (desc.cull) {
+            .none => .{},
+            .back => .{ .back = true },
+            .front => .{ .front = true },
+        },
+        .front_face = if (desc.front_face == .ccw) .counter_clockwise else .clockwise,
+        .blend = .{
+            .blend_enable = if (desc.blend.enabled) vk.gen.types.vk_true else vk.gen.types.vk_false,
+            .src_color_blend_factor = vkBlendFactor(desc.blend.src_rgb),
+            .dst_color_blend_factor = vkBlendFactor(desc.blend.dst_rgb),
+            .color_blend_op = vkBlendOp(desc.blend.op_rgb),
+            .src_alpha_blend_factor = vkBlendFactor(desc.blend.src_alpha),
+            .dst_alpha_blend_factor = vkBlendFactor(desc.blend.dst_alpha),
+            .alpha_blend_op = vkBlendOp(desc.blend.op_alpha),
+            .color_write_mask = .{ .r = true, .g = true, .b = true, .a = true },
+        },
+    };
+    for (desc.buffers, 0..) |buf, i| res.bindings[i] = .{
         .binding = @intCast(i),
         .stride = buf.stride,
         .input_rate = if (buf.step == .instance) .instance else .vertex,
     };
-    var attrs: [max_vertex_attributes]vk.gen.types.VertexInputAttributeDescription = undefined;
-    for (desc.attributes, 0..) |attr, i| attrs[i] = .{
+    for (desc.attributes, 0..) |attr, i| res.attributes[i] = .{
         .location = attr.location,
         .binding = attr.buffer,
         .format = vertexFormat(attr.format),
         .offset = attr.offset,
     };
 
-    const vertex_input: vk.gen.types.PipelineVertexInputStateCreateInfo = .{
-        .vertex_binding_description_count = @intCast(desc.buffers.len),
-        .vertex_binding_descriptions = if (desc.buffers.len > 0) &bindings else null,
-        .vertex_attribute_description_count = @intCast(desc.attributes.len),
-        .vertex_attribute_descriptions = if (desc.attributes.len > 0) &attrs else null,
+    // The format it said it draws into is made now, so that a pipeline the
+    // driver will not make is said at once.
+    _ = pipelineFor(self, res, vk_format) catch {
+        log.writeAll("fluxion-rhi: vkCreateGraphicsPipelines failed") catch {};
+        return error.PipelineFailed;
     };
+    return res;
+}
 
+/// The pipeline `res` is for a pass into `format`, made the first time it is
+/// asked for.
+pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format) types.Error!vk.gen.types.Pipeline {
+    var free: ?usize = null;
+    for (&res.variants, 0..) |*slot, i| {
+        if (slot.*) |variant| {
+            if (variant.format == format) return variant.pipeline;
+        } else if (free == null) free = i;
+    }
+    const index = free orelse return error.Unsupported;
+
+    const vertex_input: vk.gen.types.PipelineVertexInputStateCreateInfo = .{
+        .vertex_binding_description_count = res.binding_count,
+        .vertex_binding_descriptions = if (res.binding_count > 0) &res.bindings else null,
+        .vertex_attribute_description_count = res.attribute_count,
+        .vertex_attribute_descriptions = if (res.attribute_count > 0) &res.attributes else null,
+    };
     const input_assembly: vk.gen.types.PipelineInputAssemblyStateCreateInfo = .{
-        .topology = vkTopology(desc.topology),
+        .topology = res.topology,
         .primitive_restart_enable = vk.gen.types.vk_false,
     };
-
     // Real viewport/scissor come from `vkCmdSetViewport`/`vkCmdSetScissor`,
     // set dynamically per `commands.Command.set_viewport`/`.set_scissor` -
     // this is only the count `PipelineDynamicStateCreateInfo` promises.
     const viewport_state: vk.gen.types.PipelineViewportStateCreateInfo = .{ .viewport_count = 1, .scissor_count = 1 };
-
     const rasterization: vk.gen.types.PipelineRasterizationStateCreateInfo = .{
         .depth_clamp_enable = vk.gen.types.vk_false,
         .rasterizer_discard_enable = vk.gen.types.vk_false,
         .polygon_mode = .fill,
-        .cull_mode = switch (desc.cull) {
-            .none => .{},
-            .back => .{ .back = true },
-            .front => .{ .front = true },
-        },
-        .front_face = if (desc.front_face == .ccw) .counter_clockwise else .clockwise,
+        .cull_mode = res.cull,
+        .front_face = res.front_face,
         .depth_bias_enable = vk.gen.types.vk_false,
         .depth_bias_constant_factor = 0,
         .depth_bias_clamp = 0,
         .depth_bias_slope_factor = 0,
         .line_width = 1,
     };
-
     const multisample: vk.gen.types.PipelineMultisampleStateCreateInfo = .{
         .rasterization_samples = .{ .x1 = true },
         .sample_shading_enable = vk.gen.types.vk_false,
@@ -516,17 +628,7 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
         .alpha_to_coverage_enable = vk.gen.types.vk_false,
         .alpha_to_one_enable = vk.gen.types.vk_false,
     };
-
-    const blend_attachment = [_]vk.gen.types.PipelineColorBlendAttachmentState{.{
-        .blend_enable = if (desc.blend.enabled) vk.gen.types.vk_true else vk.gen.types.vk_false,
-        .src_color_blend_factor = vkBlendFactor(desc.blend.src_rgb),
-        .dst_color_blend_factor = vkBlendFactor(desc.blend.dst_rgb),
-        .color_blend_op = vkBlendOp(desc.blend.op_rgb),
-        .src_alpha_blend_factor = vkBlendFactor(desc.blend.src_alpha),
-        .dst_alpha_blend_factor = vkBlendFactor(desc.blend.dst_alpha),
-        .alpha_blend_op = vkBlendOp(desc.blend.op_alpha),
-        .color_write_mask = .{ .r = true, .g = true, .b = true, .a = true },
-    }};
+    const blend_attachment = [_]vk.gen.types.PipelineColorBlendAttachmentState{res.blend};
     const color_blend: vk.gen.types.PipelineColorBlendStateCreateInfo = .{
         .logic_op_enable = vk.gen.types.vk_false,
         .logic_op = .copy,
@@ -534,29 +636,21 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
         .attachments = &blend_attachment,
         .blend_constants = .{ 0, 0, 0, 0 },
     };
-
     const dynamic_states = [_]vk.gen.types.DynamicState{ .viewport, .scissor };
     const dynamic_state: vk.gen.types.PipelineDynamicStateCreateInfo = .{
         .dynamic_state_count = dynamic_states.len,
         .dynamic_states = &dynamic_states,
     };
 
-    // Only used to satisfy `vkCreateGraphicsPipelines`' render-pass argument:
-    // any render pass whose attachments are format/sample compatible works
-    // at `vkCmdBeginRenderPass` time, and every render pass this backend
-    // makes for one format has the same one colour attachment. `.clear` is
-    // an arbitrary, always-cached choice - the load op does not affect
-    // compatibility.
-    const render_pass = swapchain.getRenderPass(self, vk_format, .clear) catch {
-        log.writeAll("fluxion-rhi: could not make a render pass for this pipeline's color_format") catch {};
-        return error.PipelineFailed;
-    };
+    // Any render pass whose attachment has this format and one sample is
+    // compatible at `vkCmdBeginRenderPass` time; the load op and the layouts
+    // do not matter.
+    const render_pass = try swapchain.getRenderPass(self, format, .clear, .undefined, .shader_read_only_optimal);
 
     const stages = [_]vk.gen.types.PipelineShaderStageCreateInfo{
-        .{ .stage = .{ .vertex = true }, .module = shader.vertex, .name = "main" },
-        .{ .stage = .{ .fragment = true }, .module = shader.fragment, .name = "main" },
+        .{ .stage = .{ .vertex = true }, .module = res.vertex, .name = "main" },
+        .{ .stage = .{ .fragment = true }, .module = res.fragment, .name = "main" },
     };
-
     const pipeline_info = [_]vk.gen.types.GraphicsPipelineCreateInfo{.{
         .stage_count = stages.len,
         .stages = &stages,
@@ -574,20 +668,18 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
     }};
 
     var pipeline: vk.gen.types.Pipeline = .none;
-    _ = self.runtime.vkd.createGraphicsPipelines(self.runtime.device, .none, 1, &pipeline_info, null, @ptrCast(&pipeline)).check() catch {
-        log.writeAll("fluxion-rhi: vkCreateGraphicsPipelines failed") catch {};
-        return error.PipelineFailed;
-    };
-
-    const res = try self.gpa.create(PipelineRes);
-    res.* = .{ .pipeline = pipeline };
-    return res;
+    _ = self.runtime.vkd.createGraphicsPipelines(self.runtime.device, .none, 1, &pipeline_info, null, @ptrCast(&pipeline)).check() catch return error.PipelineFailed;
+    res.variants[index] = .{ .format = format, .pipeline = pipeline };
+    return pipeline;
 }
 
 pub fn destroyPipeline(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
     const res = as(PipelineRes, native);
-    self.runtime.vkd.destroyPipeline(self.runtime.device, res.pipeline, null);
+    for (res.variants) |maybe| if (maybe) |variant| self.runtime.vkd.destroyPipeline(self.runtime.device, variant.pipeline, null);
+    self.runtime.vkd.destroyShaderModule(self.runtime.device, res.vertex, null);
+    self.runtime.vkd.destroyShaderModule(self.runtime.device, res.fragment, null);
+    if (self.current_pipeline == res) self.current_pipeline = null;
     self.gpa.destroy(res);
 }
 

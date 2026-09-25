@@ -4,10 +4,10 @@
 //!
 //! A render hardware interface: buffers, textures, samplers, shaders,
 //! pipelines and passes, described once as plain values and executed by a
-//! backend chosen when the device is made. Three backends today - OpenGL
-//! 3.3, Direct3D 11 and WebGL 2 - and a fourth, `none`, that accepts
-//! everything and draws nothing, for the machines that have no GPU and the
-//! tests that need none.
+//! backend chosen when the device is made: OpenGL 3.3, Direct3D 11,
+//! Direct3D 12, Vulkan and WebGL 2 - and `none`, that accepts everything and
+//! draws nothing, for the machines that have no GPU and the tests that need
+//! none. A program says the same things to each of them.
 //!
 //!   `Device`     one backend, the resources on it, and the frame being recorded
 //!   `types`      everything a program says to a device, backend-free
@@ -129,6 +129,7 @@ pub const ColorAttachment = types.ColorAttachment;
 pub const DepthAttachment = types.DepthAttachment;
 pub const RenderPassDesc = types.RenderPassDesc;
 pub const GlHooks = types.GlHooks;
+pub const WindowHooks = types.WindowHooks;
 pub const GlProc = types.GlProc;
 pub const DeviceDesc = types.DeviceDesc;
 pub const SurfaceDesc = types.SurfaceDesc;
