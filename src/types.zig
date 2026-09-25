@@ -853,6 +853,20 @@ pub const GlHooks = struct {
     /// The default framebuffer's size in pixels, which is what a pass into
     /// the surface covers.
     framebuffer_size: *const fn (*anyopaque) [2]u32,
+    /// Make the context current again, after the device drew into another
+    /// window's: needed only by a device with a surface of `GlWindow`.
+    make_current: ?*const fn (*anyopaque) void = null,
+};
+
+/// Another window's OpenGL context, made to share the device's objects -
+/// Fluxion Platform's `share_gl_with` - for a surface on that window: see
+/// `WindowHooks.gl`. Each is called with `WindowHooks.context`.
+pub const GlWindow = struct {
+    make_current: *const fn (*anyopaque) void,
+    swap_buffers: *const fn (*anyopaque) void,
+    framebuffer_size: *const fn (*anyopaque) [2]u32,
+    /// Vsync on or off, for the context while it is current.
+    set_swap_interval: *const fn (*anyopaque, vsync: bool) void,
 };
 
 /// What a window can make for a backend, asked for only by the backend that
@@ -865,6 +879,11 @@ pub const WindowHooks = struct {
     /// surface extension the loader offers. Null when the window cannot make
     /// one.
     make_vulkan_surface: *const fn (context: *anyopaque, instance: usize, get_instance_proc_addr: *const anyopaque) ?u64,
+    /// For the OpenGL backend, a window other than the one whose context the
+    /// device has: the window's own context, sharing the device's objects,
+    /// which a surface on it draws and presents with. Null for the device's
+    /// own window, and for a window of a backend that is not GL.
+    gl: ?GlWindow = null,
 };
 
 pub const DeviceDesc = struct {
@@ -882,9 +901,10 @@ pub const DeviceDesc = struct {
 
 pub const SurfaceDesc = struct {
     /// The window, as the platform's integer: an `HWND` on Windows. Ignored
-    /// by the OpenGL backend, whose surface is the context's own framebuffer
-    /// and which therefore has exactly one - and by the WebGL backend, whose
-    /// one surface is the canvas the page made the context on.
+    /// by the OpenGL backend, whose surface is a context's own framebuffer -
+    /// the device's, or another window's given by `window.gl` - and by the
+    /// WebGL backend, whose one surface is the canvas the page made the
+    /// context on.
     native_window: usize = 0,
     /// The native module or application instance that owns `native_window`.
     ///

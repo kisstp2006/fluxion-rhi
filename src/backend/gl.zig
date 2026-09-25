@@ -711,9 +711,13 @@ const Gl = struct {
     last_error: [256]u8 = undefined,
     last_error_len: usize = 0,
     had_error: bool = false,
-    /// The one surface a context has. Made once, handed back on every
-    /// `createSurface`.
+    /// The surface of the device's own context: its default framebuffer.
     surface: SurfaceRes,
+    /// Surfaces on other windows, each with a context of its own that shares
+    /// the device's objects; and the one of them current, null while the
+    /// device's own is.
+    others: std.ArrayList(*SurfaceRes) = .empty,
+    current: ?*SurfaceRes = null,
 
     /// Asked once, when the device opened: what `Device` holds this backend to.
     capabilities: types.Caps = undefined,
@@ -892,9 +896,28 @@ const PipelineRes = struct {
 };
 
 const SurfaceRes = struct {
-    /// A surface is the default framebuffer; there is nothing to store but
-    /// the fact that it exists.
+    /// The device's own surface is its context's default framebuffer; there
+    /// is nothing to store but the fact that it exists.
     claimed: bool = false,
+    /// Another window's: its context, which shares the device's buffers,
+    /// textures, samplers and programs but not what holds them together - a
+    /// vertex array is a context's own, so each pipeline drawn here has one
+    /// made here.
+    window: ?Other = null,
+    vaos: std.AutoHashMapUnmanaged(*PipelineRes, gt.Uint) = .empty,
+    /// Whether the state the backend never changes is set in its context.
+    prepared: bool = false,
+    vsync: ?bool = null,
+
+    const Other = struct {
+        context: *anyopaque,
+        hooks: types.GlWindow,
+    };
+
+    fn size(self: *const SurfaceRes, gl: *const Gl) [2]u32 {
+        if (self.window) |w| return w.hooks.framebuffer_size(w.context);
+        return gl.hooks.framebuffer_size(gl.hooks.context);
+    }
 };
 
 // -------------------------------------------------------------------------
@@ -957,17 +980,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         self.renderer_len = n;
     }
 
-    // State that never changes under this backend.
-    self.api.pixelStorei(c.pack_alignment, 1);
-    self.api.pixelStorei(c.unpack_alignment, 1);
-    self.api.enable(c.scissor_test);
-    if (!is_gles) {
-        // Direct3D samples a cube across its edges and rasterises a
-        // multisampled target at its own rate; OpenGL asks to be told. On ES
-        // 3.0 both are simply so.
-        self.api.enable(c.texture_cube_map_seamless);
-        self.api.enable(c.multisample);
-    }
+    prepare(&self.api);
 
     // Before the debug callback is installed: what the driver says about the
     // formats it turns down is an answer and not a mistake.
@@ -985,6 +998,54 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     }
 
     return .{ self, &vtable };
+}
+
+/// State that never changes under this backend, set in a context once.
+fn prepare(api: *const Api) void {
+    api.pixelStorei(c.pack_alignment, 1);
+    api.pixelStorei(c.unpack_alignment, 1);
+    api.enable(c.scissor_test);
+    if (!is_gles) {
+        // Direct3D samples a cube across its edges and rasterises a
+        // multisampled target at its own rate; OpenGL asks to be told. On ES
+        // 3.0 both are simply so.
+        api.enable(c.texture_cube_map_seamless);
+        api.enable(c.multisample);
+    }
+}
+
+/// Make `to`'s context current - another window's, or with null the
+/// device's own. What one context did to the objects they share is seen by
+/// the other once it is flushed, so it is, first; and a mistake made in
+/// another window's context, which has no debug callback, is kept for the
+/// submit to say.
+fn useContext(self: *Gl, to: ?*SurfaceRes) void {
+    if (self.current == to) return;
+    self.api.flush();
+    if (self.debug and self.current != null and self.api.checkError() != null) self.had_error = true;
+    if (to) |surface| {
+        const w = surface.window.?;
+        w.hooks.make_current(w.context);
+        if (!surface.prepared) {
+            prepare(&self.api);
+            surface.prepared = true;
+        }
+    } else self.hooks.make_current.?(self.hooks.context);
+    self.current = to;
+}
+
+/// The vertex array of `pipeline` in the context current: its own in the
+/// device's, and one made the first time in another window's.
+fn vertexArrayOf(self: *Gl, pipeline: *PipelineRes) Error!gt.Uint {
+    const surface = self.current orelse return pipeline.vao;
+    if (surface.vaos.get(pipeline)) |vao| return vao;
+    var vao: gt.Uint = 0;
+    fnOf(&self.api, "genVertexArrays")(1, @ptrCast(&vao));
+    surface.vaos.put(self.gpa, pipeline, vao) catch {
+        fnOf(&self.api, "deleteVertexArrays")(1, @ptrCast(&vao));
+        return error.OutOfMemory;
+    };
+    return vao;
 }
 
 fn hasEs3Functions(api: *const Api) bool {
@@ -1060,6 +1121,8 @@ fn as(comptime T: type, native: backend.Native) *T {
 fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
     for (&self.framebuffers) |*entry| forgetFramebuffer(self, entry);
+    // `Device` has destroyed every surface.
+    self.others.deinit(self.gpa);
     self.gpa.destroy(self);
 }
 
@@ -1767,6 +1830,12 @@ const invalid_index: gt.Uint = 0xFFFFFFFF;
 fn destroyPipeline(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(PipelineRes, native);
+    // Its vertex arrays in other windows' contexts, each in its own.
+    for (self.others.items) |surface| if (surface.vaos.fetchRemove(res)) |gone| {
+        useContext(self, surface);
+        fnOf(&self.api, "deleteVertexArrays")(1, @ptrCast(&gone.value));
+    };
+    useContext(self, null);
     fnOf(&self.api, "deleteVertexArrays")(1, @ptrCast(&res.vao));
     self.gpa.free(res.attributes);
     self.gpa.free(res.buffers);
@@ -1779,18 +1848,45 @@ fn destroyPipeline(impl: backend.Impl, native: backend.Native) void {
 // -------------------------------------------------------------------------
 
 fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) Error!backend.Native {
-    _ = desc;
     const self = cast(impl);
-    // The default framebuffer. A second one would be a second context, which
-    // is a thing the hooks do not describe.
-    if (self.surface.claimed) return error.Unsupported;
-    self.surface.claimed = true;
-    return &self.surface;
+    const window = if (desc.window) |w| w.gl else null;
+    const other = window orelse {
+        // The device's own context's default framebuffer, of which there is one.
+        if (self.surface.claimed) return error.Unsupported;
+        self.surface.claimed = true;
+        return &self.surface;
+    };
+    // Another window's context: the device has to be able to come back to
+    // its own.
+    if (self.hooks.make_current == null) return error.Unsupported;
+    try self.others.ensureUnusedCapacity(self.gpa, 1);
+    const res = try self.gpa.create(SurfaceRes);
+    res.* = .{ .window = .{ .context = desc.window.?.context, .hooks = other } };
+    self.others.appendAssumeCapacity(res);
+    useContext(self, res);
+    other.set_swap_interval(desc.window.?.context, desc.vsync);
+    res.vsync = desc.vsync;
+    useContext(self, null);
+    return res;
 }
 
 fn destroySurface(impl: backend.Impl, native: backend.Native) void {
-    _ = native;
-    cast(impl).surface.claimed = false;
+    const self = cast(impl);
+    const res = as(SurfaceRes, native);
+    if (res == &self.surface) {
+        self.surface.claimed = false;
+        return;
+    }
+    var vaos = res.vaos.valueIterator();
+    if (res.vaos.count() > 0) useContext(self, res);
+    while (vaos.next()) |vao| fnOf(&self.api, "deleteVertexArrays")(1, @ptrCast(vao));
+    useContext(self, null);
+    res.vaos.deinit(self.gpa);
+    for (self.others.items, 0..) |held, i| if (held == res) {
+        _ = self.others.swapRemove(i);
+        break;
+    };
+    self.gpa.destroy(res);
 }
 
 fn resizeSurface(impl: backend.Impl, native: backend.Native, width: u32, height: u32) Error!void {
@@ -1803,16 +1899,22 @@ fn resizeSurface(impl: backend.Impl, native: backend.Native, width: u32, height:
 }
 
 fn surfaceSize(impl: backend.Impl, native: backend.Native) [2]u32 {
-    _ = native;
-    const self = cast(impl);
-    return self.hooks.framebuffer_size(self.hooks.context);
+    return as(SurfaceRes, native).size(cast(impl));
 }
 
 fn present(impl: backend.Impl, native: backend.Native, vsync: bool) Error!void {
-    _ = native;
-    _ = vsync; // the swap interval is the context's; see `Window.setSwapInterval`
     const self = cast(impl);
-    self.hooks.swap_buffers(self.hooks.context);
+    const res = as(SurfaceRes, native);
+    // The device's own swap interval is its context's; see
+    // `Window.setSwapInterval`.
+    const w = res.window orelse return self.hooks.swap_buffers(self.hooks.context);
+    useContext(self, res);
+    defer useContext(self, null);
+    if (res.vsync != vsync) {
+        w.hooks.set_swap_interval(w.context, vsync);
+        res.vsync = vsync;
+    }
+    w.hooks.swap_buffers(w.context);
 }
 
 // -------------------------------------------------------------------------
@@ -1829,7 +1931,7 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             .end_pass => try endPass(self),
             .set_pipeline => |h| {
                 const res = as(PipelineRes, device.pipelines.get(h).?.native);
-                bindPipeline(self, res);
+                try bindPipeline(self, res);
             },
             .set_viewport => |v| {
                 // Flipped: the top-left rectangle, measured from the bottom.
@@ -1949,11 +2051,20 @@ fn beginPass(self: *Gl, device: *Device, pass: types.RenderPassDesc) Error!void 
     else
         null;
 
+    // A surface of another window's is drawn in that window's context, and
+    // everything else in the device's; a multisampled image drawn in the
+    // device's cannot be resolved into another window's.
+    const surface: ?*SurfaceRes = if (to_surface) as(SurfaceRes, device.surfaces.get(specs[0].target.surface).?.native) else null;
+    for (specs[0..count]) |spec| if (spec.resolve) |target| if (target == .surface) {
+        if (as(SurfaceRes, device.surfaces.get(target.surface).?.native).window != null) return error.Unsupported;
+    };
+    useContext(self, if (surface) |s| if (s.window != null) s else null else null);
+
     var size: [2]u32 = undefined;
     if (to_surface) {
         api.bindFramebuffer(c.framebuffer, 0);
         self.pass_framebuffer = 0;
-        size = self.hooks.framebuffer_size(self.hooks.context);
+        size = surface.?.size(self);
     } else {
         const framebuffer = try framebufferFor(self, attachments[0..count], depth);
         // What a pass draws into is stored the way a pass leaves it, from
@@ -2047,15 +2158,17 @@ fn endPass(self: *Gl) Error!void {
     self.resolves = @splat(null);
     api.bindFramebuffer(c.framebuffer, 0);
     self.pipeline = null;
+    // Back to the device's context, where what is made between passes is.
+    useContext(self, null);
 }
 
-fn bindPipeline(self: *Gl, res: *PipelineRes) void {
+fn bindPipeline(self: *Gl, res: *PipelineRes) Error!void {
     const api = &self.api;
     self.pipeline = res;
     self.bindings_dirty = true;
 
     api.useProgram(res.program);
-    fnOf(api, "bindVertexArray")(res.vao);
+    fnOf(api, "bindVertexArray")(try vertexArrayOf(self, res));
 
     // A pipeline for a depth-only pass has no colour format and must not
     // write one, whatever the draw buffers of the framebuffer it is bound

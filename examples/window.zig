@@ -95,14 +95,20 @@ pub const Window = struct {
         };
     }
 
-    /// What the OpenGL backend needs: the context, as four callbacks.
+    /// What the OpenGL backend needs: the context, as callbacks.
     pub fn hooks(self: Window) rhi.GlHooks {
         return .{
             .context = self.inner,
             .get_proc_address = getProcAddress,
             .swap_buffers = swapBuffers,
             .framebuffer_size = framebufferSize,
+            .make_current = makeCurrent,
         };
+    }
+
+    fn makeCurrent(context: *anyopaque) void {
+        const inner: *Inner = @ptrCast(@alignCast(context));
+        inner.win.makeContextCurrent() catch {};
     }
 
     fn getProcAddress(context: *anyopaque, name: [*:0]const u8) ?rhi.GlProc {
@@ -204,6 +210,80 @@ pub const Window = struct {
         self.inner.ctx.deinit();
         std.heap.smp_allocator.destroy(self.inner);
         self.* = undefined;
+    }
+
+    /// Another window of the same context - a GL one sharing this one's
+    /// objects - which a device on this window draws into too.
+    pub fn openOther(self: Window, options: Options) Error!Other {
+        const gpa = std.heap.smp_allocator;
+        const win = try gpa.create(platform.Window);
+        errdefer gpa.destroy(win);
+        win.* = try self.inner.ctx.createWindow(.{
+            .title = options.title,
+            .width = options.width,
+            .height = options.height,
+            .visible = options.visible,
+            .gl = if (options.backend == .gl) .{ .major = 3, .minor = 3, .profile = .core } else null,
+            .share_gl_with = if (options.backend == .gl) self.inner.win else null,
+        });
+        // The device's context is the one current, whatever making another did.
+        if (options.backend == .gl) self.inner.win.makeContextCurrent() catch {};
+        return .{ .win = win };
+    }
+};
+
+/// A second window: see `Window.openOther`.
+pub const Other = struct {
+    win: *platform.Window,
+
+    /// Its surface on a device of the first window: in its own context, on GL.
+    pub fn createSurface(self: Other, device: *rhi.Device) rhi.Error!rhi.Surface {
+        const size = self.win.framebufferSize();
+        return device.createSurface(.{
+            .native_window = self.win.native(),
+            .window = .{
+                .context = self.win,
+                .make_vulkan_surface = makeVulkanSurface,
+                .gl = if (self.win.contextConfig() != null) .{
+                    .make_current = makeCurrent,
+                    .swap_buffers = swapBuffers,
+                    .framebuffer_size = framebufferSize,
+                    .set_swap_interval = setSwapInterval,
+                } else null,
+            },
+            .width = size[0],
+            .height = size[1],
+        });
+    }
+
+    pub fn close(self: *Other) void {
+        self.win.destroy();
+        std.heap.smp_allocator.destroy(self.win);
+        self.* = undefined;
+    }
+
+    fn of(context: *anyopaque) *platform.Window {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn makeCurrent(context: *anyopaque) void {
+        of(context).makeContextCurrent() catch {};
+    }
+
+    fn swapBuffers(context: *anyopaque) void {
+        of(context).swapBuffers() catch {};
+    }
+
+    fn framebufferSize(context: *anyopaque) [2]u32 {
+        return of(context).framebufferSize();
+    }
+
+    fn setSwapInterval(context: *anyopaque, vsync: bool) void {
+        of(context).setSwapInterval(if (vsync) .vsync else .immediate) catch {};
+    }
+
+    fn makeVulkanSurface(context: *anyopaque, instance: usize, get_instance_proc_addr: *const anyopaque) ?u64 {
+        return of(context).createVulkanSurface(instance, @ptrCast(@alignCast(get_instance_proc_addr)), null) catch null;
     }
 };
 
@@ -392,8 +472,68 @@ test "a window's surface is where a frame ends up" {
     try device.submit();
     try device.present(surface);
 
-    // A second surface is a second context, which the hooks do not describe.
+    // A second surface of the device's own context is not a thing: another
+    // window's is, with that window's context.
     try testing.expectError(error.Unsupported, device.createSurface(.{}));
+}
+
+test "another window's surface is drawn in its own context, with the device's objects" {
+    var fixture = try TestDevice.open(.gl);
+    defer fixture.close();
+    var device = &fixture.device;
+    const first = try fixture.window.?.createSurface(device);
+    var other = fixture.window.?.openOther(.{ .backend = .gl, .width = 64, .height = 64, .visible = false }) catch |err|
+        if (Window.isAbsent(err)) return error.SkipZigTest else return err;
+    defer other.close();
+    const second = try other.createSurface(device);
+    defer device.destroySurface(second);
+    try testing.expect((try device.surfaceSize(second)).width >= 64);
+
+    // One pipeline and one buffer, drawn in both contexts: a vertex array
+    // the second's own, or the debug output says so.
+    const shader = try device.createShader(.{ .glsl = .{ .vertex = flat_vs, .fragment = flat_fs } });
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{
+            .{ .location = 0, .format = .float2, .offset = 0 },
+            .{ .location = 1, .format = .float4, .offset = 8 },
+        },
+        .buffers = &.{.{ .stride = @sizeOf(Vertex) }},
+        .uniform_blocks = &.{"Frame"},
+    });
+    const vertices = [_]Vertex{
+        .{ .position = .{ -0.6, -0.6 }, .colour = .{ 1, 0, 0, 1 } },
+        .{ .position = .{ 0.0, 0.6 }, .colour = .{ 1, 0, 0, 1 } },
+        .{ .position = .{ 0.6, -0.6 }, .colour = .{ 1, 0, 0, 1 } },
+    };
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(vertices)), .data = std.mem.asBytes(&vertices) });
+    const tint = try device.createBuffer(.{ .kind = .uniform, .size = 16 });
+    try device.updateBuffer(tint, 0, std.mem.asBytes(&[4]f32{ 1, 1, 1, 1 }));
+    const target = try device.createTexture(.{ .width = 64, .height = 64, .usage = .{ .render_target = true } });
+
+    const into = [_]rhi.types.RenderTarget{ .{ .surface = second }, .{ .surface = first }, .{ .texture = target } };
+    for (0..2) |_| {
+        const cmd = device.begin();
+        for (into) |where| {
+            try cmd.beginPass(.{ .color = .{ .target = where, .clear_color = .{ 0, 0, 1, 1 } } });
+            try cmd.setPipeline(pipeline);
+            try cmd.setVertexBuffer(0, buffer, 0);
+            try cmd.setUniformBuffer(0, tint);
+            try cmd.draw(.{ .vertex_count = 3 });
+            try cmd.endPass();
+        }
+        try device.submit();
+        try device.present(second);
+        try device.present(first);
+    }
+
+    // The device's own context is current again: a texture drawn last reads
+    // back as it was drawn.
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, at(pixels, 64, 32, 32));
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(pixels, 64, 2, 2));
+    device.destroyPipeline(pipeline);
 }
 
 // -------------------------------------------------------------------------

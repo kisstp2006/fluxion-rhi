@@ -176,12 +176,23 @@ without the version as GLSL ES 1.00.
 
 | Backend | Where | Needs | How it presents |
 | --- | --- | --- | --- |
-| `gl` | Anywhere with OpenGL 3.3 core | `DeviceDesc.gl`: a context, current on this thread | `GlHooks.swap_buffers`; one surface, the context's own framebuffer |
+| `gl` | Anywhere with OpenGL 3.3 core | `DeviceDesc.gl`: a context, current on this thread | `GlHooks.swap_buffers`: the context's own framebuffer; and another window's, in its own context sharing the device's objects, given by `WindowHooks.gl` |
 | `d3d11` | Windows | Nothing; `d3d11.dll` is found at run time | A flip-model swap chain on the `HWND` in `SurfaceDesc` |
 | `d3d12` | Windows | Nothing; `d3d12.dll` and `d3dcompiler_47.dll` are found at run time | A flip-model swap chain on the `HWND` in `SurfaceDesc` |
 | `vulkan` | Windows, Linux, Android | A Vulkan loader, and a device with `VK_KHR_swapchain` and `VK_KHR_maintenance1` | A swapchain on the surface `SurfaceDesc.window` makes, or the one in `vulkan_surface` |
 | `webgl` | A browser, from a `wasm32` build | Nothing; the page made the context, and Fluxion WebGL's glue hands it over | Returning from the frame callback; one surface, the canvas |
 | `none` | Everywhere | Nothing | Nothing |
+
+**More than one window on OpenGL.** A device's own surface is its
+context's framebuffer. A surface on another window comes with that window's
+own context, made to share the device's - Fluxion Platform's
+`share_gl_with` - through `WindowHooks.gl`: a pass into it is drawn in its
+context, and every other pass, and everything made, in the device's, which
+needs `GlHooks.make_current` to come back to. The two share buffers,
+textures, samplers and programs; a vertex array is each context's own, so a
+pipeline gets one in each it draws in. Each switch flushes, so what one
+context did the other sees. A multisampled image cannot be resolved into
+another window's surface.
 
 `Device.init(.{})` with `.backend = .auto` takes OpenGL when hooks were given,
 Direct3D 11 on Windows otherwise and WebGL on the web; it never chooses
