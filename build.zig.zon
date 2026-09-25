@@ -8,12 +8,12 @@
     .dependencies = .{
         // The three backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#a41181c8c949b44e76a10a864614e6f44f6608cb",
-            .hash = "fluxion_gl-0.1.0-F9AI4lllBQCLkFoAt8mv5nX1Ql2Coog5Bj2MRJIRO5kf",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#d4887d3ca907b71fe5eda2537b8d0a7e929ee9e5",
+            .hash = "fluxion_gl-0.1.0-F9AI4lllBQDMizdNIdX6Qff0Yzip8x_2vu-mh5kebWkw",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#6e683e223ec04ea2c31cf9f800e3fc3463219c46",
-            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQBwS3hP4YpGg_IQ-2FFzZC8PXcqfpcB9ltL",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#161140d820bbec900735dff877dda80133f4e295",
+            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQB4FZp7I3O4DAQibxpepr8RtGa2ntS9wmen",
         },
         // The Vulkan loader and generated ABI. The RHI opens it at run time,
         // just as the Direct3D backend opens its system DLLs. Pinned to the
@@ -49,8 +49,8 @@
         // `-Dexamples` is given. The library never opens a window and never
         // writes a file.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#a3f3707277d8a4fdc8100a6edd85bc779284de52",
-            .hash = "fluxion_platform-0.1.0-WsOjUUdvFwCsEYeB1XX5RhTBrRB3ElWncnw7VZ6cR99F",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#70464d7f4f07486bbdeecadb5b5af2d786416b14",
+            .hash = "fluxion_platform-0.1.0-WsOjUQpvFwAaRZAJe78KHp5AjgI4_aUARNR5KDkk-VmU",
             .lazy = true,
         },
         .fluxion_image = .{
@@ -64,8 +64,8 @@
         // text came from.
         //
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#ab1646e71cc2b21aa147efb81e033bb35b8aaeb8",
-            .hash = "fluxion_shader-0.1.0-FqFMEv42BwDX3OTutO_2lx_Iv2EX8d-aDpq9abQEK-o2",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#ae10e60674941a1a6cc1798f3259789a69ac4746",
+            .hash = "fluxion_shader-0.1.0-FqFMEmBUBwAgRXrR34cXH0CUDdTUDtZ-EMPuSKS9ZfIF",
             .lazy = true,
         },
     },
