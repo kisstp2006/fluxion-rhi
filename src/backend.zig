@@ -85,7 +85,7 @@ pub const Vtable = struct {
     destroySurface: *const fn (Impl, Native) void,
     resizeSurface: *const fn (Impl, Native, width: u32, height: u32) Error!void,
     surfaceSize: *const fn (Impl, Native) [2]u32,
-    present: *const fn (Impl, Native, vsync: bool) Error!void,
+    present: *const fn (Impl, Native, mode: types.PresentMode) Error!void,
 
     /// Execute a list that `Device` has already validated: every handle in it
     /// is alive, every draw is inside a pass, every pass is closed.

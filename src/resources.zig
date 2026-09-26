@@ -64,7 +64,7 @@ pub const PipelineEntry = struct {
 
 pub const SurfaceEntry = struct {
     native: *anyopaque,
-    vsync: bool,
+    present_mode: types.PresentMode,
 };
 
 pub const Buffer = ids.handle.Handle(BufferEntry);

@@ -2104,10 +2104,13 @@ fn surfaceSize(impl: backend.Impl, native: backend.Native) [2]u32 {
     return .{ res.width, res.height };
 }
 
-fn present(impl: backend.Impl, native: backend.Native, vsync: bool) Error!void {
+/// A sync interval of one waits for the refresh; of nought, shows the frame
+/// at once - which, in the flip model the swap chain is made with, the
+/// compositor still shows whole: `disabled` and `mailbox` alike.
+fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) Error!void {
     _ = impl;
     const res = as(SurfaceRes, native);
-    res.swap_chain.vtable.Present(res.swap_chain, if (vsync) 1 else 0, 0).check() catch |err| switch (err) {
+    res.swap_chain.vtable.Present(res.swap_chain, if (mode.waits()) 1 else 0, 0).check() catch |err| switch (err) {
         error.DeviceRemoved, error.DeviceReset => return error.DeviceLost,
         else => return error.Failed,
     };
@@ -3646,7 +3649,7 @@ test "a pass draws into a surface, and a multisampled one resolves into it" {
     var device = try warpDevice();
     defer device.deinit();
     if (!device.caps().formatSupport(surface_format).supportsSamples(4)) return error.SkipZigTest;
-    const surface = device.createSurface(.{ .native_window = @intFromPtr(window), .width = 32, .height = 32, .vsync = false }) catch return error.SkipZigTest;
+    const surface = device.createSurface(.{ .native_window = @intFromPtr(window), .width = 32, .height = 32, .present_mode = .disabled }) catch return error.SkipZigTest;
 
     // A pass that clears it is green all over.
     {

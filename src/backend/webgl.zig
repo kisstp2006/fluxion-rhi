@@ -1340,13 +1340,13 @@ fn canvasSize() [2]u32 {
     return .{ @intCast(@max(size.width, 0)), @intCast(@max(size.height, 0)) };
 }
 
-fn present(impl: backend.Impl, native: backend.Native, vsync: bool) Error!void {
+fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) Error!void {
     // Nothing to do. The browser shows the drawing buffer when the frame
     // callback that drew into it returns, at the display's own rate - which
     // is the only vsync a page has.
     _ = impl;
     _ = native;
-    _ = vsync;
+    _ = mode;
 }
 
 // -------------------------------------------------------------------------

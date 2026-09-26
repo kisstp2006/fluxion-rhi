@@ -907,7 +907,7 @@ const SurfaceRes = struct {
     vaos: std.AutoHashMapUnmanaged(*PipelineRes, gt.Uint) = .empty,
     /// Whether the state the backend never changes is set in its context.
     prepared: bool = false,
-    vsync: ?bool = null,
+    present_mode: ?types.PresentMode = null,
 
     const Other = struct {
         context: *anyopaque,
@@ -1864,8 +1864,8 @@ fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) Error!backend.Nati
     res.* = .{ .window = .{ .context = desc.window.?.context, .hooks = other } };
     self.others.appendAssumeCapacity(res);
     useContext(self, res);
-    other.set_swap_interval(desc.window.?.context, desc.vsync);
-    res.vsync = desc.vsync;
+    other.set_swap_interval(desc.window.?.context, desc.present_mode);
+    res.present_mode = desc.present_mode;
     useContext(self, null);
     return res;
 }
@@ -1902,7 +1902,7 @@ fn surfaceSize(impl: backend.Impl, native: backend.Native) [2]u32 {
     return as(SurfaceRes, native).size(cast(impl));
 }
 
-fn present(impl: backend.Impl, native: backend.Native, vsync: bool) Error!void {
+fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) Error!void {
     const self = cast(impl);
     const res = as(SurfaceRes, native);
     // The device's own swap interval is its context's; see
@@ -1910,9 +1910,9 @@ fn present(impl: backend.Impl, native: backend.Native, vsync: bool) Error!void {
     const w = res.window orelse return self.hooks.swap_buffers(self.hooks.context);
     useContext(self, res);
     defer useContext(self, null);
-    if (res.vsync != vsync) {
-        w.hooks.set_swap_interval(w.context, vsync);
-        res.vsync = vsync;
+    if (res.present_mode != mode) {
+        w.hooks.set_swap_interval(w.context, mode);
+        res.present_mode = mode;
     }
     w.hooks.swap_buffers(w.context);
 }

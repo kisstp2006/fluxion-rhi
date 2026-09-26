@@ -561,7 +561,7 @@ pub fn destroyPipeline(self: *Device, h: types.Pipeline) void {
 pub fn createSurface(self: *Device, desc: types.SurfaceDesc) Error!types.Surface {
     const native = try self.vtable.createSurface(self.impl, desc);
     errdefer self.vtable.destroySurface(self.impl, native);
-    return self.surfaces.add(self.gpa, .{ .native = native, .vsync = desc.vsync });
+    return self.surfaces.add(self.gpa, .{ .native = native, .present_mode = desc.present_mode });
 }
 
 pub fn destroySurface(self: *Device, h: types.Surface) void {
@@ -581,15 +581,22 @@ pub fn surfaceSize(self: *Device, h: types.Surface) Error!types.Extent {
     return .{ .width = size[0], .height = size[1] };
 }
 
-pub fn setVsync(self: *Device, h: types.Surface, vsync: bool) Error!void {
+/// How the surface's frames are shown against the display's refresh, from
+/// the next `present`. See `types.PresentMode`.
+pub fn setPresentMode(self: *Device, h: types.Surface, mode: types.PresentMode) Error!void {
     const entry = self.surfaces.get(h) orelse return error.InvalidHandle;
-    entry.vsync = vsync;
+    entry.present_mode = mode;
+}
+
+pub fn presentMode(self: *Device, h: types.Surface) Error!types.PresentMode {
+    const entry = self.surfaces.get(h) orelse return error.InvalidHandle;
+    return entry.present_mode;
 }
 
 /// Show what the last submit drew into the surface.
 pub fn present(self: *Device, h: types.Surface) Error!void {
     const entry = self.surfaces.get(h) orelse return error.InvalidHandle;
-    try self.vtable.present(self.impl, entry.native, entry.vsync);
+    try self.vtable.present(self.impl, entry.native, entry.present_mode);
 }
 
 // -------------------------------------------------------------------------
@@ -874,6 +881,21 @@ test "creation refuses what no backend could do" {
         .attributes = &.{},
         .buffers = &.{},
     }));
+}
+
+test "a surface is shown in the mode it was made with, and in any it is set to" {
+    var device = try nothing();
+    defer device.deinit();
+    const surface = try device.createSurface(.{ .width = 8, .height = 8, .present_mode = .mailbox });
+    try std.testing.expectEqual(types.PresentMode.mailbox, try device.presentMode(surface));
+    for (std.enums.values(types.PresentMode)) |mode| {
+        try device.setPresentMode(surface, mode);
+        try std.testing.expectEqual(mode, try device.presentMode(surface));
+        try device.present(surface);
+    }
+    // Only enabled and adaptive wait for the refresh.
+    try std.testing.expect(types.PresentMode.enabled.waits() and types.PresentMode.adaptive.waits());
+    try std.testing.expect(!types.PresentMode.disabled.waits() and !types.PresentMode.mailbox.waits());
 }
 
 test "a frame that makes sense goes through, and one that does not is named" {

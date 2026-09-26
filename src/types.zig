@@ -865,8 +865,10 @@ pub const GlWindow = struct {
     make_current: *const fn (*anyopaque) void,
     swap_buffers: *const fn (*anyopaque) void,
     framebuffer_size: *const fn (*anyopaque) [2]u32,
-    /// Vsync on or off, for the context while it is current.
-    set_swap_interval: *const fn (*anyopaque, vsync: bool) void,
+    /// How frames are shown, for the context while it is current: `adaptive`
+    /// where the driver has late swaps, `enabled` where it has not, and
+    /// `mailbox` as `enabled` - OpenGL has no such thing.
+    set_swap_interval: *const fn (*anyopaque, mode: PresentMode) void,
 };
 
 /// What a window can make for a backend, asked for only by the backend that
@@ -930,7 +932,31 @@ pub const SurfaceDesc = struct {
     /// Zero means "the window's size".
     width: u32 = 0,
     height: u32 = 0,
-    vsync: bool = true,
+    present_mode: PresentMode = .enabled,
+};
+
+/// How a surface's frames are shown against the display's refresh. Every
+/// backend has `disabled` and `enabled`; one without the other two shows
+/// them as `enabled`, which never tears.
+pub const PresentMode = enum {
+    /// As soon as a frame is drawn, never waiting: as many frames as the
+    /// program can draw, and where nothing composites the window, tearing.
+    disabled,
+    /// One frame a refresh, the program waiting for it: never tears.
+    enabled,
+    /// One a refresh, but a late frame is shown at once rather than a whole
+    /// refresh later, tearing that once instead of stuttering. Vulkan's FIFO
+    /// relaxed and OpenGL's late swap.
+    adaptive,
+    /// The newest frame at each refresh, the program never waiting: never
+    /// tears, and no queue of old frames behind it. Vulkan's mailbox, and
+    /// Direct3D's flip model without the wait.
+    mailbox,
+
+    /// Whether the program waits for the refresh before its next frame.
+    pub fn waits(self: PresentMode) bool {
+        return self == .enabled or self == .adaptive;
+    }
 };
 
 // -------------------------------------------------------------------------

@@ -133,6 +133,7 @@ pub const WindowHooks = types.WindowHooks;
 pub const GlProc = types.GlProc;
 pub const DeviceDesc = types.DeviceDesc;
 pub const SurfaceDesc = types.SurfaceDesc;
+pub const PresentMode = types.PresentMode;
 
 /// Which backends this build could open. See `Device.available`.
 pub const available = Device.available;

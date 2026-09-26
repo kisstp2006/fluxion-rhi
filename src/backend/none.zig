@@ -203,10 +203,10 @@ fn surfaceSize(impl: backend.Impl, native: backend.Native) [2]u32 {
     return .{ r.width, r.height };
 }
 
-fn present(impl: backend.Impl, native: backend.Native, vsync: bool) backend.Error!void {
+fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) backend.Error!void {
     _ = impl;
     _ = native;
-    _ = vsync;
+    _ = mode;
 }
 
 fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) backend.Error!void {

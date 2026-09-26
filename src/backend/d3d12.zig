@@ -1322,10 +1322,11 @@ fn surfaceSize(impl: backend.Impl, native: backend.Native) [2]u32 {
     return .{ res.width, res.height };
 }
 
-fn present(impl: backend.Impl, native: backend.Native, vsync: bool) Error!void {
+/// See d3d11's: the same sync intervals, the same flip model.
+fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) Error!void {
     _ = impl;
     const res = as(SurfaceRes, native);
-    res.swap_chain.vtable.base.Present(@ptrCast(res.swap_chain), if (vsync) 1 else 0, 0).check() catch |err| switch (err) {
+    res.swap_chain.vtable.base.Present(@ptrCast(res.swap_chain), if (mode.waits()) 1 else 0, 0).check() catch |err| switch (err) {
         error.DeviceRemoved, error.DeviceReset => return error.DeviceLost,
         else => return error.Failed,
     };

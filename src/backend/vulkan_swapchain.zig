@@ -58,11 +58,10 @@ pub const SurfaceRes = struct {
     /// Whether each image has been drawn into since the swapchain was made:
     /// until it has, its layout is undefined rather than presentable.
     drawn: [max_swapchain_images]bool = @splat(false),
-    /// Whether the swapchain was made presenting with vsync, and what the
-    /// last `present` asked for: the next acquire makes it again when they
-    /// differ.
-    vsync: bool = true,
-    want_vsync: bool = true,
+    /// How the swapchain was made to present, and what the last `present`
+    /// asked for: the next acquire makes it again when they differ.
+    mode: types.PresentMode = .enabled,
+    want_mode: types.PresentMode = .enabled,
     /// Told by an acquire or a present that it no longer fits the window:
     /// made again at the next acquire.
     stale: bool = false,
@@ -80,7 +79,7 @@ pub fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) types.Error!ba
 
     const res = try self.gpa.create(SurfaceRes);
     errdefer self.gpa.destroy(res);
-    res.* = .{ .surface = surface, .vsync = desc.vsync, .want_vsync = desc.vsync };
+    res.* = .{ .surface = surface, .mode = desc.present_mode, .want_mode = desc.present_mode };
     _ = self.runtime.vkd.createSemaphore(self.runtime.device, &.{}, null, &res.acquired_signal).check() catch return error.Failed;
     errdefer self.runtime.vkd.destroySemaphore(self.runtime.device, res.acquired_signal, null);
     errdefer destroySwapchainObjects(self, res);
@@ -125,7 +124,7 @@ fn rebuild(self: *Vk, res: *SurfaceRes, width: u32, height: u32) types.Error!voi
 /// call acquired it, which the submit it is in then waits for.
 pub fn acquire(self: *Vk, res: *SurfaceRes) types.Error!bool {
     if (res.acquired != null) return false;
-    if (res.stale or res.vsync != res.want_vsync) try rebuild(self, res, res.width, res.height);
+    if (res.stale or res.mode != res.want_mode) try rebuild(self, res, res.width, res.height);
     const acquireFn = self.runtime.vkd.acquireNextImageKHR orelse return error.Unsupported;
     var tries: u32 = 0;
     while (true) : (tries += 1) {
@@ -145,12 +144,12 @@ pub fn acquire(self: *Vk, res: *SurfaceRes) types.Error!bool {
 }
 
 /// Shows the image this frame drew into. A frame that drew nothing into the
-/// surface has nothing to show, and shows nothing. `vsync` takes effect at
+/// surface has nothing to show, and shows nothing. `mode` takes effect at
 /// the next frame's acquire.
-pub fn present(impl: backend.Impl, native: backend.Native, vsync: bool) types.Error!void {
+pub fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) types.Error!void {
     const self = vulkan.cast(impl);
     const res = as(SurfaceRes, native);
-    res.want_vsync = vsync;
+    res.want_mode = mode;
     const index = res.acquired orelse return;
     res.acquired = null;
     const presentFn = self.runtime.vkd.queuePresentKHR orelse return error.Unsupported;
@@ -194,7 +193,7 @@ pub fn mapLoadOp(load: types.LoadOp) vk.gen.types.AttachmentLoadOp {
 // -------------------------------------------------------------------------
 
 /// Creates (or, with `old != .none`, recreates in place) `res`'s swapchain,
-/// image views and framebuffers. `res.surface`, `res.want_vsync` and
+/// image views and framebuffers. `res.surface`, `res.want_mode` and
 /// `res.swapchain` (as `old`) are the fields read; the rest are written.
 fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32, old: vk.gen.types.SwapchainKHR) types.Error!void {
     const vki = self.runtime.vki;
@@ -228,19 +227,26 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
     const chosen_space = chosen.?.color_space;
 
     // FIFO is required by the spec on every implementation, and is what
-    // `vsync = true` means everywhere else in this library. Without vsync,
-    // mailbox - never tearing - and then immediate, when there are.
+    // `enabled` means everywhere else in this library; each other mode is
+    // the first of its wishes the surface has, and FIFO where it has none.
     var present_mode: vk.gen.types.PresentModeKHR = .fifo;
-    if (!res.want_vsync) {
+    const wishes: []const vk.gen.types.PresentModeKHR = switch (res.want_mode) {
+        .enabled => &.{},
+        .disabled => &.{ .immediate, .mailbox },
+        .adaptive => &.{.fifo_relaxed},
+        .mailbox => &.{.mailbox},
+    };
+    if (wishes.len > 0) {
         if (vki.getPhysicalDeviceSurfacePresentModesKHR) |getModes| {
             var mode_count: u32 = max_present_modes;
             var mode_buf: [max_present_modes]vk.gen.types.PresentModeKHR = undefined;
             if (getModes(phys, res.surface, &mode_count, &mode_buf).check()) |_| {
                 const modes = mode_buf[0..mode_count];
-                if (std.mem.indexOfScalar(vk.gen.types.PresentModeKHR, modes, .mailbox) != null) {
-                    present_mode = .mailbox;
-                } else if (std.mem.indexOfScalar(vk.gen.types.PresentModeKHR, modes, .immediate) != null) {
-                    present_mode = .immediate;
+                for (wishes) |wish| {
+                    if (std.mem.indexOfScalar(vk.gen.types.PresentModeKHR, modes, wish) != null) {
+                        present_mode = wish;
+                        break;
+                    }
                 }
             } else |_| {}
         }
@@ -335,7 +341,7 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
     res.framebuffers = framebuffers;
     res.acquired = null;
     res.drawn = @splat(false);
-    res.vsync = res.want_vsync;
+    res.mode = res.want_mode;
     res.stale = false;
 }
 

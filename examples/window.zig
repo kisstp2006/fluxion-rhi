@@ -278,8 +278,13 @@ pub const Other = struct {
         return of(context).framebufferSize();
     }
 
-    fn setSwapInterval(context: *anyopaque, vsync: bool) void {
-        of(context).setSwapInterval(if (vsync) .vsync else .immediate) catch {};
+    fn setSwapInterval(context: *anyopaque, mode: rhi.PresentMode) void {
+        const interval: platform.gl.SwapInterval = switch (mode) {
+            .disabled => .immediate,
+            .enabled, .mailbox => .vsync,
+            .adaptive => .adaptive,
+        };
+        of(context).setSwapInterval(interval) catch of(context).setSwapInterval(.vsync) catch {};
     }
 
     fn makeVulkanSurface(context: *anyopaque, instance: usize, get_instance_proc_addr: *const anyopaque) ?u64 {
