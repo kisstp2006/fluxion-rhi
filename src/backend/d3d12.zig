@@ -50,6 +50,12 @@
 //! order, so a texture's state kept on the CPU is the state the next list
 //! finds: sampled-from between submits, and a pass, a write or a read moves
 //! it and moves it back.
+//!
+//! **One list a frame.** A `submit` or an upload goes on at the end of the
+//! list that is open, rather than into one of its own, and the list is
+//! executed when something needs it done: a present, a readback, a
+//! surface's end, or `max_lists` lists. `ExecuteCommandLists` has a cost of
+//! its own on the GPU, and a frame of many passes pays it once.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -108,6 +114,10 @@ const ring_sampler_descriptors = 2048;
 const ring_size = 4;
 const slot_srv_descriptors = ring_srv_descriptors / ring_size;
 const slot_sampler_descriptors = ring_sampler_descriptors / ring_size;
+
+/// The most `submit`s one list takes before it is executed: a program that
+/// never presents still has its work done.
+const max_lists = 64;
 
 const root_param_cbv0 = 0;
 const root_param_srv_table = 4;
@@ -252,9 +262,11 @@ const D3d = struct {
     fence_value: u64 = 0,
     completed: u64 = 0,
     graveyard: std.ArrayListUnmanaged(Grave) = .empty,
-    /// The buffers the submit being recorded binds: marked as used by it
-    /// once it is executed.
+    /// The buffers the submit being recorded binds: used again after a list
+    /// that runs out of ring is executed and recording goes on.
     used_buffers: std.ArrayListUnmanaged(*BufferRes) = .empty,
+    /// How many submits the open list holds.
+    lists: u32 = 0,
 
     root_signature: *pl.ID3D12RootSignature,
 
@@ -769,6 +781,13 @@ fn beginRecording(self: *D3d) Error!void {
     self.recording = true;
     self.ring_srv_used = 0;
     self.ring_sampler_used = 0;
+    self.lists = 0;
+    setUpList(self);
+}
+
+/// Execute the open list, if there is one.
+fn flush(self: *D3d) Error!void {
+    if (self.recording) try closeAndExecute(self);
 }
 
 /// Close what was recorded, execute it and signal the next fence value,
@@ -798,8 +817,10 @@ fn waitFor(self: *D3d, value: u64) Error!void {
 /// Release `what` once the GPU is past everything executed so far, or now
 /// when it already is.
 fn bury(self: *D3d, what: @FieldType(Grave, "what")) void {
-    if (self.completed >= self.fence_value) return free(what);
-    self.graveyard.append(self.gpa, .{ .value = self.fence_value, .what = what }) catch {
+    if (!self.recording and self.completed >= self.fence_value) return free(what);
+    // The open list, when there is one, may use it too.
+    const value = if (self.recording) self.fence_value + 1 else self.fence_value;
+    self.graveyard.append(self.gpa, .{ .value = value, .what = what }) catch {
         // No room to wait: wait for it instead.
         waitForGpuIdle(self);
         free(what);
@@ -828,16 +849,12 @@ fn collect(self: *D3d) void {
     }
 }
 
-/// The buffers the submit just executed bound, marked as used by it.
-fn markUsed(self: *D3d) void {
-    for (self.used_buffers.items) |res| res.current.busy = self.fence_value;
-    self.used_buffers.clearRetainingCapacity();
-}
-
-/// Bound by the submit being recorded; the version it has now is the one
-/// the list reads.
+/// Bound by the submit being recorded: the version it has now is the one
+/// the list reads, busy until the fence passes the value the list's execute
+/// will signal.
 fn use(self: *D3d, res: *BufferRes) Error!*rc.ID3D12Resource {
     self.used_buffers.append(self.gpa, res) catch return error.OutOfMemory;
+    res.current.busy = self.fence_value + 1;
     return res.current.resource;
 }
 
@@ -850,6 +867,7 @@ fn use(self: *D3d, res: *BufferRes) Error!*rc.ID3D12Resource {
 /// so `destroySurface`/`resizeSurface` call this before touching any of
 /// them.
 fn waitForGpuIdle(self: *D3d) void {
+    flush(self) catch {};
     self.fence_value += 1;
     self.queue.vtable.Signal(self.queue, @ptrCast(self.fence), self.fence_value).check() catch return;
     waitFor(self, self.fence_value) catch return;
@@ -874,7 +892,6 @@ fn abandonRecording(self: *D3d) void {
     if (!self.recording) return;
     endTarget(self);
     closeAndExecute(self) catch {};
-    markUsed(self);
 }
 
 // -------------------------------------------------------------------------
@@ -974,7 +991,8 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
 
     const target = desc.usage.render_target;
     const rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_render_target = target });
-    const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, sampled, null) catch return error.Failed;
+    const clear: rc.ClearValue = .{ .format = format, .color = desc.clear_color };
+    const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, sampled, if (target) &clear else null) catch return error.Failed;
     errdefer _ = com.release(obj);
 
     const slot = try allocSrv(self);
@@ -1054,15 +1072,14 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     }
     staging.vtable.Unmap(staging, 0, null);
 
-    try beginRecording(self);
+    if (!self.recording) try beginRecording(self);
     errdefer abandonRecording(self);
     transition(self, res, .{ .copy_dest = true });
     const dst_loc = cmdmod.TextureCopyLocation.subresource(res.resource, 0);
     const src_loc = cmdmod.TextureCopyLocation.placed(staging, footprint);
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, region.x, region.y, 0, &src_loc, null);
     transition(self, res, sampled);
-    try closeAndExecute(self);
-    // Read by the copy on its way: released once it is done.
+    // Read by the copy when the list runs: released once it has.
     bury(self, .{ .resource = staging });
     buried = true;
 }
@@ -1080,7 +1097,7 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     const readback = try transferBuffer(self, .readback, size);
     defer _ = com.release(readback);
 
-    try beginRecording(self);
+    if (!self.recording) try beginRecording(self);
     errdefer abandonRecording(self);
     transition(self, res, .{ .copy_source = true });
     const dst_loc = cmdmod.TextureCopyLocation.placed(readback, footprint);
@@ -1495,8 +1512,10 @@ fn surfaceSize(impl: backend.Impl, native: backend.Native) [2]u32 {
 
 /// See d3d11's: the same sync intervals, the same flip model.
 fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) Error!void {
-    _ = impl;
+    const self = cast(impl);
     const res = as(SurfaceRes, native);
+    // What was drawn into it is recorded, and runs before the flip.
+    try flush(self);
     res.swap_chain.vtable.base.Present(@ptrCast(res.swap_chain), if (mode.waits()) 1 else 0, 0).check() catch |err| switch (err) {
         error.DeviceRemoved, error.DeviceReset => return error.DeviceLost,
         else => return error.Failed,
@@ -1510,7 +1529,7 @@ fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) 
 fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Command) Error!void {
     const self = cast(impl);
     self.used_buffers.clearRetainingCapacity();
-    try beginRecording(self);
+    if (!self.recording) try beginRecording(self);
     errdefer abandonRecording(self);
 
     self.current_pipeline = null;
@@ -1523,7 +1542,6 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
     self.textures_dirty = true;
     self.samplers_dirty = true;
     self.target = null;
-    setUpList(self);
 
     const cmd_list = self.list;
     for (list_cmds) |command| {
@@ -1636,8 +1654,8 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
         }
     }
 
-    try closeAndExecute(self);
-    markUsed(self);
+    self.lists += 1;
+    if (self.lists >= max_lists) try closeAndExecute(self);
 }
 
 /// What every recording starts with: the one root signature, and the rings
@@ -1698,7 +1716,8 @@ fn prepareDraw(self: *D3d) Error!void {
 fn restartRecording(self: *D3d) Error!void {
     try closeAndExecute(self);
     try beginRecording(self);
-    setUpList(self);
+    // What this list bound is bound again below, in the next list.
+    for (self.used_buffers.items) |res| res.current.busy = self.fence_value + 1;
 
     const cmd_list = self.list;
     if (self.target) |target| cmd_list.vtable.OMSetRenderTargets(cmd_list, 1, @ptrCast(&target.rtv), 0, null);
@@ -1820,22 +1839,29 @@ test "a buffer the GPU may still read is written into another copy, which keeps 
     try testing.expectEqualSlices(u8, "ZbXYefgh", res.current.mapped[0..8]);
 }
 
-test "submits do not wait for each other, and what they used is released once the GPU is done" {
+test "submits go into one list, executed when needed, and what they used is released once the GPU is done" {
     var device = try warpDevice();
     defer device.deinit();
     const self = cast(device.impl);
 
-    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true }, .clear_color = .{ 0, 1, 0, 1 } });
+    try flush(self);
     const before = self.fence_value;
-    for (0..ring_size * 3) |_| {
+    for (0..12) |_| {
         const cmd = device.begin();
         try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 0, 1, 0, 1 } } });
         try cmd.endPass();
         try device.submit();
     }
-    try testing.expectEqual(before + ring_size * 3, self.fence_value);
+    // Twelve submits, and nothing executed yet.
+    try testing.expectEqual(before, self.fence_value);
+    try testing.expect(self.recording);
     const doomed = try device.createTexture(.{ .width = 2, .height = 2 });
+    const graves = self.graveyard.items.len;
     device.destroyTexture(doomed);
+    try testing.expectEqual(graves + 1, self.graveyard.items.len);
+    try flush(self);
+    try testing.expectEqual(before + 1, self.fence_value);
     waitForGpuIdle(self);
     try testing.expectEqual(@as(usize, 0), self.graveyard.items.len);
 

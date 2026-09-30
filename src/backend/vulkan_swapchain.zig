@@ -90,6 +90,7 @@ pub fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) types.Error!ba
 pub fn destroySurface(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
     const res = as(SurfaceRes, native);
+    vulkan.flush(self) catch {};
     vulkan.waitIdle(self);
     destroySwapchainObjects(self, res);
     if (self.runtime.vki.destroySurfaceKHR) |destroy| destroy(self.runtime.instance, res.surface, null);
@@ -151,6 +152,8 @@ pub fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMo
     const index = res.acquired orelse return;
     res.acquired = null;
     const presentFn = self.runtime.vkd.queuePresentKHR orelse return error.Unsupported;
+    // What was drawn into it is recorded, and goes to the queue now.
+    try vulkan.flush(self);
 
     // An empty submission signals it after everything submitted before it:
     // what the image holds is drawn when the present looks at it.

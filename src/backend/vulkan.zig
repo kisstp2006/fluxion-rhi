@@ -36,6 +36,13 @@
 //! The queue runs submissions in order, so an upload's barriers and a
 //! pass's order it against every draw before and after it, as before.
 //!
+//! **One recording a frame.** A `submit`, an upload or a transition goes on
+//! at the end of the recording that is open, rather than into one of its
+//! own, and the recording is handed to the queue when something needs it
+//! done: a present, a readback, a first draw into a surface after other
+//! work (so that work need not wait for the image), or `max_lists` lists. A
+//! frame of many passes costs one queue submission rather than one each.
+//!
 //! **Up is up, as on Direct3D.** Every viewport is given to Vulkan with a
 //! negative height (`VK_KHR_maintenance1`), so clip-space Y points up the
 //! picture and a pass draws the top of it into the first row of its
@@ -98,6 +105,10 @@ const max_surfaces_per_submit = 4;
 /// How many recordings can be on their way to the GPU at once: one waits
 /// for the one this many before it, and no other.
 const ring_size = 4;
+
+/// The most `submit`s one recording takes before it is handed over: a
+/// program that never presents still has its work done.
+const max_lists = 64;
 
 // -------------------------------------------------------------------------
 // Format mapping
@@ -351,6 +362,10 @@ pub const Vk = struct {
     /// How many of the slot's acquire semaphores this recording signalled:
     /// it waits for each.
     acquired_count: usize = 0,
+    /// How many lists the open recording holds, and whether it holds
+    /// anything at all.
+    lists: u32 = 0,
+    has_work: bool = false,
     pass_format: vk.gen.types.Format = .undefined,
     pass_extent: [2]u32 = .{ 0, 0 },
     current_pipeline: ?*PipelineRes = null,
@@ -508,6 +523,7 @@ const vtable: backend.Vtable = .{
 fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
     const vkd = self.runtime.vkd;
+    flush(self) catch {};
     waitIdle(self);
 
     resources.destroyDummyResources(self);
@@ -637,11 +653,13 @@ pub fn waitIdle(self: *Vk) void {
     collect(self);
 }
 
-/// Free `what` once the GPU is past everything submitted so far, or now
-/// when it already is.
+/// Free `what` once the GPU is past everything recorded so far - the open
+/// recording too - or now when it already is.
 pub fn bury(self: *Vk, what: @FieldType(Grave, "what")) void {
-    if (self.completed >= self.submitted) return free(self, what);
-    self.graveyard.append(self.gpa, .{ .serial = self.submitted, .what = what }) catch {
+    if (!self.recording and self.completed >= self.submitted) return free(self, what);
+    const serial = if (self.recording) recordingSerial(self) else self.submitted;
+    self.graveyard.append(self.gpa, .{ .serial = serial, .what = what }) catch {
+        flush(self) catch {};
         // No room to wait: wait for it instead.
         waitIdle(self);
         free(self, what);
@@ -694,6 +712,18 @@ pub fn record(self: *Vk) types.Error!void {
     self.recording = true;
     self.in_pass = false;
     self.acquired_count = 0;
+    self.lists = 0;
+    self.has_work = false;
+}
+
+/// The recording that is open, or a new one.
+pub fn ensureRecording(self: *Vk) types.Error!void {
+    if (!self.recording) try record(self);
+}
+
+/// Hand the open recording to the queue, if there is one.
+pub fn flush(self: *Vk) types.Error!void {
+    if (self.recording) try finish(self);
 }
 
 /// Stop recording and hand it to the queue - waiting there for every image
@@ -742,16 +772,14 @@ fn abandon(self: *Vk) void {
 // Submitting a frame
 // -------------------------------------------------------------------------
 
-/// Walks the `Command` union once, recording into the next slot's command
-/// buffer, then hands it to the queue: see the module doc.
+/// Walks the `Command` union once, recording onto the end of the open
+/// recording: see the module doc.
 fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) types.Error!void {
     const self = cast(impl);
     const vkd = self.runtime.vkd;
 
-    try record(self);
+    try ensureRecording(self);
     errdefer abandon(self);
-    const cmd = self.command_buffer;
-    const serial = recordingSerial(self);
     self.current_pipeline = null;
     self.pipeline_dirty = false;
     self.current_ubo = @splat(null);
@@ -759,6 +787,11 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
     self.bindings_dirty = true;
 
     for (list) |command| {
+        // Read at each command: a draw into a surface may hand what came
+        // before it over and start another recording.
+        const cmd = self.command_buffer;
+        const serial = recordingSerial(self);
+        defer self.has_work = true;
         switch (command) {
             .begin_pass => |pass| try beginPass(self, device, pass),
             .end_pass => {
@@ -810,7 +843,8 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
         }
     }
 
-    try finish(self);
+    self.lists += 1;
+    if (self.lists >= max_lists) try finish(self);
 }
 
 fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error!void {
@@ -826,6 +860,12 @@ fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error
         .surface => |h| {
             const surface = as(SurfaceRes, device.surfaces.get(h).?.native);
             if (surface.acquired == null) {
+                // What came before goes now: it has no need to wait for the
+                // image the acquire waits for.
+                if (self.has_work) {
+                    try finish(self);
+                    try record(self);
+                }
                 if (self.acquired_count >= max_surfaces_per_submit) return error.Unsupported;
                 if (try swapchain.acquire(self, surface, recordingSlot(self).acquires[self.acquired_count])) self.acquired_count += 1;
             }
@@ -1139,23 +1179,31 @@ test "a buffer the GPU may still read is written into another copy, which keeps 
     try testing.expectEqualSlices(u8, "ZbXYefgh", res.current.mapped[0..8]);
 }
 
-test "submits do not wait for each other, and what they used is freed once the GPU is done" {
+test "submits go into one recording, handed over when needed, and what they used is freed once the GPU is done" {
     var device = try openTestDevice();
     defer device.deinit();
     const self = cast(device.impl);
 
     const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    try flush(self);
     const before = self.submitted;
-    for (0..ring_size * 3) |_| {
+    for (0..12) |_| {
         const cmd = device.begin();
         try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 0, 1, 0, 1 } } });
         try cmd.endPass();
         try device.submit();
     }
-    try testing.expectEqual(before + ring_size * 3, self.submitted);
-    // A texture destroyed while submissions may use it waits in the ground.
+    // Twelve lists, and nothing handed to the queue yet.
+    try testing.expectEqual(before, self.submitted);
+    try testing.expect(self.recording);
+    // A texture destroyed while the open recording may use it waits in the
+    // ground until that recording is done.
     const doomed = try device.createTexture(.{ .width = 2, .height = 2 });
+    const graves = self.graveyard.items.len;
     device.destroyTexture(doomed);
+    try testing.expectEqual(graves + 1, self.graveyard.items.len);
+    try flush(self);
+    try testing.expectEqual(before + 1, self.submitted);
     waitIdle(self);
     try testing.expectEqual(self.submitted, self.completed);
     try testing.expectEqual(@as(usize, 0), self.graveyard.items.len);

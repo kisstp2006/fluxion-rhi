@@ -275,9 +275,9 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     if (desc.data) |data| {
         try write(self, res, .{ .width = desc.width, .height = desc.height, .depth = 1 }, data, desc.effectiveRowPitch(), .undefined);
     } else {
-        try vulkan.record(self);
+        try vulkan.ensureRecording(self);
         barrier(self, image, .undefined, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .top_of_pipe = true }, .{ .fragment_shader = true });
-        try vulkan.finish(self);
+        self.has_work = true;
     }
     return res;
 }
@@ -339,7 +339,7 @@ fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []cons
     defer if (!buried) freeVersion(self, staging);
     for (0..region.height) |y| @memcpy(staging.mapped[y * row_bytes ..][0..row_bytes], bytes[y * row_pitch ..][0..row_bytes]);
 
-    try vulkan.record(self);
+    try vulkan.ensureRecording(self);
     barrier(self, res.image, from, .transfer_dst_optimal, .{}, .{ .transfer_write = true }, .{ .fragment_shader = true, .color_attachment_output = true }, .{ .transfer = true });
     const copy = [_]vk.gen.types.BufferImageCopy{.{
         .buffer_offset = 0,
@@ -351,8 +351,8 @@ fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []cons
     }};
     self.runtime.vkd.cmdCopyBufferToImage(self.command_buffer, staging.buffer, res.image, .transfer_dst_optimal, copy.len, &copy);
     barrier(self, res.image, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
-    try vulkan.finish(self);
-    // Read by the copy on its way: freed once it is done.
+    self.has_work = true;
+    // Read by the copy when the recording runs: freed once it has.
     vulkan.bury(self, .{ .buffer = staging });
     buried = true;
 }
@@ -371,7 +371,7 @@ pub fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subres
     const readback = try hostBuffer(self, row_bytes * res.height, .{ .transfer_dst = true }, .{ .host_cached = true });
     defer freeVersion(self, readback);
 
-    try vulkan.record(self);
+    try vulkan.ensureRecording(self);
     barrier(self, res.image, .shader_read_only_optimal, .transfer_src_optimal, .{ .color_attachment_write = true }, .{ .transfer_read = true }, .{ .color_attachment_output = true, .fragment_shader = true }, .{ .transfer = true });
     const copy = [_]vk.gen.types.BufferImageCopy{.{
         .buffer_offset = 0,

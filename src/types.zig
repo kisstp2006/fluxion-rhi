@@ -444,6 +444,10 @@ pub const TextureDesc = struct {
     data: ?[]const u8 = null,
     /// Bytes from one row of `data` to the next. Zero means tightly packed.
     row_pitch: usize = 0,
+    /// For a render target, the colour a pass clearing it clears to most:
+    /// Direct3D 12 clears to the one it was made with faster than to any
+    /// other. Every other backend clears as fast to any colour.
+    clear_color: [4]f32 = .{ 0, 0, 0, 0 },
     label: []const u8 = "",
 
     /// Images stacked in the texture: six for a cube, the layer count for an

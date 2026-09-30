@@ -489,7 +489,7 @@ pub fn main(init: std.process.Init) !void {
     if (options.capture) |path| {
         // The whole picture at one moment, into a texture, then to a file.
         scene.step(options.at);
-        const target = try device.createTexture(.{ .width = options.width, .height = options.height, .usage = .{ .render_target = true } });
+        const target = try device.createTexture(.{ .width = options.width, .height = options.height, .usage = .{ .render_target = true }, .clear_color = background });
         try renderer.draw(.{ .texture = target }, options.width, options.height, scene);
         const pixels = try device.readTexture(target, gpa);
         defer gpa.free(pixels);
@@ -550,7 +550,7 @@ fn frameOn(backend: rhi.Backend, gpa: std.mem.Allocator) ![]u8 {
     var scene: Scene = .init(test_width, test_height);
     scene.step(1.0);
 
-    const target = try device.createTexture(.{ .width = test_width, .height = test_height, .usage = .{ .render_target = true } });
+    const target = try device.createTexture(.{ .width = test_width, .height = test_height, .usage = .{ .render_target = true }, .clear_color = background });
     try renderer.draw(.{ .texture = target }, test_width, test_height, scene);
     return device.readTexture(target, gpa);
 }
