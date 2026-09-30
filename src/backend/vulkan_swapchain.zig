@@ -252,12 +252,30 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
         }
     }
 
-    const extent: vk.gen.types.Extent2D = if (caps.current_extent.width != 0xFFFF_FFFF)
+    // A phone held sideways reports its surface turned a quarter: an extent
+    // in the display's own way up, and a transform for the program to draw
+    // ahead of it. Drawn that way up the picture is the window's, and the
+    // system turns it - a cost, which a projection turned ahead of time
+    // would save, and one nothing above this file has to know of. What is
+    // asked for is the window's own size.
+    const turned = caps.current_transform.rotate_90 or caps.current_transform.rotate_270;
+    const upright = turned and caps.supported_transforms.identity;
+    const pre_transform: vk.gen.types.SurfaceTransformFlagsKHR = if (upright) .{ .identity = true } else caps.current_transform;
+
+    const extent: vk.gen.types.Extent2D = if (upright and want_width != 0 and want_height != 0)
+        .{
+            .width = std.math.clamp(want_width, caps.min_image_extent.width, @max(1, caps.max_image_extent.width)),
+            .height = std.math.clamp(want_height, caps.min_image_extent.height, @max(1, caps.max_image_extent.height)),
+        }
+    else if (upright and caps.current_extent.width != 0xFFFF_FFFF)
+        .{ .width = caps.current_extent.height, .height = caps.current_extent.width }
+    else if (caps.current_extent.width != 0xFFFF_FFFF)
         caps.current_extent
-    else .{
-        .width = std.math.clamp(if (want_width != 0) want_width else 1, caps.min_image_extent.width, @max(1, caps.max_image_extent.width)),
-        .height = std.math.clamp(if (want_height != 0) want_height else 1, caps.min_image_extent.height, @max(1, caps.max_image_extent.height)),
-    };
+    else
+        .{
+            .width = std.math.clamp(if (want_width != 0) want_width else 1, caps.min_image_extent.width, @max(1, caps.max_image_extent.width)),
+            .height = std.math.clamp(if (want_height != 0) want_height else 1, caps.min_image_extent.height, @max(1, caps.max_image_extent.height)),
+        };
     if (extent.width == 0 or extent.height == 0) return error.Unsupported;
 
     var image_count = caps.min_image_count + 1;
@@ -282,7 +300,7 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
         .image_array_layers = 1,
         .image_usage = usage,
         .image_sharing_mode = .exclusive,
-        .pre_transform = caps.current_transform,
+        .pre_transform = pre_transform,
         .composite_alpha = composite_alpha,
         .present_mode = present_mode,
         .clipped = vk.gen.types.vk_true,
