@@ -520,9 +520,9 @@ pub fn gpuHeapStart(heap: *ID3D12DescriptorHeap) GpuDescriptorHandle {
     return out;
 }
 
-/// `ID3D12Fence`. `GetCompletedValue`/`Signal` are the poll-and-signal pair a
-/// fully synchronous backend needs; `SetEventOnCompletion` and the Win32
-/// event it would need are not declared - poll-spin is fine here.
+/// `ID3D12Fence`: what the queue signals, what the CPU reads back, and
+/// `SetEventOnCompletion`, which with no event blocks until the fence has
+/// reached the value.
 pub const ID3D12Fence = extern struct {
     vtable: *const VTable,
 
@@ -531,7 +531,7 @@ pub const ID3D12Fence = extern struct {
     pub const VTable = extern struct {
         base: ID3D12Pageable.VTable,
         GetCompletedValue: *const fn (*ID3D12Fence) callconv(.winapi) u64,
-        SetEventOnCompletion: *const anyopaque,
+        SetEventOnCompletion: *const fn (*ID3D12Fence, u64, ?*anyopaque) callconv(.winapi) Hresult,
         Signal: *const fn (*ID3D12Fence, u64) callconv(.winapi) Hresult,
     };
 };

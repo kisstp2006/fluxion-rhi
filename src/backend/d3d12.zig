@@ -17,9 +17,10 @@
 //!
 //! **Buffers are always upload-heap.** CPU-writable, mapped once at creation
 //! and kept mapped for the buffer's life - `updateBuffer` is a `memcpy` into
-//! memory the GPU already sees, safe because nothing here ever has two
-//! frames in flight at once (see below). No device-local buffer, no copy
-//! queue, no fencing per update.
+//! memory the GPU already sees. One the GPU may still be reading is written
+//! into another copy - a version - that starts as the buffer's bytes kept
+//! on the CPU, the way a Direct3D 11 driver renames a buffer written with
+//! discard (see below). No device-local buffer, no copy queue.
 //!
 //! **One root signature for every pipeline.** Four root CBVs (`b0`-`b3`),
 //! one CBV_SRV_UAV descriptor table (`t0`-`t3`) and one sampler table
@@ -33,18 +34,22 @@
 //! samplers changed since the last one takes the next four slots of the
 //! ring, has the four descriptors copied there with `CopyDescriptorsSimple`,
 //! and points its table at them - so each draw reads the textures it was
-//! given, not whatever the last `set_texture` of the list left. The ring
-//! starts over at every submit, which is safe because a submit has waited for
-//! the GPU before the next one records; one that runs out of ring executes
-//! what it has, waits, and records on from the same state.
+//! given, not whatever the last `set_texture` of the list left. Each
+//! recording slot (below) has its own part of the ring, which starts over
+//! when the slot is recorded into again - by then the GPU is done with it;
+//! one that runs out executes what it has and records on from the same state
+//! in the next slot.
 //!
-//! **Fully synchronous.** `submit` records the whole command list, executes
-//! it, signals a fence and spins on `GetCompletedValue` until the GPU has
-//! caught up, every time. No double-buffering, no multiple frames in flight.
-//! Slower than a real engine would want, and simple enough that nothing here
-//! has to reason about what the GPU might still be reading. A texture's state
-//! is therefore known on the CPU: it is sampled-from between submits, and a
-//! pass, a write or a read moves it and moves it back.
+//! **Recordings in flight.** A submit, an upload or a readback records into
+//! the next of `ring_size` slots - a command allocator and its part of the
+//! descriptor rings - executes it and signals the fence with the next value,
+//! without waiting; a slot is waited for, with `SetEventOnCompletion`, only
+//! when it comes round again. What is destroyed while the GPU may still use
+//! it, and a staging buffer, is released once the fence is past the last
+//! value signalled; a readback waits for its own. The queue runs lists in
+//! order, so a texture's state kept on the CPU is the state the next list
+//! finds: sampled-from between submits, and a pass, a write or a read moves
+//! it and moves it back.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -96,6 +101,13 @@ const max_rtv_descriptors = 256;
 /// heap that shaders see holds at most 2048.
 const ring_srv_descriptors = 65536;
 const ring_sampler_descriptors = 2048;
+
+/// How many recordings can be on their way to the GPU at once: one waits
+/// for the one this many before it, and no other. Each has a part of the
+/// descriptor rings.
+const ring_size = 4;
+const slot_srv_descriptors = ring_srv_descriptors / ring_size;
+const slot_sampler_descriptors = ring_sampler_descriptors / ring_size;
 
 const root_param_cbv0 = 0;
 const root_param_srv_table = 4;
@@ -230,10 +242,19 @@ const D3d = struct {
 
     device: *d3d12.ID3D12Device,
     queue: *d3d12.ID3D12CommandQueue,
-    cmd_allocator: *cmdmod.ID3D12CommandAllocator,
+    /// The one list, reset onto the allocator of the slot at `at`.
     list: *cmdmod.ID3D12GraphicsCommandList,
+    slots: [ring_size]Slot,
+    at: usize = 0,
     fence: *rc.ID3D12Fence,
+    /// The value the last execute signalled, and the last the GPU is known
+    /// to have reached.
     fence_value: u64 = 0,
+    completed: u64 = 0,
+    graveyard: std.ArrayListUnmanaged(Grave) = .empty,
+    /// The buffers the submit being recorded binds: marked as used by it
+    /// once it is executed.
+    used_buffers: std.ArrayListUnmanaged(*BufferRes) = .empty,
 
     root_signature: *pl.ID3D12RootSignature,
 
@@ -261,8 +282,8 @@ const D3d = struct {
     plain_sampler: rc.CpuDescriptorHandle,
 
     /// The shader-visible rings the root descriptor tables point into; see
-    /// the module comment. `*_used` is how far into each the recording that is
-    /// open has come.
+    /// the module comment. `*_used` is how far into its slot's part of each
+    /// the recording that is open has come.
     ring_srv_heap: *rc.ID3D12DescriptorHeap,
     ring_sampler_heap: *rc.ID3D12DescriptorHeap,
     ring_srv_used: u32 = 0,
@@ -306,12 +327,40 @@ const VertexBinding = struct {
     size: u32 = 0,
 };
 
-const BufferRes = struct {
+/// One recording on its way to the GPU: the allocator its list used, and
+/// the fence value its execute signalled - nought for none.
+const Slot = struct {
+    allocator: *cmdmod.ID3D12CommandAllocator,
+    value: u64 = 0,
+};
+
+/// Released once the fence is past `value`.
+const Grave = struct {
+    value: u64,
+    what: union(enum) {
+        resource: *rc.ID3D12Resource,
+        pso: *pl.ID3D12PipelineState,
+    },
+};
+
+/// One copy of a buffer's memory, persistently mapped - an upload-heap
+/// resource may stay mapped for its whole life - and the fence value of the
+/// last execute that used it.
+const Version = struct {
     resource: *rc.ID3D12Resource,
-    size: u32,
-    /// Persistently mapped: an upload-heap resource may stay mapped for its
-    /// whole life, and every buffer here is one.
     mapped: [*]u8,
+    busy: u64 = 0,
+};
+
+/// A buffer: the version draws are recorded with now, the ones a write moved
+/// it off, and its bytes on the CPU, which a new version starts as.
+const BufferRes = struct {
+    current: Version,
+    spare: std.ArrayListUnmanaged(Version) = .empty,
+    shadow: []u8,
+    /// How far anything was ever written: a new version copies no further.
+    written: usize,
+    size: u32,
 };
 
 const TextureRes = struct {
@@ -397,10 +446,17 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     const queue = d3d12.createCommandQueue(device, .{ .type = .direct }) catch return error.NoDevice;
     errdefer _ = com.release(queue);
 
-    const cmd_allocator = cmdmod.createCommandAllocator(device, .direct) catch return error.NoDevice;
-    errdefer _ = com.release(cmd_allocator);
+    var slots: [ring_size]Slot = undefined;
+    var made: usize = 0;
+    errdefer for (slots[0..made]) |one| {
+        _ = com.release(one.allocator);
+    };
+    for (&slots) |*one| {
+        one.* = .{ .allocator = cmdmod.createCommandAllocator(device, .direct) catch return error.NoDevice };
+        made += 1;
+    }
 
-    const list = cmdmod.createGraphicsCommandList(device, 0, .direct, cmd_allocator) catch return error.NoDevice;
+    const list = cmdmod.createGraphicsCommandList(device, 0, .direct, slots[0].allocator) catch return error.NoDevice;
     errdefer _ = com.release(list);
     // Real Direct3D 12 API requirement: a command list is created already
     // recording, and must be closed before its first `ExecuteCommandLists`.
@@ -478,7 +534,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .factory = factory,
         .device = device,
         .queue = queue,
-        .cmd_allocator = cmd_allocator,
+        .slots = slots,
         .list = list,
         .fence = fence,
         .root_signature = root_signature,
@@ -553,8 +609,11 @@ fn as(comptime T: type, native: backend.Native) *T {
 fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
     // `Device.deinit` has already destroyed every resource this device
-    // made, and every `submit`/upload already waited for the GPU: nothing
-    // outstanding needs a flush here.
+    // made; what the GPU may still be using waits in the graveyard.
+    waitForGpuIdle(self);
+    self.graveyard.deinit(self.gpa);
+    self.used_buffers.deinit(self.gpa);
+    for (self.slots) |one| _ = com.release(one.allocator);
     if (self.compiler) |*c| c.unload();
     com.releaseAll(.{
         self.ring_sampler_heap,
@@ -565,7 +624,6 @@ fn deinit(impl: backend.Impl) void {
         self.root_signature,
         self.fence,
         self.list,
-        self.cmd_allocator,
         self.queue,
         self.device,
     });
@@ -699,23 +757,88 @@ fn rtvHandle(self: *D3d, i: u32) rc.CpuDescriptorHandle {
 // texture upload's - is built from.
 // -------------------------------------------------------------------------
 
+/// Record into the next slot, once the GPU is done with what was recorded
+/// there last, with its part of the rings empty.
 fn beginRecording(self: *D3d) Error!void {
-    self.cmd_allocator.vtable.Reset(self.cmd_allocator).check() catch return error.Failed;
-    self.list.vtable.Reset(self.list, self.cmd_allocator, null).check() catch return error.Failed;
+    self.at = (self.at + 1) % ring_size;
+    const slot = &self.slots[self.at];
+    try waitFor(self, slot.value);
+    collect(self);
+    slot.allocator.vtable.Reset(slot.allocator).check() catch return error.Failed;
+    self.list.vtable.Reset(self.list, slot.allocator, null).check() catch return error.Failed;
     self.recording = true;
+    self.ring_srv_used = 0;
+    self.ring_sampler_used = 0;
 }
 
-fn closeExecuteAndWait(self: *D3d) Error!void {
+/// Close what was recorded, execute it and signal the next fence value,
+/// without waiting for it.
+fn closeAndExecute(self: *D3d) Error!void {
     self.recording = false;
     self.list.vtable.Close(self.list).check() catch return error.Failed;
     const lists = [_]*cmdmod.ID3D12GraphicsCommandList{self.list};
     cmdmod.executeCommandLists(self.queue, &lists);
     self.fence_value += 1;
     self.queue.vtable.Signal(self.queue, @ptrCast(self.fence), self.fence_value).check() catch return error.Failed;
-    while (self.fence.vtable.GetCompletedValue(self.fence) < self.fence_value) {}
+    self.slots[self.at].value = self.fence_value;
     if (self.debug) {
         self.device.vtable.GetDeviceRemovedReason(self.device).check() catch return error.DeviceLost;
     }
+}
+
+/// Wait until the GPU has reached `value`, sleeping rather than spinning.
+fn waitFor(self: *D3d, value: u64) Error!void {
+    if (value <= self.completed) return;
+    self.completed = self.fence.vtable.GetCompletedValue(self.fence);
+    if (value <= self.completed) return;
+    self.fence.vtable.SetEventOnCompletion(self.fence, value, null).check() catch return error.DeviceLost;
+    self.completed = @max(self.completed, value);
+}
+
+/// Release `what` once the GPU is past everything executed so far, or now
+/// when it already is.
+fn bury(self: *D3d, what: @FieldType(Grave, "what")) void {
+    if (self.completed >= self.fence_value) return free(what);
+    self.graveyard.append(self.gpa, .{ .value = self.fence_value, .what = what }) catch {
+        // No room to wait: wait for it instead.
+        waitForGpuIdle(self);
+        free(what);
+    };
+}
+
+fn free(what: @FieldType(Grave, "what")) void {
+    switch (what) {
+        .resource => |resource| _ = com.release(resource),
+        .pso => |pso| _ = com.release(pso),
+    }
+}
+
+/// Release what the GPU is done with.
+fn collect(self: *D3d) void {
+    self.completed = @max(self.completed, self.fence.vtable.GetCompletedValue(self.fence));
+    var i: usize = 0;
+    while (i < self.graveyard.items.len) {
+        const grave = self.graveyard.items[i];
+        if (grave.value > self.completed) {
+            i += 1;
+            continue;
+        }
+        _ = self.graveyard.swapRemove(i);
+        free(grave.what);
+    }
+}
+
+/// The buffers the submit just executed bound, marked as used by it.
+fn markUsed(self: *D3d) void {
+    for (self.used_buffers.items) |res| res.current.busy = self.fence_value;
+    self.used_buffers.clearRetainingCapacity();
+}
+
+/// Bound by the submit being recorded; the version it has now is the one
+/// the list reads.
+fn use(self: *D3d, res: *BufferRes) Error!*rc.ID3D12Resource {
+    self.used_buffers.append(self.gpa, res) catch return error.OutOfMemory;
+    return res.current.resource;
 }
 
 /// Blocks until the queue has finished everything submitted to it so far -
@@ -729,12 +852,13 @@ fn closeExecuteAndWait(self: *D3d) Error!void {
 fn waitForGpuIdle(self: *D3d) void {
     self.fence_value += 1;
     self.queue.vtable.Signal(self.queue, @ptrCast(self.fence), self.fence_value).check() catch return;
-    while (self.fence.vtable.GetCompletedValue(self.fence) < self.fence_value) {}
+    waitFor(self, self.fence_value) catch return;
+    collect(self);
 }
 
 /// Record a texture's move to `to`, if it is not there already, and keep
-/// where it is now. Every recording executes in full before the next begins,
-/// so the state kept here is the state the GPU will find.
+/// where it is now. The queue runs the lists in the order they were
+/// recorded, so the state kept here is the state the GPU will find.
 fn transition(self: *D3d, res: *TextureRes, to: rc.ResourceStates) void {
     if (@as(u32, @bitCast(res.state)) == @as(u32, @bitCast(to))) return;
     const barrier = cmdmod.ResourceBarrier.transition(res.resource, res.state, to);
@@ -749,7 +873,8 @@ fn transition(self: *D3d, res: *TextureRes, to: rc.ResourceStates) void {
 fn abandonRecording(self: *D3d) void {
     if (!self.recording) return;
     endTarget(self);
-    closeExecuteAndWait(self) catch {};
+    closeAndExecute(self) catch {};
+    markUsed(self);
 }
 
 // -------------------------------------------------------------------------
@@ -762,7 +887,23 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
     errdefer self.gpa.destroy(res);
 
     const size: u32 = @intCast(if (desc.kind == .uniform) std.mem.alignForward(usize, desc.size, 16) else desc.size);
+    const shadow = try self.gpa.alloc(u8, @max(size, 1));
+    errdefer self.gpa.free(shadow);
+    @memset(shadow, 0);
+    const version = try uploadVersion(self, size);
+    errdefer _ = com.release(version.resource);
+    @memset(version.mapped[0..size], 0);
+    // Nought throughout, as it was made.
+    res.* = .{ .current = version, .shadow = shadow, .written = size, .size = size };
+    if (desc.data) |data| {
+        @memcpy(version.mapped[0..data.len], data);
+        @memcpy(shadow[0..data.len], data);
+    }
+    return res;
+}
 
+/// An upload-heap buffer's memory, mapped for its life.
+fn uploadVersion(self: *D3d, size: u32) Error!Version {
     const obj = rc.createCommittedResource(
         self.device,
         .of(.upload),
@@ -772,29 +913,49 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
         null,
     ) catch return error.Failed;
     errdefer _ = com.release(obj);
-
     var mapped: ?*anyopaque = null;
     obj.vtable.Map(obj, 0, &rc.Range.nothing_read, &mapped).check() catch return error.Failed;
-    const bytes: [*]u8 = @ptrCast(mapped.?);
-    @memset(bytes[0..size], 0);
-    if (desc.data) |data| @memcpy(bytes[0..data.len], data);
-
-    res.* = .{ .resource = obj, .size = size, .mapped = bytes };
-    return res;
+    return .{ .resource = obj, .mapped = @ptrCast(mapped.?) };
 }
 
 fn destroyBuffer(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(BufferRes, native);
-    res.resource.vtable.Unmap(res.resource, 0, null);
-    _ = com.release(res.resource);
+    bury(self, .{ .resource = res.current.resource });
+    for (res.spare.items) |version| bury(self, .{ .resource = version.resource });
+    res.spare.deinit(self.gpa);
+    self.gpa.free(res.shadow);
     self.gpa.destroy(res);
 }
 
+/// Write into the version the GPU is not reading: the current one when no
+/// list it may still be running used it, another when one did.
 fn updateBuffer(impl: backend.Impl, native: backend.Native, offset: usize, bytes: []const u8) Error!void {
-    _ = impl;
+    const self = cast(impl);
     const res = as(BufferRes, native);
-    @memcpy(res.mapped[offset..][0..bytes.len], bytes);
+    const end = offset + bytes.len;
+    if (res.current.busy > self.completed) self.completed = self.fence.vtable.GetCompletedValue(self.fence);
+    if (res.current.busy > self.completed) {
+        res.spare.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+        const fresh = try spareVersion(self, res);
+        res.spare.appendAssumeCapacity(res.current);
+        res.current = fresh;
+        // Everything else written is in the new one too.
+        const before = @min(offset, res.written);
+        @memcpy(fresh.mapped[0..before], res.shadow[0..before]);
+        if (res.written > end) @memcpy(fresh.mapped[end..res.written], res.shadow[end..res.written]);
+    }
+    @memcpy(res.current.mapped[offset..end], bytes);
+    @memcpy(res.shadow[offset..end], bytes);
+    res.written = @max(res.written, end);
+}
+
+/// A version of `res` the GPU is done with, or a new one.
+fn spareVersion(self: *D3d, res: *BufferRes) Error!Version {
+    for (res.spare.items, 0..) |version, i| {
+        if (version.busy <= self.completed) return res.spare.swapRemove(i);
+    }
+    return uploadVersion(self, res.size);
 }
 
 // -------------------------------------------------------------------------
@@ -839,12 +1000,15 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     return res;
 }
 
+/// Its descriptors are free at once - a list copies a texture's into the
+/// ring, and a target's, as it records - and the texture itself once the
+/// GPU is done with it.
 fn destroyTexture(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(TextureRes, native);
     freeSrv(self, res.srv_index);
     if (res.rtv_index) |rtv| freeRtv(self, rtv);
-    _ = com.release(res.resource);
+    bury(self, .{ .resource = res.resource });
     self.gpa.destroy(res);
 }
 
@@ -868,9 +1032,8 @@ fn transferBuffer(self: *D3d, heap: rc.HeapType, size: u64) Error!*rc.ID3D12Reso
 
 /// Any box of level zero, through a one-off staging buffer laid out the way
 /// a copy wants its rows padded, and `CopyTextureRegion` onto the texture.
-/// Runs its own record/execute/wait, sharing the one command list and
-/// allocator `submit` also uses: writing happens between submits, never
-/// while one is being recorded.
+/// Records into a slot of its own, as `submit` does, without waiting:
+/// writing happens between submits, never while one is being recorded.
 fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.TextureRegion, bytes: []const u8, row_pitch: usize, slice_pitch: usize) Error!void {
     _ = slice_pitch;
     const self = cast(impl);
@@ -879,7 +1042,10 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     const row_bytes = res.format.rowBytes(region.width);
 
     const staging = try transferBuffer(self, .upload, @as(u64, footprint.footprint.row_pitch) * region.height);
-    defer _ = com.release(staging);
+    var buried = false;
+    defer if (!buried) {
+        _ = com.release(staging);
+    };
     var mapped: ?*anyopaque = null;
     staging.vtable.Map(staging, 0, &rc.Range.nothing_read, &mapped).check() catch return error.Failed;
     const dst: [*]u8 = @ptrCast(mapped.?);
@@ -895,7 +1061,10 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     const src_loc = cmdmod.TextureCopyLocation.placed(staging, footprint);
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, region.x, region.y, 0, &src_loc, null);
     transition(self, res, sampled);
-    try closeExecuteAndWait(self);
+    try closeAndExecute(self);
+    // Read by the copy on its way: released once it is done.
+    bury(self, .{ .resource = staging });
+    buried = true;
 }
 
 /// Level zero, copied into a readback buffer and handed back as RGBA, eight
@@ -918,7 +1087,9 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     const src_loc = cmdmod.TextureCopyLocation.subresource(res.resource, 0);
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, 0, 0, 0, &src_loc, null);
     transition(self, res, sampled);
-    try closeExecuteAndWait(self);
+    try closeAndExecute(self);
+    // The one wait a readback has: the bytes are wanted now.
+    try waitFor(self, self.fence_value);
 
     var mapped: ?*anyopaque = null;
     const everything: rc.Range = .{ .begin = 0, .end = @intCast(size) };
@@ -1228,7 +1399,7 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
 fn destroyPipeline(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(PipelineRes, native);
-    _ = com.release(res.pso);
+    bury(self, .{ .pso = res.pso });
     if (self.current_pipeline == res) self.current_pipeline = null;
     self.gpa.destroy(res);
 }
@@ -1338,11 +1509,10 @@ fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) 
 
 fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Command) Error!void {
     const self = cast(impl);
+    self.used_buffers.clearRetainingCapacity();
     try beginRecording(self);
     errdefer abandonRecording(self);
 
-    self.ring_srv_used = 0;
-    self.ring_sampler_used = 0;
     self.current_pipeline = null;
     self.vertex_bindings = @splat(.{});
     self.bindings_dirty = false;
@@ -1418,13 +1588,14 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
             .set_vertex_buffer => |b| {
                 if (b.slot >= max_vertex_slots) return error.Unsupported;
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                self.vertex_bindings[b.slot] = .{ .resource = res.resource, .offset = b.offset, .size = res.size };
+                self.vertex_bindings[b.slot] = .{ .resource = try use(self, res), .offset = b.offset, .size = res.size };
                 self.bindings_dirty = true;
             },
             .set_index_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
+                const resource = try use(self, res);
                 self.index_view = .{
-                    .buffer_location = res.resource.vtable.GetGPUVirtualAddress(res.resource),
+                    .buffer_location = resource.vtable.GetGPUVirtualAddress(resource),
                     .size_in_bytes = res.size,
                     .format = if (b.format == .u16) .r16_uint else .r32_uint,
                 };
@@ -1433,7 +1604,8 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
             .set_uniform_buffer => |b| {
                 if (b.slot >= max_binding_slots) return error.Unsupported;
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                self.uniforms[b.slot] = res.resource.vtable.GetGPUVirtualAddress(res.resource);
+                const resource = try use(self, res);
+                self.uniforms[b.slot] = resource.vtable.GetGPUVirtualAddress(resource);
                 cmd_list.vtable.SetGraphicsRootConstantBufferView(cmd_list, root_param_cbv0 + b.slot, self.uniforms[b.slot]);
             },
             .set_texture => |b| {
@@ -1464,7 +1636,8 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
         }
     }
 
-    try closeExecuteAndWait(self);
+    try closeAndExecute(self);
+    markUsed(self);
 }
 
 /// What every recording starts with: the one root signature, and the rings
@@ -1491,12 +1664,12 @@ fn endTarget(self: *D3d) void {
 /// The tables a draw reads, made where its textures or samplers changed, and
 /// its vertex buffers bound.
 fn prepareDraw(self: *D3d) Error!void {
-    const out_of_srvs = self.textures_dirty and self.ring_srv_used + max_binding_slots > ring_srv_descriptors;
-    const out_of_samplers = self.samplers_dirty and self.ring_sampler_used + max_binding_slots > ring_sampler_descriptors;
+    const out_of_srvs = self.textures_dirty and self.ring_srv_used + max_binding_slots > slot_srv_descriptors;
+    const out_of_samplers = self.samplers_dirty and self.ring_sampler_used + max_binding_slots > slot_sampler_descriptors;
     if (out_of_srvs or out_of_samplers) try restartRecording(self);
 
     if (self.textures_dirty) {
-        const at = self.ring_srv_used;
+        const at: u32 = @as(u32, @intCast(self.at)) * slot_srv_descriptors + self.ring_srv_used;
         self.ring_srv_used += max_binding_slots;
         const start = rc.cpuHeapStart(self.ring_srv_heap);
         for (self.textures, 0..) |source, i| {
@@ -1506,7 +1679,7 @@ fn prepareDraw(self: *D3d) Error!void {
         self.textures_dirty = false;
     }
     if (self.samplers_dirty) {
-        const at = self.ring_sampler_used;
+        const at: u32 = @as(u32, @intCast(self.at)) * slot_sampler_descriptors + self.ring_sampler_used;
         self.ring_sampler_used += max_binding_slots;
         const start = rc.cpuHeapStart(self.ring_sampler_heap);
         for (self.samplers, 0..) |source, i| {
@@ -1518,15 +1691,13 @@ fn prepareDraw(self: *D3d) Error!void {
     flushBindings(self);
 }
 
-/// Execute what has been recorded, wait for it, and record on from the same
-/// state with the rings empty again: what a submit that draws with more
-/// changes of texture than the ring holds does. The target stays where the
+/// Execute what has been recorded and record on from the same state in the
+/// next slot, with its part of the rings: what a submit that draws with more
+/// changes of texture than a part holds does. The target stays where the
 /// pass put it; nothing is cleared again.
 fn restartRecording(self: *D3d) Error!void {
-    try closeExecuteAndWait(self);
+    try closeAndExecute(self);
     try beginRecording(self);
-    self.ring_srv_used = 0;
-    self.ring_sampler_used = 0;
     setUpList(self);
 
     const cmd_list = self.list;
@@ -1625,6 +1796,52 @@ test "a buffer is created, updated, and its bytes are what was written" {
     const buffer = try device.createBuffer(.{ .kind = .uniform, .size = 16, .data = std.mem.asBytes(&[4]f32{ 1, 2, 3, 4 }) });
     try device.updateBuffer(buffer, 0, std.mem.asBytes(&[4]f32{ 5, 6, 7, 8 }));
     device.destroyBuffer(buffer);
+}
+
+test "a buffer the GPU may still read is written into another copy, which keeps the rest of its bytes" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const self = cast(device.impl);
+
+    const handle = try device.createBuffer(.{ .kind = .vertex, .size = 8, .data = "abcdefgh" });
+    const res = as(BufferRes, device.buffers.get(handle).?.native);
+    const first = res.current;
+    // As if a list the GPU has not done yet drew with it.
+    res.current.busy = self.fence_value + 1;
+    try device.updateBuffer(handle, 2, "XY");
+    try testing.expect(res.current.resource != first.resource);
+    try testing.expectEqualSlices(u8, "abcdefgh", first.mapped[0..8]);
+    try testing.expectEqualSlices(u8, "abXYefgh", res.current.mapped[0..8]);
+
+    // One no list uses is written where it is.
+    const second = res.current.resource;
+    try device.updateBuffer(handle, 0, "Z");
+    try testing.expectEqual(second, res.current.resource);
+    try testing.expectEqualSlices(u8, "ZbXYefgh", res.current.mapped[0..8]);
+}
+
+test "submits do not wait for each other, and what they used is released once the GPU is done" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const self = cast(device.impl);
+
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const before = self.fence_value;
+    for (0..ring_size * 3) |_| {
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 0, 1, 0, 1 } } });
+        try cmd.endPass();
+        try device.submit();
+    }
+    try testing.expectEqual(before + ring_size * 3, self.fence_value);
+    const doomed = try device.createTexture(.{ .width = 2, .height = 2 });
+    device.destroyTexture(doomed);
+    waitForGpuIdle(self);
+    try testing.expectEqual(@as(usize, 0), self.graveyard.items.len);
+
+    const back = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(back);
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, back[0..4].*);
 }
 
 test "a texture reads back as it was made, and a box written into it changes that box" {
