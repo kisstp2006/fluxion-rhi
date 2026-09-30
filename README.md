@@ -212,7 +212,10 @@ renderer asks - textures drawn into and sampled after, written in part and
 read back, `rgba8`, `bgra8` and `r8`, blending, instancing, scissors - and draw
 the picture Direct3D 11 does, which the sprites example's tests check. Both
 are narrower than it: 2D textures only, one mip level, one sample, no depth,
-no anisotropy, and every submit waits for the GPU. Vulkan gives every
+no anisotropy. A submit does not wait for the GPU: up to four are on their
+way at once, and a buffer written while the GPU may still read it is
+written into another copy of its memory, which keeps the rest of its bytes -
+so `updateBuffer` means what it means on Direct3D 11. Vulkan gives every
 viewport a negative height, so its clip space is Direct3D's. With
 `DeviceDesc.debug` it turns the Khronos validation layer on, when one is
 installed.
