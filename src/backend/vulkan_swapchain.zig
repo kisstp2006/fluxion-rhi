@@ -50,8 +50,9 @@ pub const SurfaceRes = struct {
     height: u32 = 0,
     views: []vk.gen.types.ImageView = &.{},
     framebuffers: []vk.gen.types.Framebuffer = &.{},
-    /// Signalled by the acquire; the submit that acquired waits on it.
-    acquired_signal: vk.gen.types.Semaphore = .none,
+    /// One for each image: signalled once everything drawn before its
+    /// present is done, and waited for by the present.
+    rendered: []vk.gen.types.Semaphore = &.{},
     /// The image a pass acquired this frame, which `present` shows; null
     /// once it has.
     acquired: ?u32 = null,
@@ -80,8 +81,6 @@ pub fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) types.Error!ba
     const res = try self.gpa.create(SurfaceRes);
     errdefer self.gpa.destroy(res);
     res.* = .{ .surface = surface, .mode = desc.present_mode, .want_mode = desc.present_mode };
-    _ = self.runtime.vkd.createSemaphore(self.runtime.device, &.{}, null, &res.acquired_signal).check() catch return error.Failed;
-    errdefer self.runtime.vkd.destroySemaphore(self.runtime.device, res.acquired_signal, null);
     errdefer destroySwapchainObjects(self, res);
 
     try buildSwapchain(self, res, desc.width, desc.height, .none);
@@ -91,9 +90,8 @@ pub fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) types.Error!ba
 pub fn destroySurface(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
     const res = as(SurfaceRes, native);
-    _ = self.runtime.vkd.deviceWaitIdle(self.runtime.device);
+    vulkan.waitIdle(self);
     destroySwapchainObjects(self, res);
-    self.runtime.vkd.destroySemaphore(self.runtime.device, res.acquired_signal, null);
     if (self.runtime.vki.destroySurfaceKHR) |destroy| destroy(self.runtime.instance, res.surface, null);
     self.gpa.destroy(res);
 }
@@ -113,7 +111,7 @@ pub fn surfaceSize(impl: backend.Impl, native: backend.Native) [2]u32 {
 /// Make the swapchain again, for a new size or present mode. An image
 /// acquired and not yet shown is given up.
 fn rebuild(self: *Vk, res: *SurfaceRes, width: u32, height: u32) types.Error!void {
-    _ = self.runtime.vkd.deviceWaitIdle(self.runtime.device);
+    vulkan.waitIdle(self);
     destroySwapchainViews(self, res);
     res.acquired = null;
     try buildSwapchain(self, res, width, height, res.swapchain);
@@ -122,14 +120,14 @@ fn rebuild(self: *Vk, res: *SurfaceRes, width: u32, height: u32) types.Error!voi
 /// The image this frame draws into: acquired by the first pass into the
 /// surface since the last `present`, and the same one after. True when this
 /// call acquired it, which the submit it is in then waits for.
-pub fn acquire(self: *Vk, res: *SurfaceRes) types.Error!bool {
+pub fn acquire(self: *Vk, res: *SurfaceRes, signal: vk.gen.types.Semaphore) types.Error!bool {
     if (res.acquired != null) return false;
     if (res.stale or res.mode != res.want_mode) try rebuild(self, res, res.width, res.height);
     const acquireFn = self.runtime.vkd.acquireNextImageKHR orelse return error.Unsupported;
     var tries: u32 = 0;
     while (true) : (tries += 1) {
         var index: u32 = 0;
-        const result = acquireFn(self.runtime.device, res.swapchain, forever, res.acquired_signal, .none, &index).check() catch |err| switch (err) {
+        const result = acquireFn(self.runtime.device, res.swapchain, forever, signal, .none, &index).check() catch |err| switch (err) {
             error.OutOfDate => if (tries == 0) {
                 try rebuild(self, res, res.width, res.height);
                 continue;
@@ -154,13 +152,20 @@ pub fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMo
     res.acquired = null;
     const presentFn = self.runtime.vkd.queuePresentKHR orelse return error.Unsupported;
 
+    // An empty submission signals it after everything submitted before it:
+    // what the image holds is drawn when the present looks at it.
+    const rendered = [_]vk.gen.types.Semaphore{res.rendered[index]};
+    const signal = [_]vk.gen.types.SubmitInfo{.{ .signal_semaphore_count = rendered.len, .signal_semaphores = &rendered }};
+    _ = self.runtime.vkd.queueSubmit(self.runtime.graphics_queue, 1, &signal, .none).check() catch |err| switch (err) {
+        error.DeviceLost => return error.DeviceLost,
+        else => return error.Failed,
+    };
+
     const swapchains = [_]vk.gen.types.SwapchainKHR{res.swapchain};
     const indices = [_]u32{index};
-    // Every submit that drew into the image waited for its fence before it
-    // returned: the drawing is done, and no semaphore is needed to say so.
     const result = presentFn(self.runtime.graphics_queue, &.{
-        .wait_semaphore_count = 0,
-        .wait_semaphores = null,
+        .wait_semaphore_count = rendered.len,
+        .wait_semaphores = &rendered,
         .swapchain_count = swapchains.len,
         .swapchains = &swapchains,
         .image_indices = &indices,
@@ -173,11 +178,6 @@ pub fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMo
         else => return error.Failed,
     };
     if (result == .suboptimal_khr) res.stale = true;
-
-    // Fully synchronous, like every other step: block until the present -
-    // and everything queued before it - has actually happened, so the next
-    // frame's `submit` never overlaps this one.
-    _ = self.runtime.vkd.queueWaitIdle(self.runtime.graphics_queue).check() catch return error.DeviceLost;
 }
 
 pub fn mapLoadOp(load: types.LoadOp) vk.gen.types.AttachmentLoadOp {
@@ -330,6 +330,15 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
     errdefer self.gpa.free(views);
     const framebuffers = try self.gpa.alloc(vk.gen.types.Framebuffer, images.len);
     errdefer self.gpa.free(framebuffers);
+    const rendered = try self.gpa.alloc(vk.gen.types.Semaphore, images.len);
+    @memset(rendered, .none);
+    errdefer {
+        for (rendered) |semaphore| if (semaphore != .none) vkd.destroySemaphore(self.runtime.device, semaphore, null);
+        self.gpa.free(rendered);
+    }
+    for (rendered) |*semaphore| {
+        _ = vkd.createSemaphore(self.runtime.device, &.{}, null, semaphore).check() catch return error.Failed;
+    }
 
     for (images, 0..) |image, i| {
         _ = vkd.createImageView(self.runtime.device, &.{
@@ -357,6 +366,7 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
     res.height = extent.height;
     res.views = views;
     res.framebuffers = framebuffers;
+    res.rendered = rendered;
     res.acquired = null;
     res.drawn = @splat(false);
     res.mode = res.want_mode;
@@ -366,8 +376,11 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
 fn destroySwapchainViews(self: *Vk, res: *SurfaceRes) void {
     for (res.framebuffers) |fb| self.runtime.vkd.destroyFramebuffer(self.runtime.device, fb, null);
     for (res.views) |view| self.runtime.vkd.destroyImageView(self.runtime.device, view, null);
+    for (res.rendered) |semaphore| self.runtime.vkd.destroySemaphore(self.runtime.device, semaphore, null);
+    self.gpa.free(res.rendered);
     self.gpa.free(res.framebuffers);
     self.gpa.free(res.views);
+    res.rendered = &.{};
     res.framebuffers = &.{};
     res.views = &.{};
 }

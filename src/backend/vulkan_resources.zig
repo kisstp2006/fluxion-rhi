@@ -61,12 +61,26 @@ fn memoryTypeIndex(self: *Vk, allowed: u32, wanted: vk.gen.types.MemoryPropertyF
 // Buffers
 // -------------------------------------------------------------------------
 
-pub const BufferRes = struct {
+/// One copy of a buffer's memory, mapped for its life, and the serial of
+/// the last submission that recorded a use of it.
+pub const Version = struct {
     buffer: vk.gen.types.Buffer,
     memory: vk.gen.types.DeviceMemory,
-    /// Mapped for the whole life of the buffer.
     mapped: [*]u8,
+    busy: u64 = 0,
+};
+
+/// A buffer: the version draws are recorded with now, the ones a write
+/// moved it off, and its bytes on the CPU, which a new version starts as.
+/// See the module doc of `vulkan.zig`.
+pub const BufferRes = struct {
+    current: Version,
+    spare: std.ArrayListUnmanaged(Version) = .empty,
+    shadow: []u8,
+    /// How far anything was ever written: a new version copies no further.
+    written: usize,
     size: usize,
+    usage: vk.gen.types.BufferUsageFlags,
 };
 
 pub fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) types.Error!backend.Native {
@@ -79,15 +93,25 @@ pub fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) types.Error!back
     }
     // A uniform block is read in whole vec4s, as on the other backends.
     const size = if (desc.kind == .uniform) std.mem.alignForward(usize, desc.size, 16) else desc.size;
-    const res = try hostBuffer(self, size, usage, .{});
-    if (desc.data) |data| @memcpy(res.mapped[0..data.len], data);
+    const shadow = try self.gpa.alloc(u8, @max(size, 1));
+    errdefer self.gpa.free(shadow);
+    const version = try hostBuffer(self, size, usage, .{});
+    errdefer freeVersion(self, version);
+    const res = try self.gpa.create(BufferRes);
+    res.* = .{ .current = version, .shadow = shadow, .written = 0, .size = size, .usage = usage };
+    if (desc.data) |data| {
+        @memcpy(version.mapped[0..data.len], data);
+        @memcpy(shadow[0..data.len], data);
+        res.written = data.len;
+    }
     return res;
 }
 
-/// A buffer the CPU writes and reads through a mapping kept for its life:
-/// every buffer here, and the staging and readback ones. `cached` is asked
-/// for where the CPU reads it back, when the driver has such memory.
-fn hostBuffer(self: *Vk, size: usize, usage: vk.gen.types.BufferUsageFlags, extra: vk.gen.types.MemoryPropertyFlags) types.Error!*BufferRes {
+/// A buffer's memory the CPU writes and reads through a mapping kept for its
+/// life: a version of every buffer here, and the staging and readback ones.
+/// `cached` is asked for where the CPU reads it back, when the driver has
+/// such memory.
+fn hostBuffer(self: *Vk, size: usize, usage: vk.gen.types.BufferUsageFlags, extra: vk.gen.types.MemoryPropertyFlags) types.Error!Version {
     const vkd = self.runtime.vkd;
     var buffer: vk.gen.types.Buffer = .none;
     _ = vkd.createBuffer(self.runtime.device, &.{
@@ -115,25 +139,53 @@ fn hostBuffer(self: *Vk, size: usize, usage: vk.gen.types.BufferUsageFlags, extr
 
     var mapped: ?*anyopaque = null;
     _ = vkd.mapMemory(self.runtime.device, memory, 0, vk.gen.types.whole_size, .{}, &mapped).check() catch return error.Failed;
+    return .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped.?) };
+}
 
-    const res = try self.gpa.create(BufferRes);
-    res.* = .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped.?), .size = size };
-    return res;
+pub fn freeVersion(self: *Vk, version: Version) void {
+    self.runtime.vkd.unmapMemory(self.runtime.device, version.memory);
+    self.runtime.vkd.destroyBuffer(self.runtime.device, version.buffer, null);
+    self.runtime.vkd.freeMemory(self.runtime.device, version.memory, null);
 }
 
 pub fn destroyBuffer(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
     const res = as(BufferRes, native);
-    self.runtime.vkd.unmapMemory(self.runtime.device, res.memory);
-    self.runtime.vkd.destroyBuffer(self.runtime.device, res.buffer, null);
-    self.runtime.vkd.freeMemory(self.runtime.device, res.memory, null);
+    vulkan.bury(self, .{ .buffer = res.current });
+    for (res.spare.items) |version| vulkan.bury(self, .{ .buffer = version });
+    res.spare.deinit(self.gpa);
+    self.gpa.free(res.shadow);
     self.gpa.destroy(res);
 }
 
+/// Write into the version the GPU is not reading: the current one when no
+/// submission it may still be running used it, another when one did.
 pub fn updateBuffer(impl: backend.Impl, native: backend.Native, offset: usize, bytes: []const u8) types.Error!void {
-    _ = impl;
+    const self = vulkan.cast(impl);
     const res = as(BufferRes, native);
-    @memcpy(res.mapped[offset..][0..bytes.len], bytes);
+    const end = offset + bytes.len;
+    if (res.current.busy > self.completed) vulkan.poll(self);
+    if (res.current.busy > self.completed) {
+        try res.spare.ensureUnusedCapacity(self.gpa, 1);
+        const fresh = try spareVersion(self, res);
+        res.spare.appendAssumeCapacity(res.current);
+        res.current = fresh;
+        // Everything else written is in the new one too.
+        const before = @min(offset, res.written);
+        @memcpy(fresh.mapped[0..before], res.shadow[0..before]);
+        if (res.written > end) @memcpy(fresh.mapped[end..res.written], res.shadow[end..res.written]);
+    }
+    @memcpy(res.current.mapped[offset..end], bytes);
+    @memcpy(res.shadow[offset..end], bytes);
+    res.written = @max(res.written, end);
+}
+
+/// A version of `res` the GPU is done with, or a new one.
+fn spareVersion(self: *Vk, res: *BufferRes) types.Error!Version {
+    for (res.spare.items, 0..) |version, i| {
+        if (version.busy <= self.completed) return res.spare.swapRemove(i);
+    }
+    return hostBuffer(self, res.size, res.usage, .{});
 }
 
 // -------------------------------------------------------------------------
@@ -260,7 +312,10 @@ fn barrier(
 
 pub fn destroyTexture(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
-    const res = as(TextureRes, native);
+    vulkan.bury(self, .{ .texture = as(TextureRes, native) });
+}
+
+pub fn freeTexture(self: *Vk, res: *TextureRes) void {
     if (res.framebuffer != .none) self.runtime.vkd.destroyFramebuffer(self.runtime.device, res.framebuffer, null);
     self.runtime.vkd.destroyImageView(self.runtime.device, res.view, null);
     self.runtime.vkd.destroyImage(self.runtime.device, res.image, null);
@@ -280,7 +335,8 @@ pub fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Te
 fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []const u8, row_pitch: usize, from: vk.gen.types.ImageLayout) types.Error!void {
     const row_bytes = res.format.rowBytes(region.width);
     const staging = try hostBuffer(self, row_bytes * region.height, .{ .transfer_src = true }, .{});
-    defer destroyBuffer(self, staging);
+    var buried = false;
+    defer if (!buried) freeVersion(self, staging);
     for (0..region.height) |y| @memcpy(staging.mapped[y * row_bytes ..][0..row_bytes], bytes[y * row_pitch ..][0..row_bytes]);
 
     try vulkan.record(self);
@@ -296,6 +352,9 @@ fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []cons
     self.runtime.vkd.cmdCopyBufferToImage(self.command_buffer, staging.buffer, res.image, .transfer_dst_optimal, copy.len, &copy);
     barrier(self, res.image, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
     try vulkan.finish(self);
+    // Read by the copy on its way: freed once it is done.
+    vulkan.bury(self, .{ .buffer = staging });
+    buried = true;
 }
 
 /// Level zero, copied into a buffer the CPU reads and handed back as RGBA,
@@ -310,7 +369,7 @@ pub fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subres
     const texel = res.format.rowBytes(1);
     const row_bytes = res.format.rowBytes(res.width);
     const readback = try hostBuffer(self, row_bytes * res.height, .{ .transfer_dst = true }, .{ .host_cached = true });
-    defer destroyBuffer(self, readback);
+    defer freeVersion(self, readback);
 
     try vulkan.record(self);
     barrier(self, res.image, .shader_read_only_optimal, .transfer_src_optimal, .{ .color_attachment_write = true }, .{ .transfer_read = true }, .{ .color_attachment_output = true, .fragment_shader = true }, .{ .transfer = true });
@@ -335,6 +394,8 @@ pub fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subres
     }};
     self.runtime.vkd.cmdPipelineBarrier(self.command_buffer, .{ .transfer = true }, .{ .host = true }, .{}, 0, null, to_host.len, &to_host, 0, null);
     try vulkan.finish(self);
+    // The one wait a readback has: the bytes are wanted now.
+    try vulkan.waitFor(self, self.submitted);
 
     const out_row = @as(usize, res.width) * 4;
     const pixels = try gpa.alloc(u8, out_row * res.height);
@@ -395,7 +456,10 @@ pub fn createSampler(impl: backend.Impl, desc: types.SamplerDesc) types.Error!ba
 
 pub fn destroySampler(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
-    const res = as(SamplerRes, native);
+    vulkan.bury(self, .{ .sampler = as(SamplerRes, native) });
+}
+
+pub fn freeSampler(self: *Vk, res: *SamplerRes) void {
     self.runtime.vkd.destroySampler(self.runtime.device, res.sampler, null);
     self.gpa.destroy(res);
 }
@@ -676,10 +740,14 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format) ty
 pub fn destroyPipeline(impl: backend.Impl, native: backend.Native) void {
     const self = vulkan.cast(impl);
     const res = as(PipelineRes, native);
+    if (self.current_pipeline == res) self.current_pipeline = null;
+    vulkan.bury(self, .{ .pipeline = res });
+}
+
+pub fn freePipeline(self: *Vk, res: *PipelineRes) void {
     for (res.variants) |maybe| if (maybe) |variant| self.runtime.vkd.destroyPipeline(self.runtime.device, variant.pipeline, null);
     self.runtime.vkd.destroyShaderModule(self.runtime.device, res.vertex, null);
     self.runtime.vkd.destroyShaderModule(self.runtime.device, res.fragment, null);
-    if (self.current_pipeline == res) self.current_pipeline = null;
     self.gpa.destroy(res);
 }
 

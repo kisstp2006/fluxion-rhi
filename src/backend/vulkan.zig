@@ -14,10 +14,27 @@
 //!                            framebuffers, the render-pass cache, acquire
 //!                            and present.
 //!
-//! **Fully synchronous.** One command buffer, one fence, no frames in
-//! flight: `submit` records, submits, and blocks on the fence before
-//! returning, and so does every upload and readback. Slower than
-//! double-buffering, and unambiguously correct.
+//! **Recordings in flight.** A submit, an upload or a transition is
+//! recorded into the next of `ring_size` slots - a command buffer, a fence,
+//! descriptor pools and acquire semaphores each - and handed to the queue
+//! without waiting for it. A slot is waited for only when it comes round
+//! again, so the CPU records while the GPU draws. Every submission has a
+//! serial one more than the last, and `completed` is the last the GPU is
+//! known to have finished. What that asks of the rest:
+//!
+//!   - A buffer the GPU may still read is not written: a write to one
+//!     moves it to another copy of its memory - a version - which starts
+//!     as the buffer's bytes kept on the CPU, the way a Direct3D 11 driver
+//!     renames a buffer written with discard. A version is used again once
+//!     the GPU is past the last submission that used it.
+//!   - What is destroyed, and a staging buffer, is buried with the serial of
+//!     the last submission, and freed once `completed` reaches it.
+//!   - A readback waits for its own submission.
+//!   - A present waits for a semaphore an empty submission signals, after
+//!     everything submitted before it.
+//!
+//! The queue runs submissions in order, so an upload's barriers and a
+//! pass's order it against every draw before and after it, as before.
 //!
 //! **Up is up, as on Direct3D.** Every viewport is given to Vulkan with a
 //! negative height (`VK_KHR_maintenance1`), so clip-space Y points up the
@@ -29,9 +46,10 @@
 //! **One shared pipeline layout.** Every pipeline this backend makes uses
 //! the same two descriptor sets - `set 0` four uniform-buffer slots, `set 1`
 //! four combined-image-sampler slots - so `setUniformBuffer`/`setTexture`
-//! and a draw never have to know which pipeline is bound. Descriptor pools
-//! reset once per `submit`, and a pair of sets allocated fresh whenever a
-//! binding actually changes (`flushBindings`), is what makes that safe: a
+//! and a draw never have to know which pipeline is bound. A slot's
+//! descriptor pools, reset when the slot is recorded into again, and a pair
+//! of sets allocated fresh whenever a binding actually changes
+//! (`flushBindings`), is what makes that safe: a
 //! descriptor set's *content* is whatever the last `vkUpdateDescriptorSets`
 //! on it wrote, checked only when the GPU executes the draw that reads it -
 //! reusing one set across draws with different textures in the same list
@@ -76,6 +94,10 @@ const max_render_passes = 32;
 /// The most surfaces one submit can draw into: each acquires its image, and
 /// the submit waits for every one it acquired.
 const max_surfaces_per_submit = 4;
+
+/// How many recordings can be on their way to the GPU at once: one waits
+/// for the one this many before it, and no other.
+const ring_size = 4;
 
 // -------------------------------------------------------------------------
 // Format mapping
@@ -265,24 +287,51 @@ pub fn loaderAvailable() bool {
 
 const TexBinding = struct { texture: *TextureRes, sampler: *SamplerRes };
 
+/// One recording on its way to the GPU: its command buffer, the fence it
+/// signals when it is done, the pools its draws' descriptor sets came from
+/// and the semaphores its acquires signalled. Recorded into again only once
+/// the GPU is done with it.
+pub const Slot = struct {
+    command_buffer: vk.gen.types.CommandBuffer,
+    fence: vk.gen.types.Fence = .none,
+    /// The serial of the submission recorded here last; nought for none.
+    serial: u64 = 0,
+    descriptor_pools: std.ArrayListUnmanaged(vk.gen.types.DescriptorPool) = .empty,
+    /// The pool the recording takes sets from now.
+    pool_index: usize = 0,
+    acquires: [max_surfaces_per_submit]vk.gen.types.Semaphore = @splat(.none),
+};
+
+/// Something freed once the GPU is past `serial`.
+pub const Grave = struct {
+    serial: u64,
+    what: union(enum) {
+        buffer: resources.Version,
+        texture: *TextureRes,
+        sampler: *SamplerRes,
+        pipeline: *PipelineRes,
+    },
+};
+
 pub const Vk = struct {
     gpa: Allocator,
     runtime: Runtime,
 
-    /// The one command buffer everything - resource uploads and every
-    /// frame's draws alike - is recorded into, one at a time. See the
-    /// module doc: this backend has no frames in flight.
     command_pool: vk.gen.types.CommandPool,
-    command_buffer: vk.gen.types.CommandBuffer,
-    fence: vk.gen.types.Fence,
+    /// What is being recorded into now: the slot's at `at`. See the module
+    /// doc for the ring.
+    command_buffer: vk.gen.types.CommandBuffer = undefined,
+    slots: [ring_size]Slot,
+    at: usize = 0,
+    /// Serials: the last submission handed to the queue, and the last the
+    /// GPU is known to have done.
+    submitted: u64 = 0,
+    completed: u64 = 0,
+    graveyard: std.ArrayListUnmanaged(Grave) = .empty,
 
     pipeline_layout: vk.gen.types.PipelineLayout,
     set_layout_uniforms: vk.gen.types.DescriptorSetLayout,
     set_layout_textures: vk.gen.types.DescriptorSetLayout,
-    /// The pools descriptor sets come from; `pool_index` is the one this
-    /// submit takes from now.
-    descriptor_pools: std.ArrayListUnmanaged(vk.gen.types.DescriptorPool) = .empty,
-    pool_index: usize = 0,
 
     /// What an unbound uniform or texture slot reads from - see
     /// `vulkan_resources.zig`'s "Dummy resources" section.
@@ -299,8 +348,8 @@ pub const Vk = struct {
     // recorded, reset by `record` and by every `beginPass` ---
     recording: bool = false,
     in_pass: bool = false,
-    /// The surfaces whose images this submit acquired: it waits for each.
-    acquired: [max_surfaces_per_submit]vk.gen.types.Semaphore = undefined,
+    /// How many of the slot's acquire semaphores this recording signalled:
+    /// it waits for each.
     acquired_count: usize = 0,
     pass_format: vk.gen.types.Format = .undefined,
     pass_extent: [2]u32 = .{ 0, 0 },
@@ -338,16 +387,21 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
     }, null, &command_pool).check() catch return error.NoDevice;
     errdefer vkd.destroyCommandPool(runtime.device, command_pool, null);
 
-    var command_buffer: vk.gen.types.CommandBuffer = undefined;
+    var command_buffers: [ring_size]vk.gen.types.CommandBuffer = undefined;
     _ = vkd.allocateCommandBuffers(runtime.device, &.{
         .command_pool = command_pool,
         .level = .primary,
-        .command_buffer_count = 1,
-    }, @ptrCast(&command_buffer)).check() catch return error.NoDevice;
-
-    var fence: vk.gen.types.Fence = .none;
-    _ = vkd.createFence(runtime.device, &.{}, null, &fence).check() catch return error.NoDevice;
-    errdefer vkd.destroyFence(runtime.device, fence, null);
+        .command_buffer_count = ring_size,
+    }, &command_buffers).check() catch return error.NoDevice;
+    var slots: [ring_size]Slot = undefined;
+    for (&slots, command_buffers) |*one, buffer| one.* = .{ .command_buffer = buffer };
+    errdefer for (&slots) |*one| destroySlot(vkd, runtime.device, one);
+    for (&slots) |*one| {
+        _ = vkd.createFence(runtime.device, &.{}, null, &one.fence).check() catch return error.NoDevice;
+        for (&one.acquires) |*semaphore| {
+            _ = vkd.createSemaphore(runtime.device, &.{}, null, semaphore).check() catch return error.NoDevice;
+        }
+    }
 
     var ubo_bindings: [uniform_slots]vk.gen.types.DescriptorSetLayoutBinding = undefined;
     for (&ubo_bindings, 0..) |*b, i| b.* = .{
@@ -392,8 +446,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
         .gpa = gpa,
         .runtime = runtime,
         .command_pool = command_pool,
-        .command_buffer = command_buffer,
-        .fence = fence,
+        .slots = slots,
         .pipeline_layout = pipeline_layout,
         .set_layout_uniforms = set_layout_uniforms,
         .set_layout_textures = set_layout_textures,
@@ -401,8 +454,6 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
         .dummy_texture = undefined,
         .dummy_sampler = undefined,
     };
-    errdefer self.descriptor_pools.deinit(gpa);
-    try addDescriptorPool(self);
 
     var props: vk.PhysicalDeviceProperties = undefined;
     self.runtime.vki.getPhysicalDeviceProperties(self.runtime.physical_device, &props);
@@ -457,18 +508,22 @@ const vtable: backend.Vtable = .{
 fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
     const vkd = self.runtime.vkd;
-    _ = vkd.deviceWaitIdle(self.runtime.device).check() catch {};
+    waitIdle(self);
 
     resources.destroyDummyResources(self);
+    collect(self);
+    self.graveyard.deinit(self.gpa);
     for (self.render_passes) |maybe| if (maybe) |entry| vkd.destroyRenderPass(self.runtime.device, entry.pass, null);
 
-    for (self.descriptor_pools.items) |pool| vkd.destroyDescriptorPool(self.runtime.device, pool, null);
-    self.descriptor_pools.deinit(self.gpa);
+    for (&self.slots) |*one| {
+        for (one.descriptor_pools.items) |pool| vkd.destroyDescriptorPool(self.runtime.device, pool, null);
+        one.descriptor_pools.deinit(self.gpa);
+        destroySlot(vkd, self.runtime.device, one);
+    }
     vkd.destroyPipelineLayout(self.runtime.device, self.pipeline_layout, null);
     vkd.destroyDescriptorSetLayout(self.runtime.device, self.set_layout_textures, null);
     vkd.destroyDescriptorSetLayout(self.runtime.device, self.set_layout_uniforms, null);
-    vkd.destroyFence(self.runtime.device, self.fence, null);
-    // Frees `self.command_buffer` too.
+    // Frees the slots' command buffers too.
     vkd.destroyCommandPool(self.runtime.device, self.command_pool, null);
 
     self.runtime.deinit();
@@ -531,15 +586,109 @@ fn caps(impl: backend.Impl) types.Caps {
 }
 
 // -------------------------------------------------------------------------
-// Recording: the command buffer every submit, upload and readback records
-// into, one after another
+// Recording: every submit, upload and readback takes the next slot of the
+// ring, and hands it to the queue without waiting for it
 // -------------------------------------------------------------------------
 
 const forever: u64 = ~@as(u64, 0);
 
-/// Start recording into the one command buffer.
+/// A slot's fence and semaphores; its command buffer goes with the pool.
+fn destroySlot(vkd: vk.gen.commands.Device, device: vk.Device, which: *Slot) void {
+    if (which.fence != .none) vkd.destroyFence(device, which.fence, null);
+    which.fence = .none;
+    for (&which.acquires) |*semaphore| {
+        if (semaphore.* != .none) vkd.destroySemaphore(device, semaphore.*, null);
+        semaphore.* = .none;
+    }
+}
+
+/// The serial the recording under way gets when it is submitted.
+pub fn recordingSerial(self: *const Vk) u64 {
+    return self.submitted + 1;
+}
+
+/// Learn what the GPU has finished since last asked, without waiting.
+pub fn poll(self: *Vk) void {
+    const vkd = self.runtime.vkd;
+    for (&self.slots) |*one| {
+        if (one.serial <= self.completed) continue;
+        const status = vkd.getFenceStatus(self.runtime.device, one.fence);
+        if (status == .success) self.completed = @max(self.completed, one.serial);
+    }
+}
+
+/// Wait until the GPU has done the submission `serial` and all before it.
+pub fn waitFor(self: *Vk, serial: u64) types.Error!void {
+    if (serial <= self.completed) return;
+    for (&self.slots) |*one| {
+        if (one.serial != serial) continue;
+        _ = self.runtime.vkd.waitForFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{one.fence}, vk.gen.types.vk_true, forever).check() catch return error.DeviceLost;
+        break;
+    }
+    // A serial no slot holds any more was waited for when its slot came
+    // round again; the queue does them in order.
+    self.completed = @max(self.completed, serial);
+}
+
+/// Wait for everything submitted, and free what waited for it.
+pub fn waitIdle(self: *Vk) void {
+    _ = self.runtime.vkd.deviceWaitIdle(self.runtime.device).check() catch {};
+    self.completed = self.submitted;
+    collect(self);
+}
+
+/// Free `what` once the GPU is past everything submitted so far, or now
+/// when it already is.
+pub fn bury(self: *Vk, what: @FieldType(Grave, "what")) void {
+    if (self.completed >= self.submitted) return free(self, what);
+    self.graveyard.append(self.gpa, .{ .serial = self.submitted, .what = what }) catch {
+        // No room to wait: wait for it instead.
+        waitIdle(self);
+        free(self, what);
+    };
+}
+
+/// Free what the GPU is done with.
+pub fn collect(self: *Vk) void {
+    var i: usize = 0;
+    while (i < self.graveyard.items.len) {
+        const grave = self.graveyard.items[i];
+        if (grave.serial > self.completed) {
+            i += 1;
+            continue;
+        }
+        _ = self.graveyard.swapRemove(i);
+        free(self, grave.what);
+    }
+}
+
+fn free(self: *Vk, what: @FieldType(Grave, "what")) void {
+    switch (what) {
+        .buffer => |version| resources.freeVersion(self, version),
+        .texture => |res| resources.freeTexture(self, res),
+        .sampler => |res| resources.freeSampler(self, res),
+        .pipeline => |res| resources.freePipeline(self, res),
+    }
+}
+
+/// The slot being recorded into.
+pub fn recordingSlot(self: *Vk) *Slot {
+    return &self.slots[self.at];
+}
+
+/// Start recording into the next slot, once the GPU is done with it.
 pub fn record(self: *Vk) types.Error!void {
     const vkd = self.runtime.vkd;
+    self.at = (self.at + 1) % ring_size;
+    const next = &self.slots[self.at];
+    try waitFor(self, next.serial);
+    for (next.descriptor_pools.items) |pool| {
+        _ = vkd.resetDescriptorPool(self.runtime.device, pool, 0).check() catch return error.Failed;
+    }
+    next.pool_index = 0;
+    poll(self);
+    collect(self);
+    self.command_buffer = next.command_buffer;
     _ = vkd.resetCommandBuffer(self.command_buffer, .{}).check() catch return error.Failed;
     _ = vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit = true } }).check() catch return error.Failed;
     self.recording = true;
@@ -547,12 +696,14 @@ pub fn record(self: *Vk) types.Error!void {
     self.acquired_count = 0;
 }
 
-/// Stop recording, submit - waiting for every image this recording
-/// acquired - and block until the GPU has done it all. The fence is reset
-/// only here, right before the submit that signals it, so a recording given
-/// up on never leaves it waiting for a signal that will not come.
+/// Stop recording and hand it to the queue - waiting there for every image
+/// this recording acquired - without waiting for the GPU. The fence is
+/// reset only here, right before the submit that signals it, so a
+/// recording given up on never leaves it waiting for a signal that will not
+/// come.
 pub fn finish(self: *Vk) types.Error!void {
     const vkd = self.runtime.vkd;
+    const now = recordingSlot(self);
     self.recording = false;
     _ = vkd.endCommandBuffer(self.command_buffer).check() catch return error.Failed;
 
@@ -562,17 +713,18 @@ pub fn finish(self: *Vk) types.Error!void {
     const cmd_buffers = [_]vk.gen.types.CommandBuffer{self.command_buffer};
     const submit_info = [_]vk.gen.types.SubmitInfo{.{
         .wait_semaphore_count = @intCast(waits),
-        .wait_semaphores = if (waits > 0) &self.acquired else null,
+        .wait_semaphores = if (waits > 0) &now.acquires else null,
         .wait_dst_stage_mask = if (waits > 0) &wait_stages else null,
         .command_buffer_count = cmd_buffers.len,
         .command_buffers = &cmd_buffers,
     }};
-    _ = vkd.resetFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}).check() catch return error.Failed;
-    _ = vkd.queueSubmit(self.runtime.graphics_queue, 1, &submit_info, self.fence).check() catch |err| switch (err) {
+    _ = vkd.resetFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{now.fence}).check() catch return error.Failed;
+    _ = vkd.queueSubmit(self.runtime.graphics_queue, 1, &submit_info, now.fence).check() catch |err| switch (err) {
         error.DeviceLost => return error.DeviceLost,
         else => return error.Failed,
     };
-    _ = vkd.waitForFences(self.runtime.device, 1, &[_]vk.gen.types.Fence{self.fence}, vk.gen.types.vk_true, forever).check() catch return error.DeviceLost;
+    self.submitted += 1;
+    now.serial = self.submitted;
 }
 
 /// What a submit that failed part-way leaves: its pass ended and what was
@@ -590,17 +742,16 @@ fn abandon(self: *Vk) void {
 // Submitting a frame
 // -------------------------------------------------------------------------
 
-/// Walks the `Command` union once, recording into `self.command_buffer` -
-/// then submits it and blocks on `self.fence` before returning, per the
-/// module doc's "fully synchronous" rule.
+/// Walks the `Command` union once, recording into the next slot's command
+/// buffer, then hands it to the queue: see the module doc.
 fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) types.Error!void {
     const self = cast(impl);
     const vkd = self.runtime.vkd;
-    const cmd = self.command_buffer;
 
     try record(self);
     errdefer abandon(self);
-    try resetDescriptorPools(self);
+    const cmd = self.command_buffer;
+    const serial = recordingSerial(self);
     self.current_pipeline = null;
     self.pipeline_dirty = false;
     self.current_ubo = @splat(null);
@@ -622,13 +773,15 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
             .set_scissor => |maybe| setScissor(self, maybe),
             .set_vertex_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                const buffers = [_]vk.gen.types.Buffer{res.buffer};
+                res.current.busy = serial;
+                const buffers = [_]vk.gen.types.Buffer{res.current.buffer};
                 const offsets = [_]vk.gen.types.DeviceSize{b.offset};
                 vkd.cmdBindVertexBuffers(cmd, b.slot, 1, &buffers, &offsets);
             },
             .set_index_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                vkd.cmdBindIndexBuffer(cmd, res.buffer, 0, if (b.format == .u16) .uint16 else .uint32);
+                res.current.busy = serial;
+                vkd.cmdBindIndexBuffer(cmd, res.current.buffer, 0, if (b.format == .u16) .uint16 else .uint32);
             },
             .set_uniform_buffer => |b| {
                 if (b.slot >= uniform_slots) return error.Unsupported;
@@ -672,10 +825,9 @@ fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error
     switch (color.target) {
         .surface => |h| {
             const surface = as(SurfaceRes, device.surfaces.get(h).?.native);
-            if (try swapchain.acquire(self, surface)) {
+            if (surface.acquired == null) {
                 if (self.acquired_count >= max_surfaces_per_submit) return error.Unsupported;
-                self.acquired[self.acquired_count] = surface.acquired_signal;
-                self.acquired_count += 1;
+                if (try swapchain.acquire(self, surface, recordingSlot(self).acquires[self.acquired_count])) self.acquired_count += 1;
             }
             const index = surface.acquired.?;
             // An image drawn into before is presentable; one that never was
@@ -770,6 +922,7 @@ fn prepareDraw(self: *Vk) types.Error!void {
 }
 
 fn addDescriptorPool(self: *Vk) types.Error!void {
+    const pools = &recordingSlot(self).descriptor_pools;
     const pool_sizes = [_]vk.gen.types.DescriptorPoolSize{
         .{ .type = .uniform_buffer, .descriptor_count = uniform_slots * binding_states_per_pool },
         .{ .type = .combined_image_sampler, .descriptor_count = texture_slots * binding_states_per_pool },
@@ -780,17 +933,10 @@ fn addDescriptorPool(self: *Vk) types.Error!void {
         .pool_size_count = pool_sizes.len,
         .pool_sizes = &pool_sizes,
     }, null, &pool).check() catch return error.OutOfMemory;
-    self.descriptor_pools.append(self.gpa, pool) catch {
+    pools.append(self.gpa, pool) catch {
         self.runtime.vkd.destroyDescriptorPool(self.runtime.device, pool, null);
         return error.OutOfMemory;
     };
-}
-
-fn resetDescriptorPools(self: *Vk) types.Error!void {
-    for (self.descriptor_pools.items) |pool| {
-        _ = self.runtime.vkd.resetDescriptorPool(self.runtime.device, pool, 0).check() catch return error.Failed;
-    }
-    self.pool_index = 0;
 }
 
 /// Allocates a fresh `(set 0, set 1)` pair, writes it from
@@ -806,7 +952,8 @@ fn flushBindings(self: *Vk) types.Error!void {
     var uniform_infos: [uniform_slots]vk.gen.types.DescriptorBufferInfo = undefined;
     for (&uniform_infos, 0..) |*info_, i| {
         const res = self.current_ubo[i] orelse self.dummy_buffer;
-        info_.* = .{ .buffer = res.buffer, .offset = 0, .range = vk.gen.types.whole_size };
+        res.current.busy = recordingSerial(self);
+        info_.* = .{ .buffer = res.current.buffer, .offset = 0, .range = vk.gen.types.whole_size };
     }
     var texture_infos: [texture_slots]vk.gen.types.DescriptorImageInfo = undefined;
     for (&texture_infos, 0..) |*info_, i| {
@@ -818,15 +965,16 @@ fn flushBindings(self: *Vk) types.Error!void {
 
     const set_layouts = [_]vk.gen.types.DescriptorSetLayout{ self.set_layout_uniforms, self.set_layout_textures };
     var sets: [2]vk.gen.types.DescriptorSet = undefined;
+    const now = recordingSlot(self);
     while (true) {
-        if (self.pool_index >= self.descriptor_pools.items.len) try addDescriptorPool(self);
+        if (now.pool_index >= now.descriptor_pools.items.len) try addDescriptorPool(self);
         _ = vkd.allocateDescriptorSets(self.runtime.device, &.{
-            .descriptor_pool = self.descriptor_pools.items[self.pool_index],
+            .descriptor_pool = now.descriptor_pools.items[now.pool_index],
             .descriptor_set_count = set_layouts.len,
             .set_layouts = &set_layouts,
         }, &sets).check() catch |err| switch (err) {
             error.OutOfPoolMemory, error.FragmentedPool => {
-                self.pool_index += 1;
+                now.pool_index += 1;
                 continue;
             },
             else => return error.OutOfMemory,
@@ -967,6 +1115,54 @@ test "passes clear textures, submit after submit, and each reads back its colour
     defer testing.allocator.free(b);
     try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, a[0..4].*);
     try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, b[(7 * 8 + 7) * 4 ..][0..4].*);
+}
+
+test "a buffer the GPU may still read is written into another copy, which keeps the rest of its bytes" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    const self = cast(device.impl);
+
+    const handle = try device.createBuffer(.{ .kind = .vertex, .size = 8, .data = "abcdefgh" });
+    const res = as(BufferRes, device.buffers.get(handle).?.native);
+    const first = res.current;
+    // As if a submission the GPU has not done yet drew with it.
+    res.current.busy = self.submitted + 1;
+    try device.updateBuffer(handle, 2, "XY");
+    try testing.expect(res.current.buffer != first.buffer);
+    try testing.expectEqualSlices(u8, "abcdefgh", first.mapped[0..8]);
+    try testing.expectEqualSlices(u8, "abXYefgh", res.current.mapped[0..8]);
+
+    // One no submission uses is written where it is.
+    const second = res.current.buffer;
+    try device.updateBuffer(handle, 0, "Z");
+    try testing.expectEqual(second, res.current.buffer);
+    try testing.expectEqualSlices(u8, "ZbXYefgh", res.current.mapped[0..8]);
+}
+
+test "submits do not wait for each other, and what they used is freed once the GPU is done" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    const self = cast(device.impl);
+
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const before = self.submitted;
+    for (0..ring_size * 3) |_| {
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 0, 1, 0, 1 } } });
+        try cmd.endPass();
+        try device.submit();
+    }
+    try testing.expectEqual(before + ring_size * 3, self.submitted);
+    // A texture destroyed while submissions may use it waits in the ground.
+    const doomed = try device.createTexture(.{ .width = 2, .height = 2 });
+    device.destroyTexture(doomed);
+    waitIdle(self);
+    try testing.expectEqual(self.submitted, self.completed);
+    try testing.expectEqual(@as(usize, 0), self.graveyard.items.len);
+
+    const back = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(back);
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, back[0..4].*);
 }
 
 test "what is not here yet is refused as Unsupported" {
