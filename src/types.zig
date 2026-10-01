@@ -945,6 +945,8 @@ pub const SurfaceDesc = struct {
 pub const PresentMode = enum {
     /// As soon as a frame is drawn, never waiting: as many frames as the
     /// program can draw, and where nothing composites the window, tearing.
+    /// Vulkan's immediate, OpenGL's swap interval of nought, and Direct3D's
+    /// flip model presenting with tearing allowed, where the system allows it.
     disabled,
     /// One frame a refresh, the program waiting for it: never tears.
     enabled,

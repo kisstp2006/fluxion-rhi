@@ -93,10 +93,13 @@ the same `SurfaceDesc` on every backend.
 **A surface is shown in a `PresentMode`**: `disabled` never waits for the
 display, `enabled` waits for its refresh and never tears, `adaptive` waits but
 shows a late frame at once, `mailbox` shows the newest frame at each refresh
-without the program waiting. Vulkan has all four; Direct3D's flip model shows
-`disabled` and `mailbox` whole, the compositor keeping them from tearing;
-OpenGL has `adaptive` where the driver has late swaps. A mode a backend has
-not is shown as `enabled`. `setPresentMode` changes it from the next `present`.
+without the program waiting. Vulkan has all four. Direct3D's flip model shows
+`mailbox` whole, the compositor keeping it from tearing, and `disabled` with
+tearing allowed where the system allows it (Windows 10 and later): a frame
+goes up at once, and tears where nothing composites the window - fullscreen,
+or a borderless window over the whole screen. OpenGL has `adaptive` where the
+driver has late swaps. A mode a backend has not is shown as `enabled`.
+`setPresentMode` changes it from the next `present`.
 
 **One program for every backend.** The same calls, the same shader handed
 over in every language it is written in (Fluxion Shader writes them all from

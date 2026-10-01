@@ -270,6 +270,12 @@ const AlphaMode = enum(u32) { unspecified = 0, premultiplied = 1, straight = 2, 
 
 const usage_render_target_output: u32 = 1 << 5;
 
+/// `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`, and `DXGI_PRESENT_ALLOW_TEARING`: a
+/// swap chain made with the first may be presented with the second, which puts
+/// a frame up at once, mid-refresh, where nothing composites the window.
+const swap_chain_allow_tearing: u32 = 0x800;
+const present_allow_tearing: u32 = 0x200;
+
 const SampleDesc = extern struct {
     count: u32 = 1,
     quality: u32 = 0,
@@ -933,6 +939,10 @@ const SurfaceRes = struct {
     rtv: *IRenderTargetView,
     width: u32,
     height: u32,
+    /// `swap_chain_allow_tearing` where the system allows tearing, nought
+    /// where it does not: what the chain was made with, and what every
+    /// resize has to say again.
+    flags: u32,
 };
 
 /// What a swap chain is made in, and so the one format a multisampled texture
@@ -2040,7 +2050,8 @@ fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) Error!backend.Nati
     const factory2: *IFactory2 = @ptrCast(com.queryInterface(self.factory, dxgi.IDXGIFactory2) catch return error.Unsupported);
     defer _ = com.release(factory2);
 
-    const chain_desc: SwapChainDesc1 = .{ .width = desc.width, .height = desc.height };
+    const flags: u32 = if (dxgi.allowsTearing(self.factory)) swap_chain_allow_tearing else 0;
+    const chain_desc: SwapChainDesc1 = .{ .width = desc.width, .height = desc.height, .flags = flags };
     var swap_chain: ?*ISwapChain = null;
     factory2.vtable.CreateSwapChainForHwnd(
         factory2,
@@ -2055,7 +2066,7 @@ fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) Error!backend.Nati
 
     const res = try self.gpa.create(SurfaceRes);
     errdefer self.gpa.destroy(res);
-    res.* = .{ .swap_chain = swap_chain.?, .back_buffer = undefined, .rtv = undefined, .width = 0, .height = 0 };
+    res.* = .{ .swap_chain = swap_chain.?, .back_buffer = undefined, .rtv = undefined, .width = 0, .height = 0, .flags = flags };
     try attachBackBuffer(self, res);
     return res;
 }
@@ -2094,7 +2105,7 @@ fn resizeSurface(impl: backend.Impl, native: backend.Native, width: u32, height:
     self.context.vtable.Flush(self.context);
     _ = com.release(res.rtv);
     _ = com.release(res.back_buffer);
-    res.swap_chain.vtable.ResizeBuffers(res.swap_chain, 0, width, height, .unknown, 0).check() catch return error.Failed;
+    res.swap_chain.vtable.ResizeBuffers(res.swap_chain, 0, width, height, .unknown, res.flags).check() catch return error.Failed;
     try attachBackBuffer(self, res);
 }
 
@@ -2104,13 +2115,17 @@ fn surfaceSize(impl: backend.Impl, native: backend.Native) [2]u32 {
     return .{ res.width, res.height };
 }
 
-/// A sync interval of one waits for the refresh; of nought, shows the frame
-/// at once - which, in the flip model the swap chain is made with, the
-/// compositor still shows whole: `disabled` and `mailbox` alike.
+/// A sync interval of one waits for the refresh; of nought, it does not. In
+/// the flip model the swap chain is made with, `mailbox` leaves the compositor
+/// to show whole frames, the newest at each refresh; `disabled` puts a frame up
+/// at once, and where nothing composites the window - fullscreen, or a
+/// borderless window over the whole screen - tears, where the system allows it.
 fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) Error!void {
     _ = impl;
     const res = as(SurfaceRes, native);
-    res.swap_chain.vtable.Present(res.swap_chain, if (mode.waits()) 1 else 0, 0).check() catch |err| switch (err) {
+    const interval: u32 = if (mode.waits()) 1 else 0;
+    const flags: u32 = if (mode == .disabled and res.flags & swap_chain_allow_tearing != 0) present_allow_tearing else 0;
+    res.swap_chain.vtable.Present(res.swap_chain, interval, flags).check() catch |err| switch (err) {
         error.DeviceRemoved, error.DeviceReset => return error.DeviceLost,
         else => return error.Failed,
     };
@@ -3606,6 +3621,35 @@ test "a depth attachment can be a face of a cube, and a level of an array" {
         defer testing.allocator.free(pixels);
         try testing.expectEqual(palette[0], pixelAt(pixels, 8, 4, 4));
     }
+}
+
+test "a surface presents in every mode and is resized, made to tear where the system allows it" {
+    // A window that is never shown, for the swap chain to belong to.
+    const window = user32.CreateWindowExA(0, "STATIC", "fluxion-rhi", user32.ws_popup, 0, 0, 32, 32, null, null, null, null) orelse return error.SkipZigTest;
+    defer _ = user32.DestroyWindow(window);
+
+    var device = try warpDevice();
+    defer device.deinit();
+    const surface = device.createSurface(.{ .native_window = @intFromPtr(window), .width = 32, .height = 32, .present_mode = .disabled }) catch return error.SkipZigTest;
+    const res = as(SurfaceRes, device.surfaces.get(surface).?.native);
+    const allowed = dxgi.allowsTearing(cast(device.impl).factory);
+    try testing.expectEqual(if (allowed) swap_chain_allow_tearing else 0, res.flags);
+
+    // Each mode presents - `disabled` with the tearing flag, which a chain
+    // made without it would refuse - before a resize and after it.
+    for (0..2) |round| {
+        if (round == 1) try device.resizeSurface(surface, 48, 40);
+        for ([_]types.PresentMode{ .disabled, .enabled, .adaptive, .mailbox, .disabled }) |mode| {
+            try device.setPresentMode(surface, mode);
+            const cmd = device.begin();
+            try cmd.beginPass(.{ .color = .{ .target = .{ .surface = surface }, .clear_color = .{ 0, 1, 0, 1 } } });
+            try cmd.endPass();
+            try device.submit();
+            try device.present(surface);
+        }
+    }
+    try testing.expectEqual(@as(u32, 48), res.width);
+    try testing.expectEqual(if (allowed) swap_chain_allow_tearing else 0, res.flags);
 }
 
 const user32 = struct {
