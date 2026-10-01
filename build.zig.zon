@@ -49,8 +49,8 @@
         // `-Dexamples` is given. The library never opens a window and never
         // writes a file.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#5b9e0f68299117b924849a71452c31a5edc6d0dc",
-            .hash = "fluxion_platform-0.1.0-WsOjUbdyGAC9gDHrhCOkb_LcsXrOzijfatykISXtqLaa",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#7f6990aef6d5c2a3f56bfb76582e6e55563da7c5",
+            .hash = "fluxion_platform-0.1.0-WsOjUZdGGQBbA31UoS_op4pisjc8pza_GUuOx3xKy8y0",
             .lazy = true,
         },
         .fluxion_image = .{
