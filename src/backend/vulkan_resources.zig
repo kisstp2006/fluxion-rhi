@@ -202,6 +202,11 @@ pub const TextureRes = struct {
     vk_format: vk.gen.types.Format,
     /// For a texture made to be drawn into: the framebuffer a pass begins.
     framebuffer: vk.gen.types.Framebuffer = .none,
+
+    fn aspect(self: *const TextureRes) vk.gen.types.ImageAspectFlags {
+        if (!self.format.isDepth()) return .{ .color = true };
+        return .{ .depth = true, .stencil = self.format.hasStencil() };
+    }
 };
 
 pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!backend.Native {
@@ -224,7 +229,12 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
         .array_layers = 1,
         .samples = .{ .x1 = true },
         .tiling = .optimal,
-        .usage = .{ .transfer_src = true, .transfer_dst = true, .sampled = true, .color_attachment = desc.usage.render_target },
+        // A depth texture is only drawn into, and kept for the passes that
+        // load it.
+        .usage = if (desc.format.isDepth())
+            .{ .depth_stencil_attachment = true }
+        else
+            .{ .transfer_src = true, .transfer_dst = true, .sampled = true, .color_attachment = desc.usage.render_target },
         .sharing_mode = .exclusive,
         .initial_layout = .undefined,
     }, null, &image).check() catch return error.Failed;
@@ -243,22 +253,32 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     errdefer vkd.freeMemory(self.runtime.device, memory, null);
     _ = vkd.bindImageMemory(self.runtime.device, image, memory, 0).check() catch return error.Failed;
 
-    var view: vk.gen.types.ImageView = .none;
+    const res = try self.gpa.create(TextureRes);
+    errdefer self.gpa.destroy(res);
+    res.* = .{ .image = image, .memory = memory, .view = .none, .width = desc.width, .height = desc.height, .format = desc.format, .vk_format = vk_format };
+
     _ = vkd.createImageView(self.runtime.device, &.{
         .image = image,
         .view_type = .@"2d",
         .format = vk_format,
         .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
-        .subresource_range = colorRange(),
-    }, null, &view).check() catch return error.Failed;
-    errdefer vkd.destroyImageView(self.runtime.device, view, null);
+        .subresource_range = rangeOf(res.aspect()),
+    }, null, &res.view).check() catch return error.Failed;
+    errdefer vkd.destroyImageView(self.runtime.device, res.view, null);
+    const view = res.view;
 
-    const res = try self.gpa.create(TextureRes);
-    errdefer self.gpa.destroy(res);
-    res.* = .{ .image = image, .memory = memory, .view = view, .width = desc.width, .height = desc.height, .format = desc.format, .vk_format = vk_format };
+    // Into where depth is written, the layout every pass that loads it
+    // expects; the framebuffer is the pass's own, with its colour target.
+    if (desc.format.isDepth()) {
+        try vulkan.ensureRecording(self);
+        const to: vk.gen.types.AccessFlags = .{ .depth_stencil_attachment_read = true, .depth_stencil_attachment_write = true };
+        barrierOf(self, image, res.aspect(), .undefined, .depth_stencil_attachment_optimal, .{}, to, .{ .top_of_pipe = true }, .{ .early_fragment_tests = true });
+        self.has_work = true;
+        return res;
+    }
 
     if (desc.usage.render_target) {
-        const render_pass = try swapchain.getRenderPass(self, vk_format, .clear, .undefined, .shader_read_only_optimal);
+        const render_pass = try swapchain.getRenderPass(self, vk_format, .clear, .undefined, .shader_read_only_optimal, .none);
         const attachments = [_]vk.gen.types.ImageView{view};
         _ = vkd.createFramebuffer(self.runtime.device, &.{
             .render_pass = render_pass,
@@ -283,13 +303,31 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
 }
 
 fn colorRange() vk.gen.types.ImageSubresourceRange {
-    return .{ .aspect_mask = .{ .color = true }, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 };
+    return rangeOf(.{ .color = true });
+}
+
+fn rangeOf(aspect: vk.gen.types.ImageAspectFlags) vk.gen.types.ImageSubresourceRange {
+    return .{ .aspect_mask = aspect, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 };
 }
 
 /// One image layout barrier, recorded into the backend's command buffer.
 fn barrier(
     self: *Vk,
     image: vk.gen.types.Image,
+    old: vk.gen.types.ImageLayout,
+    new: vk.gen.types.ImageLayout,
+    src_access: vk.gen.types.AccessFlags,
+    dst_access: vk.gen.types.AccessFlags,
+    src_stage: vk.gen.types.PipelineStageFlags,
+    dst_stage: vk.gen.types.PipelineStageFlags,
+) void {
+    barrierOf(self, image, .{ .color = true }, old, new, src_access, dst_access, src_stage, dst_stage);
+}
+
+fn barrierOf(
+    self: *Vk,
+    image: vk.gen.types.Image,
+    aspect: vk.gen.types.ImageAspectFlags,
     old: vk.gen.types.ImageLayout,
     new: vk.gen.types.ImageLayout,
     src_access: vk.gen.types.AccessFlags,
@@ -305,7 +343,7 @@ fn barrier(
         .src_queue_family_index = vk.gen.types.queue_family_ignored,
         .dst_queue_family_index = vk.gen.types.queue_family_ignored,
         .image = image,
-        .subresource_range = colorRange(),
+        .subresource_range = rangeOf(aspect),
     }};
     self.runtime.vkd.cmdPipelineBarrier(self.command_buffer, src_stage, dst_stage, .{}, 0, null, 0, null, barriers.len, &barriers);
 }
@@ -570,18 +608,15 @@ pub const PipelineRes = struct {
     cull: vk.gen.types.CullModeFlags,
     front_face: vk.gen.types.FrontFace,
     blend: vk.gen.types.PipelineColorBlendAttachmentState,
+    depth: types.DepthState,
     variants: [max_variants]?Variant = @splat(null),
 
-    const Variant = struct { format: vk.gen.types.Format, pipeline: vk.gen.types.Pipeline };
+    const Variant = struct { format: vk.gen.types.Format, depth: vk.gen.types.Format, pipeline: vk.gen.types.Pipeline };
 };
 
 pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_native: backend.Native, log: *Io.Writer) types.Error!backend.Native {
     const self = vulkan.cast(impl);
     const vkd = self.runtime.vkd;
-    if (desc.depth_format != null) {
-        log.writeAll("fluxion-rhi: the Vulkan backend has no depth attachments yet") catch {};
-        return error.Unsupported;
-    }
     if (desc.extra_color_formats.len > 0) {
         log.writeAll("fluxion-rhi: the Vulkan backend has no multiple render targets yet") catch {};
         return error.Unsupported;
@@ -590,8 +625,8 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
         log.writeAll("fluxion-rhi: the Vulkan backend has no multisampling yet") catch {};
         return error.Unsupported;
     }
-    const color_format = desc.color_format orelse return error.Unsupported;
-    const vk_format = vulkan.toVkFormat(color_format) orelse return error.Unsupported;
+    const vk_format: vk.gen.types.Format = if (desc.color_format) |format| vulkan.toVkFormat(format) orelse return error.Unsupported else .undefined;
+    const depth_format: vk.gen.types.Format = if (desc.depth_format) |format| vulkan.toVkFormat(format) orelse return error.Unsupported else .undefined;
     if (desc.buffers.len > max_vertex_bindings or desc.attributes.len > max_vertex_attributes) return error.Unsupported;
 
     const shader = as(ShaderRes, shader_native);
@@ -616,6 +651,7 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
             .front => .{ .front = true },
         },
         .front_face = if (desc.front_face == .ccw) .counter_clockwise else .clockwise,
+        .depth = desc.depth,
         .blend = .{
             .blend_enable = if (desc.blend.enabled) vk.gen.types.vk_true else vk.gen.types.vk_false,
             .src_color_blend_factor = vkBlendFactor(desc.blend.src_rgb),
@@ -641,20 +677,21 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
 
     // The format it said it draws into is made now, so that a pipeline the
     // driver will not make is said at once.
-    _ = pipelineFor(self, res, vk_format) catch {
+    _ = pipelineFor(self, res, vk_format, depth_format) catch {
         log.writeAll("fluxion-rhi: vkCreateGraphicsPipelines failed") catch {};
         return error.PipelineFailed;
     };
     return res;
 }
 
-/// The pipeline `res` is for a pass into `format`, made the first time it is
-/// asked for.
-pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format) types.Error!vk.gen.types.Pipeline {
+/// The pipeline `res` is for a pass into `format` - `undefined` for none -
+/// with a depth attachment of `depth` - `undefined` for none - made the
+/// first time it is asked for.
+pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format, depth: vk.gen.types.Format) types.Error!vk.gen.types.Pipeline {
     var free: ?usize = null;
     for (&res.variants, 0..) |*slot, i| {
         if (slot.*) |variant| {
-            if (variant.format == format) return variant.pipeline;
+            if (variant.format == format and variant.depth == depth) return variant.pipeline;
         } else if (free == null) free = i;
     }
     const index = free orelse return error.Unsupported;
@@ -696,9 +733,21 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format) ty
     const color_blend: vk.gen.types.PipelineColorBlendStateCreateInfo = .{
         .logic_op_enable = vk.gen.types.vk_false,
         .logic_op = .copy,
-        .attachment_count = blend_attachment.len,
+        .attachment_count = if (format != .undefined) blend_attachment.len else 0,
         .attachments = &blend_attachment,
         .blend_constants = .{ 0, 0, 0, 0 },
+    };
+    const keep: vk.gen.types.StencilOpState = .{ .fail_op = .keep, .pass_op = .keep, .depth_fail_op = .keep, .compare_op = .always, .compare_mask = 0, .write_mask = 0, .reference = 0 };
+    const depth_stencil: vk.gen.types.PipelineDepthStencilStateCreateInfo = .{
+        .depth_test_enable = if (res.depth.test_enabled) vk.gen.types.vk_true else vk.gen.types.vk_false,
+        .depth_write_enable = if (res.depth.write) vk.gen.types.vk_true else vk.gen.types.vk_false,
+        .depth_compare_op = vkCompare(res.depth.compare),
+        .depth_bounds_test_enable = vk.gen.types.vk_false,
+        .stencil_test_enable = vk.gen.types.vk_false,
+        .front = keep,
+        .back = keep,
+        .min_depth_bounds = 0,
+        .max_depth_bounds = 1,
     };
     const dynamic_states = [_]vk.gen.types.DynamicState{ .viewport, .scissor };
     const dynamic_state: vk.gen.types.PipelineDynamicStateCreateInfo = .{
@@ -709,7 +758,7 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format) ty
     // Any render pass whose attachment has this format and one sample is
     // compatible at `vkCmdBeginRenderPass` time; the load op and the layouts
     // do not matter.
-    const render_pass = try swapchain.getRenderPass(self, format, .clear, .undefined, .shader_read_only_optimal);
+    const render_pass = try swapchain.getRenderPass(self, format, .clear, .undefined, .shader_read_only_optimal, .{ .format = depth, .load = if (depth != .undefined) .clear else .dont_care });
 
     const stages = [_]vk.gen.types.PipelineShaderStageCreateInfo{
         .{ .stage = .{ .vertex = true }, .module = res.vertex, .name = "main" },
@@ -723,6 +772,7 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format) ty
         .viewport_state = &viewport_state,
         .rasterization_state = &rasterization,
         .multisample_state = &multisample,
+        .depth_stencil_state = if (depth != .undefined) &depth_stencil else null,
         .color_blend_state = &color_blend,
         .dynamic_state = &dynamic_state,
         .layout = self.pipeline_layout,
@@ -733,7 +783,7 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format) ty
 
     var pipeline: vk.gen.types.Pipeline = .none;
     _ = self.runtime.vkd.createGraphicsPipelines(self.runtime.device, .none, 1, &pipeline_info, null, @ptrCast(&pipeline)).check() catch return error.PipelineFailed;
-    res.variants[index] = .{ .format = format, .pipeline = pipeline };
+    res.variants[index] = .{ .format = format, .depth = depth, .pipeline = pipeline };
     return pipeline;
 }
 

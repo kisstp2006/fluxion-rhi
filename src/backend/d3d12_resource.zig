@@ -68,6 +68,10 @@ pub const Format = enum(u32) {
     r16_uint = 57,
     r8_unorm = 61,
     b8g8r8a8_unorm = 87,
+    d32_float_s8x24_uint = 20,
+    d32_float = 40,
+    d24_unorm_s8_uint = 45,
+    d16_unorm = 55,
     _,
 };
 
@@ -256,11 +260,16 @@ pub const ResourceStates = packed struct(u32) {
     };
 };
 
-/// `D3D12_CLEAR_VALUE`. Only the colour branch of the union: this backend
-/// never creates a depth-stencil committed resource.
+/// `D3D12_CLEAR_VALUE`. The union is the colour branch's sixteen bytes;
+/// `depthStencil` fills the other branch - a float and a byte after it - in
+/// the same place.
 pub const ClearValue = extern struct {
     format: Format,
     color: [4]f32 = .{ 0, 0, 0, 0 },
+
+    pub fn depthStencil(format: Format, depth: f32, stencil: u8) ClearValue {
+        return .{ .format = format, .color = .{ depth, @bitCast(@as(u32, stencil)), 0, 0 } };
+    }
 };
 
 /// `D3D12_RANGE`. `Begin == End` means "nothing is read", the pattern an
@@ -590,6 +599,13 @@ pub fn createShaderResourceView(device: *ID3D12Device, resource: ?*ID3D12Resourc
 pub fn createRenderTargetView(device: *ID3D12Device, resource: ?*ID3D12Resource, desc: ?*const RenderTargetViewDesc, dest: CpuDescriptorHandle) void {
     const create = slot(*const fn (*ID3D12Device, ?*ID3D12Resource, ?*const RenderTargetViewDesc, CpuDescriptorHandle) callconv(.winapi) void, device.vtable.CreateRenderTargetView);
     create(device, resource, desc, dest);
+}
+
+/// A depth-stencil view of the resource's own format, its first mip and
+/// layer: what a texture made with a depth format is drawn into through.
+pub fn createDepthStencilView(device: *ID3D12Device, resource: *ID3D12Resource, dest: CpuDescriptorHandle) void {
+    const create = slot(*const fn (*ID3D12Device, ?*ID3D12Resource, ?*const anyopaque, CpuDescriptorHandle) callconv(.winapi) void, device.vtable.CreateDepthStencilView);
+    create(device, resource, null, dest);
 }
 
 pub fn createSampler(device: *ID3D12Device, desc: *const SamplerDesc, dest: CpuDescriptorHandle) void {

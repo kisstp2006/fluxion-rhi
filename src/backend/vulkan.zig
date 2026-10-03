@@ -123,6 +123,10 @@ pub fn toVkFormat(format: types.Format) ?vk.gen.types.Format {
         .rgba8_unorm => .r8g8b8a8_unorm,
         .bgra8_unorm => .b8g8r8a8_unorm,
         .r8_unorm => .r8_unorm,
+        .depth16_unorm => .d16_unorm,
+        .depth24_stencil8 => .d24_unorm_s8_uint,
+        .depth32_float => .d32_sfloat,
+        .depth32_float_stencil8 => .d32_sfloat_s8_uint,
         else => null,
     };
 }
@@ -321,6 +325,8 @@ pub const Grave = struct {
         texture: *TextureRes,
         sampler: *SamplerRes,
         pipeline: *PipelineRes,
+        /// A pass's own, made for a colour target and a depth one.
+        framebuffer: vk.gen.types.Framebuffer,
     },
 };
 
@@ -367,6 +373,8 @@ pub const Vk = struct {
     lists: u32 = 0,
     has_work: bool = false,
     pass_format: vk.gen.types.Format = .undefined,
+    /// The open pass's depth attachment's format, `undefined` for none.
+    pass_depth: vk.gen.types.Format = .undefined,
     pass_extent: [2]u32 = .{ 0, 0 },
     current_pipeline: ?*PipelineRes = null,
     pipeline_dirty: bool = false,
@@ -598,6 +606,21 @@ fn caps(impl: backend.Impl) types.Caps {
             .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
         });
     }
+    // A depth format the device draws depth into, for 3D: not sampled.
+    for ([_]types.Format{ .depth16_unorm, .depth24_stencil8, .depth32_float, .depth32_float_stencil8 }) |format| {
+        var fp: vk.gen.types.FormatProperties = undefined;
+        vki.getPhysicalDeviceFormatProperties(self.runtime.physical_device, toVkFormat(format).?, &fp);
+        if (!fp.optimal_tiling_features.depth_stencil_attachment) continue;
+        answer.formats.set(format, .{
+            .sampled = false,
+            .filterable = false,
+            .render_target = true,
+            .blendable = false,
+            .generate_mips = false,
+            .sample_counts = 0b1,
+            .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
+        });
+    }
     return answer;
 }
 
@@ -686,6 +709,7 @@ fn free(self: *Vk, what: @FieldType(Grave, "what")) void {
         .texture => |res| resources.freeTexture(self, res),
         .sampler => |res| resources.freeSampler(self, res),
         .pipeline => |res| resources.freePipeline(self, res),
+        .framebuffer => |fb| self.runtime.vkd.destroyFramebuffer(self.runtime.device, fb, null),
     }
 }
 
@@ -848,15 +872,16 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
 }
 
 fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error!void {
-    if (pass.depth != null or pass.extra_colors.len > 0) return error.Unsupported;
-    const color = pass.color orelse return error.Unsupported;
-    const load = swapchain.mapLoadOp(color.load);
+    if (pass.extra_colors.len > 0) return error.Unsupported;
+    const depth_texture: ?*TextureRes = if (pass.depth) |depth| as(TextureRes, device.textures.get(depth.texture).?.native) else null;
+    const depth: swapchain.Depth = if (pass.depth) |held| .{ .format = depth_texture.?.vk_format, .load = swapchain.mapLoadOp(held.load) } else .none;
 
     var framebuffer: vk.gen.types.Framebuffer = .none;
     var render_pass: vk.gen.types.RenderPass = .none;
     var format: vk.gen.types.Format = .undefined;
     var extent: [2]u32 = undefined;
-    switch (color.target) {
+    var color_view: vk.gen.types.ImageView = .none;
+    if (pass.color) |color| switch (color.target) {
         .surface => |h| {
             const surface = as(SurfaceRes, device.surfaces.get(h).?.native);
             if (surface.acquired == null) {
@@ -870,36 +895,77 @@ fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error
                 if (try swapchain.acquire(self, surface, recordingSlot(self).acquires[self.acquired_count])) self.acquired_count += 1;
             }
             const index = surface.acquired.?;
+            const load = swapchain.mapLoadOp(color.load);
             // An image drawn into before is presentable; one that never was
             // has nothing in it to keep.
             const initial: vk.gen.types.ImageLayout = if (load == .load and surface.drawn[index]) .present_src_khr else .undefined;
             surface.drawn[index] = true;
-            render_pass = try swapchain.getRenderPass(self, surface.format, load, initial, .present_src_khr);
+            render_pass = try swapchain.getRenderPass(self, surface.format, load, initial, .present_src_khr, depth);
             framebuffer = surface.framebuffers[index];
+            color_view = surface.views[index];
             format = surface.format;
             extent = .{ surface.width, surface.height };
         },
         .texture => |h| {
             const texture = as(TextureRes, device.textures.get(h).?.native);
             if (texture.framebuffer == .none) return error.Unsupported;
+            const load = swapchain.mapLoadOp(color.load);
             const initial: vk.gen.types.ImageLayout = if (load == .load) .shader_read_only_optimal else .undefined;
-            render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .shader_read_only_optimal);
+            render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .shader_read_only_optimal, depth);
             framebuffer = texture.framebuffer;
+            color_view = texture.view;
             format = texture.vk_format;
             extent = .{ texture.width, texture.height };
         },
+    } else {
+        // Depth alone: a shadow map, a depth prepass.
+        render_pass = try swapchain.getRenderPass(self, .undefined, .dont_care, .undefined, .undefined, depth);
+        extent = .{ depth_texture.?.width, depth_texture.?.height };
     }
 
-    const clears = [_]vk.gen.types.ClearValue{.{ .color = .{ .float32 = color.clear_color } }};
+    // A pass with depth has a framebuffer of its own, of its colour view and
+    // its depth view, freed once the GPU is past this recording.
+    if (depth_texture) |held| {
+        var views: [2]vk.gen.types.ImageView = undefined;
+        var count: u32 = 0;
+        if (color_view != .none) {
+            views[count] = color_view;
+            count += 1;
+        }
+        views[count] = held.view;
+        count += 1;
+        framebuffer = .none;
+        _ = self.runtime.vkd.createFramebuffer(self.runtime.device, &.{
+            .render_pass = render_pass,
+            .attachment_count = count,
+            .attachments = &views,
+            .width = extent[0],
+            .height = extent[1],
+            .layers = 1,
+        }, null, &framebuffer).check() catch return error.Failed;
+        bury(self, .{ .framebuffer = framebuffer });
+    }
+
+    var clears: [2]vk.gen.types.ClearValue = undefined;
+    var clear_count: u32 = 0;
+    if (pass.color) |color| {
+        clears[clear_count] = .{ .color = .{ .float32 = color.clear_color } };
+        clear_count += 1;
+    }
+    if (pass.depth) |held| {
+        clears[clear_count] = .{ .depth_stencil = .{ .depth = held.clear_depth, .stencil = held.clear_stencil } };
+        clear_count += 1;
+    }
     self.runtime.vkd.cmdBeginRenderPass(self.command_buffer, &.{
         .render_pass = render_pass,
         .framebuffer = framebuffer,
         .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = extent[0], .height = extent[1] } },
-        .clear_value_count = clears.len,
+        .clear_value_count = clear_count,
         .clear_values = &clears,
     }, .@"inline");
     self.in_pass = true;
     self.pass_format = format;
+    self.pass_depth = depth.format;
     self.pass_extent = extent;
 
     // A pass begins covering the whole attachment, like every other
@@ -954,7 +1020,7 @@ fn setScissor(self: *Vk, maybe: ?types.Rect) void {
 fn prepareDraw(self: *Vk) types.Error!void {
     if (self.pipeline_dirty) {
         const res = self.current_pipeline orelse return error.InvalidArgument;
-        const pipeline = try resources.pipelineFor(self, res, self.pass_format);
+        const pipeline = try resources.pipelineFor(self, res, self.pass_format, self.pass_depth);
         self.runtime.vkd.cmdBindPipeline(self.command_buffer, .graphics, pipeline);
         self.pipeline_dirty = false;
     }
@@ -1230,16 +1296,79 @@ test "what is not here yet is refused as Unsupported" {
         .samples = 4,
         .usage = .{ .sampled = false, .render_target = true },
     }));
-    // A depth pipeline: not a `caps` rejection (`Device.createPipeline` has
-    // no caps check for it), but the backend's own - see
-    // `vulkan_resources.createPipeline`.
-    const shader = try device.createShader(.{ .spirv = .{ .vertex = triangle_vertex, .fragment = triangle_fragment } });
-    try testing.expectError(error.Unsupported, device.createPipeline(.{
+}
+
+test "a depth texture keeps what is nearer, whichever is drawn last, and a pass can write depth alone" {
+    var device = try openTestDevice();
+    defer device.deinit();
+
+    const shader = try device.createShader(.{ .spirv = .{ .vertex = shaded_vertex, .fragment = shaded_fragment } });
+    defer device.destroyShader(shader);
+    const attributes = [_]types.VertexAttribute{ .{ .location = 0, .format = .float3, .offset = 0 }, .{ .location = 1, .format = .float4, .offset = 12 } };
+    const pipeline = try device.createPipeline(.{
         .shader = shader,
-        .attributes = &.{},
-        .buffers = &.{},
+        .attributes = &attributes,
+        .buffers = &.{.{ .stride = 28 }},
+        .depth = .standard,
         .depth_format = .depth32_float,
-    }));
+    });
+    defer device.destroyPipeline(pipeline);
+    const only_depth = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &attributes,
+        .buffers = &.{.{ .stride = 28 }},
+        .depth = .standard,
+        .color_format = null,
+        .depth_format = .depth32_float,
+    });
+    defer device.destroyPipeline(only_depth);
+
+    // A triangle over the whole target, near and red; then one far and blue.
+    const corners = [_]f32{
+        -1, -1, 0.2, 1, 0, 0, 1, 3, -1, 0.2, 1, 0, 0, 1, -1, 3, 0.2, 1, 0, 0, 1,
+        -1, -1, 0.8, 0, 0, 1, 1, 3, -1, 0.8, 0, 0, 1, 1, -1, 3, 0.8, 0, 0, 1, 1,
+    };
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) });
+    defer device.destroyBuffer(buffer);
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    defer device.destroyTexture(target);
+    const depth = device.createTexture(.{ .width = 8, .height = 8, .format = .depth32_float, .usage = .{ .sampled = false, .render_target = true } }) catch |err| switch (err) {
+        // A device with no 32-bit float depth: every desktop one has it.
+        error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer device.destroyTexture(depth);
+
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } }, .depth = .{ .texture = depth } });
+    try cmd.setPipeline(pipeline);
+    try cmd.setVertexBuffer(0, buffer, 0);
+    try cmd.draw(.{ .vertex_count = 6 });
+    try cmd.endPass();
+    try device.submit();
+    {
+        const pixels = try device.readTexture(target, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, pixels[(4 * 8 + 4) * 4 ..][0..4]);
+    }
+
+    // The near triangle into the depth alone, kept; then the far one with
+    // colour, loading that depth: nothing passes, and the clear shows.
+    const pass = device.begin();
+    try pass.beginPass(.{ .depth = .{ .texture = depth } });
+    try pass.setPipeline(only_depth);
+    try pass.setVertexBuffer(0, buffer, 0);
+    try pass.draw(.{ .vertex_count = 3 });
+    try pass.endPass();
+    try pass.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 0, 1, 0, 1 } }, .depth = .{ .texture = depth, .load = .load } });
+    try pass.setPipeline(pipeline);
+    try pass.setVertexBuffer(0, buffer, 0);
+    try pass.draw(.{ .vertex_count = 3, .first_vertex = 3 });
+    try pass.endPass();
+    try device.submit();
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, pixels[(4 * 8 + 4) * 4 ..][0..4]);
 }
 
 // -------------------------------------------------------------------------
@@ -1329,4 +1458,52 @@ const triangle_fragment: []const u32 = blk: {
     break :blk header ++ cap ++ mem ++ entry ++ exec ++ dec ++
         g1 ++ g2 ++ g3 ++ g4 ++ g5 ++ g6 ++ g7 ++ g8 ++
         f1 ++ f2 ++ f3 ++ f4 ++ f5;
+};
+
+// A pair that draws something to look at, compiled from
+//
+//     layout(location = 0) in vec3 position;
+//     layout(location = 1) in vec4 color;
+//     layout(location = 0) out vec4 shade;
+//     void main() { gl_Position = vec4(position, 1); shade = color; }
+//
+// and a fragment stage that writes `shade`: the depth test's.
+const shaded_vertex: []const u32 = &.{
+    0x07230203, 0x00010000, 0x000d000b, 0x0000001f, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0009000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000012, 0x0000001b,
+    0x0000001d, 0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b, 0x00000000, 0x0000000b,
+    0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x0000000b, 0x00000001, 0x00050048, 0x0000000b,
+    0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000000b, 0x00000003, 0x0000000b, 0x00000004,
+    0x00040047, 0x00000012, 0x0000001e, 0x00000000, 0x00040047, 0x0000001b, 0x0000001e, 0x00000000,
+    0x00040047, 0x0000001d, 0x0000001e, 0x00000001, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+    0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004,
+    0x00040015, 0x00000008, 0x00000020, 0x00000000, 0x0004002b, 0x00000008, 0x00000009, 0x00000001,
+    0x0004001c, 0x0000000a, 0x00000006, 0x00000009, 0x0006001e, 0x0000000b, 0x00000007, 0x00000006,
+    0x0000000a, 0x0000000a, 0x00040020, 0x0000000c, 0x00000003, 0x0000000b, 0x0004003b, 0x0000000c,
+    0x0000000d, 0x00000003, 0x00040015, 0x0000000e, 0x00000020, 0x00000001, 0x0004002b, 0x0000000e,
+    0x0000000f, 0x00000000, 0x00040017, 0x00000010, 0x00000006, 0x00000003, 0x00040020, 0x00000011,
+    0x00000001, 0x00000010, 0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004002b, 0x00000006,
+    0x00000014, 0x3f800000, 0x00040020, 0x00000019, 0x00000003, 0x00000007, 0x0004003b, 0x00000019,
+    0x0000001b, 0x00000003, 0x00040020, 0x0000001c, 0x00000001, 0x00000007, 0x0004003b, 0x0000001c,
+    0x0000001d, 0x00000001, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
+    0x00000005, 0x0004003d, 0x00000010, 0x00000013, 0x00000012, 0x00050051, 0x00000006, 0x00000015,
+    0x00000013, 0x00000000, 0x00050051, 0x00000006, 0x00000016, 0x00000013, 0x00000001, 0x00050051,
+    0x00000006, 0x00000017, 0x00000013, 0x00000002, 0x00070050, 0x00000007, 0x00000018, 0x00000015,
+    0x00000016, 0x00000017, 0x00000014, 0x00050041, 0x00000019, 0x0000001a, 0x0000000d, 0x0000000f,
+    0x0003003e, 0x0000001a, 0x00000018, 0x0004003d, 0x00000007, 0x0000001e, 0x0000001d, 0x0003003e,
+    0x0000001b, 0x0000001e, 0x000100fd, 0x00010038,
+};
+
+const shaded_fragment: []const u32 = &.{
+    0x07230203, 0x00010000, 0x000d000b, 0x0000000d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000000b, 0x00030010,
+    0x00000004, 0x00000007, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047, 0x0000000b,
+    0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
+    0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00040020, 0x0000000a,
+    0x00000001, 0x00000007, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000001, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000007, 0x0000000c,
+    0x0000000b, 0x0003003e, 0x00000009, 0x0000000c, 0x000100fd, 0x00010038,
 };

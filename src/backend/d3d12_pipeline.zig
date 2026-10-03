@@ -250,19 +250,8 @@ pub const RasterizerDesc = extern struct {
 /// `D3D12_DEPTH_WRITE_MASK`.
 pub const DepthWriteMask = enum(u32) { zero = 0, all = 1 };
 
-/// `D3D12_COMPARISON_FUNC`, re-declared here rather than imported from
-/// `d3d12_resource.zig`: a pipeline state and a sampler both read the same
-/// eight values, and neither module needs the other for anything else.
-pub const ComparisonFunc = enum(u32) {
-    never = 1,
-    less = 2,
-    equal = 3,
-    less_equal = 4,
-    greater = 5,
-    not_equal = 6,
-    greater_equal = 7,
-    always = 8,
-};
+/// `D3D12_COMPARISON_FUNC`: the one a sampler compares with too.
+pub const ComparisonFunc = resource.ComparisonFunc;
 
 pub const StencilOp = enum(u32) { keep = 1, zero = 2, replace = 3, incr_sat = 4, decr_sat = 5, invert = 6, incr = 7, decr = 8 };
 

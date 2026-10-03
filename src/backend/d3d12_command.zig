@@ -225,7 +225,7 @@ pub const ID3D12GraphicsCommandList = extern struct {
         IASetVertexBuffers: *const fn (*ID3D12GraphicsCommandList, u32, u32, [*]const VertexBufferView) callconv(.winapi) void,
         SOSetTargets: *const anyopaque,
         OMSetRenderTargets: *const fn (*ID3D12GraphicsCommandList, u32, ?[*]const CpuDescriptorHandle, Bool, ?*const CpuDescriptorHandle) callconv(.winapi) void,
-        ClearDepthStencilView: *const anyopaque,
+        ClearDepthStencilView: *const fn (*ID3D12GraphicsCommandList, CpuDescriptorHandle, u32, f32, u8, u32, ?[*]const Rect) callconv(.winapi) void,
         ClearRenderTargetView: *const fn (*ID3D12GraphicsCommandList, CpuDescriptorHandle, *const [4]f32, u32, ?[*]const Rect) callconv(.winapi) void,
         ClearUnorderedAccessViewUint: *const anyopaque,
         ClearUnorderedAccessViewFloat: *const anyopaque,

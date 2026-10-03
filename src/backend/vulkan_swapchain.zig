@@ -327,7 +327,7 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
     _ = getImages(self.runtime.device, swapchain, &image_count_actual, &images_buf).check() catch return error.Failed;
     const images = images_buf[0..image_count_actual];
 
-    const render_pass = try getRenderPass(self, chosen_format, .clear, .undefined, .present_src_khr);
+    const render_pass = try getRenderPass(self, chosen_format, .clear, .undefined, .present_src_khr, .none);
 
     const views = try self.gpa.alloc(vk.gen.types.ImageView, images.len);
     errdefer self.gpa.free(views);
@@ -405,11 +405,22 @@ pub const RenderPassEntry = struct {
     load: vk.gen.types.AttachmentLoadOp,
     initial: vk.gen.types.ImageLayout,
     final: vk.gen.types.ImageLayout,
+    depth: Depth,
     pass: vk.gen.types.RenderPass,
 };
 
-/// The render pass for one `(format, load op, initial layout, final layout)`,
-/// making it the first time it is asked for. `vulkan.zig`'s
+/// A pass's depth attachment, if it has one: its format, and whether it is
+/// cleared or what an earlier pass wrote is kept. `undefined` is none.
+pub const Depth = struct {
+    format: vk.gen.types.Format = .undefined,
+    load: vk.gen.types.AttachmentLoadOp = .dont_care,
+
+    pub const none: Depth = .{};
+};
+
+/// The render pass for one `(format, load op, initial layout, final layout,
+/// depth)`, making it the first time it is asked for. A colour format of
+/// `undefined` is a pass that writes depth alone. `vulkan.zig`'s
 /// `Vk.render_passes` is the cache; this is the only function that reads or
 /// writes it.
 ///
@@ -424,10 +435,12 @@ pub fn getRenderPass(
     load: vk.gen.types.AttachmentLoadOp,
     initial: vk.gen.types.ImageLayout,
     final: vk.gen.types.ImageLayout,
+    depth: Depth,
 ) types.Error!vk.gen.types.RenderPass {
     for (self.render_passes) |maybe| {
         if (maybe) |entry| {
-            if (entry.format == format and entry.load == load and entry.initial == initial and entry.final == final) return entry.pass;
+            if (entry.format == format and entry.load == load and entry.initial == initial and entry.final == final and
+                entry.depth.format == depth.format and entry.depth.load == depth.load) return entry.pass;
         }
     }
 
@@ -440,21 +453,48 @@ pub fn getRenderPass(
     }
     const index = free_index orelse return error.OutOfMemory;
 
-    const attachment = [_]vk.gen.types.AttachmentDescription{.{
-        .format = format,
-        .samples = .{ .x1 = true },
-        .load_op = load,
-        .store_op = .store,
-        .stencil_load_op = .dont_care,
-        .stencil_store_op = .dont_care,
-        .initial_layout = initial,
-        .final_layout = final,
-    }};
+    // The colour attachment first, when there is one, and the depth after
+    // it: the order `beginPass` gives the views and the clear values in.
+    var attachments: [2]vk.gen.types.AttachmentDescription = undefined;
+    var count: u32 = 0;
+    const has_color = format != .undefined;
+    if (has_color) {
+        attachments[count] = .{
+            .format = format,
+            .samples = .{ .x1 = true },
+            .load_op = load,
+            .store_op = .store,
+            .stencil_load_op = .dont_care,
+            .stencil_store_op = .dont_care,
+            .initial_layout = initial,
+            .final_layout = final,
+        };
+        count += 1;
+    }
+    const depth_at = count;
+    if (depth.format != .undefined) {
+        const stencil = depth.format == .d24_unorm_s8_uint or depth.format == .d32_sfloat_s8_uint;
+        attachments[count] = .{
+            .format = depth.format,
+            .samples = .{ .x1 = true },
+            .load_op = depth.load,
+            .store_op = .store,
+            .stencil_load_op = if (stencil) depth.load else .dont_care,
+            .stencil_store_op = if (stencil) .store else .dont_care,
+            // Kept where depth is written between passes: cleared, what was
+            // there before does not matter.
+            .initial_layout = if (depth.load == .load) .depth_stencil_attachment_optimal else .undefined,
+            .final_layout = .depth_stencil_attachment_optimal,
+        };
+        count += 1;
+    }
     const color_ref = [_]vk.gen.types.AttachmentReference{.{ .attachment = 0, .layout = .color_attachment_optimal }};
+    const depth_ref: vk.gen.types.AttachmentReference = .{ .attachment = depth_at, .layout = .depth_stencil_attachment_optimal };
     const subpass = [_]vk.gen.types.SubpassDescription{.{
         .pipeline_bind_point = .graphics,
-        .color_attachment_count = color_ref.len,
-        .color_attachments = &color_ref,
+        .color_attachment_count = if (has_color) color_ref.len else 0,
+        .color_attachments = if (has_color) &color_ref else null,
+        .depth_stencil_attachment = if (depth.format != .undefined) &depth_ref else null,
     }};
 
     // The same two for every render pass, because two passes whose
@@ -464,35 +504,37 @@ pub fn getRenderPass(
     // semaphore gates COLOR_ATTACHMENT_OUTPUT, where the attachment's layout
     // transition is then tied rather than at TOP_OF_PIPE. Out of it: what it
     // wrote lands before a later pass loads it or a shader samples it.
+    // Depth is in both whether the pass has it or not, so that every pass
+    // has the same two and any one is compatible with any other.
     const dependencies = [_]vk.gen.types.SubpassDependency{
         .{
             .src_subpass = vk.gen.types.subpass_external,
             .dst_subpass = 0,
-            .src_stage_mask = .{ .fragment_shader = true, .color_attachment_output = true },
-            .dst_stage_mask = .{ .color_attachment_output = true },
-            .src_access_mask = .{ .color_attachment_write = true },
-            .dst_access_mask = .{ .color_attachment_read = true, .color_attachment_write = true },
+            .src_stage_mask = .{ .fragment_shader = true, .color_attachment_output = true, .late_fragment_tests = true },
+            .dst_stage_mask = .{ .color_attachment_output = true, .early_fragment_tests = true },
+            .src_access_mask = .{ .color_attachment_write = true, .depth_stencil_attachment_write = true },
+            .dst_access_mask = .{ .color_attachment_read = true, .color_attachment_write = true, .depth_stencil_attachment_read = true, .depth_stencil_attachment_write = true },
         },
         .{
             .src_subpass = 0,
             .dst_subpass = vk.gen.types.subpass_external,
-            .src_stage_mask = .{ .color_attachment_output = true },
-            .dst_stage_mask = .{ .fragment_shader = true, .color_attachment_output = true },
-            .src_access_mask = .{ .color_attachment_write = true },
-            .dst_access_mask = .{ .shader_read = true, .color_attachment_read = true, .color_attachment_write = true },
+            .src_stage_mask = .{ .color_attachment_output = true, .late_fragment_tests = true },
+            .dst_stage_mask = .{ .fragment_shader = true, .color_attachment_output = true, .early_fragment_tests = true },
+            .src_access_mask = .{ .color_attachment_write = true, .depth_stencil_attachment_write = true },
+            .dst_access_mask = .{ .shader_read = true, .color_attachment_read = true, .color_attachment_write = true, .depth_stencil_attachment_read = true, .depth_stencil_attachment_write = true },
         },
     };
 
     var render_pass: vk.gen.types.RenderPass = .none;
     _ = self.runtime.vkd.createRenderPass(self.runtime.device, &.{
-        .attachment_count = attachment.len,
-        .attachments = &attachment,
+        .attachment_count = count,
+        .attachments = &attachments,
         .subpass_count = subpass.len,
         .subpasses = &subpass,
         .dependency_count = dependencies.len,
         .dependencies = &dependencies,
     }, null, &render_pass).check() catch return error.Failed;
 
-    self.render_passes[index] = .{ .format = format, .load = load, .initial = initial, .final = final, .pass = render_pass };
+    self.render_passes[index] = .{ .format = format, .load = load, .initial = initial, .final = final, .depth = depth, .pass = render_pass };
     return render_pass;
 }

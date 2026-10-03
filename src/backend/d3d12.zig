@@ -102,6 +102,7 @@ const max_binding_slots = 4;
 const max_srv_descriptors = 4096;
 const max_sampler_descriptors = 256;
 const max_rtv_descriptors = 256;
+const max_dsv_descriptors = 64;
 /// The shader-visible rings, in descriptors: four for every draw whose
 /// textures changed, and four for every draw whose samplers did. A sampler
 /// heap that shaders see holds at most 2048.
@@ -294,6 +295,11 @@ const D3d = struct {
     rtv_heap: *rc.ID3D12DescriptorHeap,
     rtv_next: u32 = 0,
     rtv_free: std.ArrayListUnmanaged(u32) = .empty,
+    /// The same for a depth texture's depth-stencil view.
+    dsv_heap: *rc.ID3D12DescriptorHeap,
+    dsv_increment: u32,
+    dsv_next: u32 = 0,
+    dsv_free: std.ArrayListUnmanaged(u32) = .empty,
     /// What an empty slot of a table reads: a null SRV and a plain sampler,
     /// in the permanent heaps.
     null_srv: rc.CpuDescriptorHandle,
@@ -328,15 +334,25 @@ const D3d = struct {
     scissor: cmdmod.Rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 };
 
-/// What the pass that is open draws into.
+/// What the pass that is open draws into: a colour target, a depth one, or
+/// both.
 const Target = struct {
-    rtv: rc.CpuDescriptorHandle,
+    rtv: ?rc.CpuDescriptorHandle,
+    dsv: ?rc.CpuDescriptorHandle = null,
     width: u32,
     height: u32,
-    /// What it goes back to when the pass ends: the back buffer to
-    /// presenting, a texture to being sampled.
-    resource: *rc.ID3D12Resource,
+    /// What the colour target goes back to when the pass ends: the back
+    /// buffer to presenting, a texture to being sampled. A depth texture
+    /// stays where depth is written.
+    resource: ?*rc.ID3D12Resource,
     texture: ?*TextureRes,
+
+    fn bind(self: Target, list: *cmdmod.ID3D12GraphicsCommandList) void {
+        const count: u32 = if (self.rtv != null) 1 else 0;
+        const rtvs: ?[*]const rc.CpuDescriptorHandle = if (self.rtv) |*rtv| @ptrCast(rtv) else null;
+        const dsv: ?*const rc.CpuDescriptorHandle = if (self.dsv) |*held| held else null;
+        list.vtable.OMSetRenderTargets(list, count, rtvs, 0, dsv);
+    }
 };
 
 const VertexBinding = struct {
@@ -391,6 +407,9 @@ const TextureRes = struct {
     /// Its render target view, for a texture made to be drawn into.
     rtv_index: ?u32 = null,
     rtv_cpu: rc.CpuDescriptorHandle = .{},
+    /// Its depth-stencil view, for one of a depth format.
+    dsv_index: ?u32 = null,
+    dsv_cpu: rc.CpuDescriptorHandle = .{},
     /// Where it is now, as the recording that is open has left it: `sampled`
     /// between submits.
     state: rc.ResourceStates = sampled,
@@ -520,6 +539,8 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     errdefer _ = com.release(sampler_heap);
     const rtv_heap = rc.createDescriptorHeap(device, .{ .type = .rtv, .num_descriptors = max_rtv_descriptors }) catch return error.NoDevice;
     errdefer _ = com.release(rtv_heap);
+    const dsv_heap = rc.createDescriptorHeap(device, .{ .type = .dsv, .num_descriptors = max_dsv_descriptors }) catch return error.NoDevice;
+    errdefer _ = com.release(dsv_heap);
     const ring_srv_heap = rc.createDescriptorHeap(device, .{
         .type = .cbv_srv_uav,
         .num_descriptors = ring_srv_descriptors,
@@ -568,6 +589,8 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .sampler_heap = sampler_heap,
         .sampler_next = 1,
         .rtv_heap = rtv_heap,
+        .dsv_heap = dsv_heap,
+        .dsv_increment = rc.descriptorHandleIncrementSize(device, .dsv),
         .null_srv = null_srv,
         .plain_sampler = plain_sampler,
         .ring_srv_heap = ring_srv_heap,
@@ -641,6 +664,7 @@ fn deinit(impl: backend.Impl) void {
         self.ring_sampler_heap,
         self.ring_srv_heap,
         self.rtv_heap,
+        self.dsv_heap,
         self.sampler_heap,
         self.srv_heap,
         self.root_signature,
@@ -652,6 +676,7 @@ fn deinit(impl: backend.Impl) void {
     self.srv_free.deinit(self.gpa);
     self.sampler_free.deinit(self.gpa);
     self.rtv_free.deinit(self.gpa);
+    self.dsv_free.deinit(self.gpa);
     _ = com.release(self.factory);
     self.dxgi_library.unload();
     self.library.unload();
@@ -701,6 +726,12 @@ fn caps(impl: backend.Impl) types.Caps {
     answer.formats.set(.rgba8_unorm, support);
     answer.formats.set(.bgra8_unorm, support);
     answer.formats.set(.r8_unorm, support);
+    // A depth format is drawn into, not sampled: depth testing, for 3D.
+    var depth = support;
+    depth.sampled = false;
+    depth.filterable = false;
+    depth.blendable = false;
+    for ([_]types.Format{ .depth16_unorm, .depth24_stencil8, .depth32_float, .depth32_float_stencil8 }) |format| answer.formats.set(format, depth);
     return answer;
 }
 
@@ -709,6 +740,10 @@ fn textureFormat(format: types.Format) ?rc.Format {
         .rgba8_unorm => .r8g8b8a8_unorm,
         .bgra8_unorm => .b8g8r8a8_unorm,
         .r8_unorm => .r8_unorm,
+        .depth16_unorm => .d16_unorm,
+        .depth24_stencil8 => .d24_unorm_s8_uint,
+        .depth32_float => .d32_float,
+        .depth32_float_stencil8 => .d32_float_s8x24_uint,
         else => null,
     };
 }
@@ -772,6 +807,22 @@ fn freeRtv(self: *D3d, i: u32) void {
 
 fn rtvHandle(self: *D3d, i: u32) rc.CpuDescriptorHandle {
     return rc.cpuHeapStart(self.rtv_heap).offsetBy(i, self.rtv_increment);
+}
+
+fn allocDsv(self: *D3d) Error!u32 {
+    if (takeFree(&self.dsv_free)) |i| return i;
+    if (self.dsv_next >= max_dsv_descriptors) return error.Failed;
+    const i = self.dsv_next;
+    self.dsv_next += 1;
+    return i;
+}
+
+fn freeDsv(self: *D3d, i: u32) void {
+    self.dsv_free.append(self.gpa, i) catch {};
+}
+
+fn dsvHandle(self: *D3d, i: u32) rc.CpuDescriptorHandle {
+    return rc.cpuHeapStart(self.dsv_heap).offsetBy(i, self.dsv_increment);
 }
 
 // -------------------------------------------------------------------------
@@ -999,6 +1050,38 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     const res = try self.gpa.create(TextureRes);
     errdefer self.gpa.destroy(res);
 
+    // A depth texture is only ever drawn into: made where depth is written,
+    // with a depth-stencil view and a null shader resource view.
+    if (desc.format.isDepth()) {
+        const rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_depth_stencil = true, .deny_shader_resource = true });
+        const clear: rc.ClearValue = .depthStencil(format, 1, 0);
+        const writing: rc.ResourceStates = .{ .depth_write = true };
+        const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, writing, &clear) catch return error.Failed;
+        errdefer _ = com.release(obj);
+        const dsv = try allocDsv(self);
+        errdefer freeDsv(self, dsv);
+        const slot = try allocSrv(self);
+        const cpu = srvHandle(self, slot);
+        rc.createShaderResourceView(self.device, null, &.{
+            .format = .r8g8b8a8_unorm,
+            .dimension = .texture2d,
+            .u = .{ .texture2d = .{ .mip_levels = 1 } },
+        }, cpu);
+        res.* = .{
+            .resource = obj,
+            .width = desc.width,
+            .height = desc.height,
+            .format = desc.format,
+            .srv_index = slot,
+            .srv_cpu = cpu,
+            .dsv_index = dsv,
+            .dsv_cpu = dsvHandle(self, dsv),
+            .state = writing,
+        };
+        rc.createDepthStencilView(self.device, obj, res.dsv_cpu);
+        return res;
+    }
+
     const target = desc.usage.render_target;
     const rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_render_target = target });
     const clear: rc.ClearValue = .{ .format = format, .color = desc.clear_color };
@@ -1036,6 +1119,7 @@ fn destroyTexture(impl: backend.Impl, native: backend.Native) void {
     const res = as(TextureRes, native);
     freeSrv(self, res.srv_index);
     if (res.rtv_index) |rtv| freeRtv(self, rtv);
+    if (res.dsv_index) |dsv| freeDsv(self, dsv);
     bury(self, .{ .resource = res.resource });
     self.gpa.destroy(res);
 }
@@ -1326,8 +1410,8 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
     const self = cast(impl);
     const shader_res = as(ShaderRes, shader);
 
-    if (desc.depth_format != null or desc.extra_color_formats.len > 0 or desc.samples != 1) {
-        log.writeAll("fluxion-rhi: the Direct3D 12 backend's MVP has no depth, no extra colour attachments and no MSAA") catch {};
+    if (desc.extra_color_formats.len > 0 or desc.samples != 1) {
+        log.writeAll("fluxion-rhi: the Direct3D 12 backend has no extra colour attachments and no MSAA yet") catch {};
         return error.Unsupported;
     }
     if (desc.buffers.len > max_vertex_slots) {
@@ -1338,10 +1422,8 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
         log.print("fluxion-rhi: the Direct3D 12 backend takes at most {d} vertex attributes", .{max_attributes}) catch {};
         return error.PipelineFailed;
     }
-    const color_format = textureFormat(desc.color_format orelse {
-        log.writeAll("fluxion-rhi: the Direct3D 12 backend's MVP has no depth-only pass") catch {};
-        return error.Unsupported;
-    }) orelse return error.Unsupported;
+    const color_format: ?rc.Format = if (desc.color_format) |format| textureFormat(format) orelse return error.Unsupported else null;
+    const depth_format: rc.Format = if (desc.depth_format) |format| textureFormat(format) orelse return error.Unsupported else .unknown;
 
     var elements: [max_attributes]pl.InputElementDesc = undefined;
     for (desc.attributes, 0..) |attribute, i| {
@@ -1392,7 +1474,7 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
     };
 
     var rtv_formats: [8]rc.Format = @splat(.unknown);
-    rtv_formats[0] = color_format;
+    if (color_format) |format| rtv_formats[0] = format;
 
     const pso_desc: pl.GraphicsPipelineStateDesc = .{
         .root_signature = self.root_signature,
@@ -1400,14 +1482,19 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
         .ps = .of(shader_res.pixel),
         .blend_state = blend,
         .rasterizer_state = rasterizer,
-        .depth_stencil_state = .{},
+        .depth_stencil_state = .{
+            .depth_enable = if (desc.depth.test_enabled) 1 else 0,
+            .depth_write_mask = if (desc.depth.write) .all else .zero,
+            .depth_func = comparison(desc.depth.compare),
+        },
         .input_layout = .{
             .elements = if (desc.attributes.len == 0) null else &elements,
             .count = @intCast(desc.attributes.len),
         },
         .primitive_topology_type = topology_type,
-        .num_render_targets = 1,
+        .num_render_targets = if (color_format != null) 1 else 0,
         .rtv_formats = rtv_formats,
+        .dsv_format = depth_format,
         .sample = .{},
     };
 
@@ -1562,26 +1649,41 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
     for (list_cmds) |command| {
         switch (command) {
             .begin_pass => |pass| {
-                if (pass.depth != null or pass.extra_colors.len > 0) return error.Unsupported;
-                const color = pass.color orelse return error.Unsupported;
-                const target: Target = switch (color.target) {
-                    .surface => |h| blk: {
+                if (pass.extra_colors.len > 0) return error.Unsupported;
+                var target: Target = .{ .rtv = null, .width = 0, .height = 0, .resource = null, .texture = null };
+                if (pass.color) |color| switch (color.target) {
+                    .surface => |h| {
                         const surf = as(SurfaceRes, device.surfaces.get(h).?.native);
                         const idx = surf.swap_chain.vtable.GetCurrentBackBufferIndex(surf.swap_chain);
                         const to_rt = cmdmod.ResourceBarrier.transition(surf.back_buffers[idx], .{}, .{ .render_target = true });
                         cmd_list.vtable.ResourceBarrier(cmd_list, 1, &[_]cmdmod.ResourceBarrier{to_rt});
-                        break :blk .{ .rtv = surf.rtv_handles[idx], .width = surf.width, .height = surf.height, .resource = surf.back_buffers[idx], .texture = null };
+                        target = .{ .rtv = surf.rtv_handles[idx], .width = surf.width, .height = surf.height, .resource = surf.back_buffers[idx], .texture = null };
                     },
-                    .texture => |h| blk: {
+                    .texture => |h| {
                         const res = as(TextureRes, device.textures.get(h).?.native);
                         if (res.rtv_index == null) return error.Unsupported;
                         transition(self, res, .{ .render_target = true });
-                        break :blk .{ .rtv = res.rtv_cpu, .width = res.width, .height = res.height, .resource = res.resource, .texture = res };
+                        target = .{ .rtv = res.rtv_cpu, .width = res.width, .height = res.height, .resource = res.resource, .texture = res };
                     },
                 };
+                if (pass.depth) |depth| {
+                    const res = as(TextureRes, device.textures.get(depth.texture).?.native);
+                    const dsv = res.dsv_index orelse return error.Unsupported;
+                    transition(self, res, .{ .depth_write = true });
+                    target.dsv = dsvHandle(self, dsv);
+                    if (pass.color == null) {
+                        target.width = res.width;
+                        target.height = res.height;
+                    }
+                }
                 self.target = target;
-                cmd_list.vtable.OMSetRenderTargets(cmd_list, 1, @ptrCast(&target.rtv), 0, null);
-                if (color.load == .clear) cmd_list.vtable.ClearRenderTargetView(cmd_list, target.rtv, &color.clear_color, 0, null);
+                target.bind(cmd_list);
+                if (pass.color) |color| if (color.load == .clear) cmd_list.vtable.ClearRenderTargetView(cmd_list, target.rtv.?, &color.clear_color, 0, null);
+                if (pass.depth) |depth| if (depth.load == .clear) {
+                    const res = as(TextureRes, device.textures.get(depth.texture).?.native);
+                    const flags: u32 = if (res.format.hasStencil()) 0x3 else 0x1;
+                    cmd_list.vtable.ClearDepthStencilView(cmd_list, target.dsv.?, flags, depth.clear_depth, depth.clear_stencil, 0, null);
+                };
 
                 self.viewport = .{ .width = @floatFromInt(target.width), .height = @floatFromInt(target.height) };
                 self.scissor = .{ .left = 0, .top = 0, .right = @intCast(target.width), .bottom = @intCast(target.height) };
@@ -1688,8 +1790,8 @@ fn endTarget(self: *D3d) void {
     self.target = null;
     if (target.texture) |res| {
         transition(self, res, sampled);
-    } else {
-        const to_present = cmdmod.ResourceBarrier.transition(target.resource, .{ .render_target = true }, .{});
+    } else if (target.resource) |back_buffer| {
+        const to_present = cmdmod.ResourceBarrier.transition(back_buffer, .{ .render_target = true }, .{});
         self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{to_present});
     }
 }
@@ -1735,7 +1837,7 @@ fn restartRecording(self: *D3d) Error!void {
     for (self.used_buffers.items) |res| res.current.busy = self.fence_value + 1;
 
     const cmd_list = self.list;
-    if (self.target) |target| cmd_list.vtable.OMSetRenderTargets(cmd_list, 1, @ptrCast(&target.rtv), 0, null);
+    if (self.target) |target| target.bind(cmd_list);
     cmd_list.vtable.RSSetViewports(cmd_list, 1, &[_]cmdmod.Viewport{self.viewport});
     cmd_list.vtable.RSSetScissorRects(cmd_list, 1, &[_]cmdmod.Rect{self.scissor});
     if (self.current_pipeline) |p| {
@@ -1818,7 +1920,9 @@ test "caps: .d2 rgba8, bgra8 and r8, sampled and drawn into, one sample" {
     try testing.expectEqual(@as(u32, 1), c.limits.max_anisotropy);
     try testing.expect(c.features.sampler_border);
 
-    // Never claimed: a depth format, and a compressed one.
+    // A depth format is drawn into and not sampled; a compressed one is
+    // never claimed.
+    try testing.expect(c.formatSupport(.depth32_float).render_target);
     try testing.expect(!c.formatSupport(.depth32_float).sampled);
     try testing.expect(!c.formatSupport(.bc1_rgba_unorm).sampled);
 }
@@ -2145,9 +2249,87 @@ test "what is not here yet comes back as error.Unsupported" {
     // No multisampled render targets, and no chains of levels.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .samples = 4, .usage = .{ .sampled = false, .render_target = true } }));
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 2 }));
-    // No compressed or depth formats.
+    // No compressed formats, and no depth to sample.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .bc1_rgba_unorm }));
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .sampled = false, .render_target = true } }));
+    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .sampled = true, .render_target = true } }));
+}
+
+test "a depth texture keeps what is nearer, whichever is drawn last, and a pass can write depth alone" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    const vs =
+        \\struct In { float3 position : ATTR0; float4 color : ATTR1; };
+        \\struct Out { float4 position : SV_POSITION; float4 color : COLOR0; };
+        \\Out main(In i) { Out o; o.position = float4(i.position, 1); o.color = i.color; return o; }
+    ;
+    const ps =
+        \\struct In { float4 position : SV_POSITION; float4 color : COLOR0; };
+        \\float4 main(In i) : SV_TARGET { return i.color; }
+    ;
+    const shader = try device.createShader(.{ .hlsl = .{ .vertex = vs, .fragment = ps } });
+    defer device.destroyShader(shader);
+    const attributes = [_]types.VertexAttribute{ .{ .location = 0, .format = .float3, .offset = 0 }, .{ .location = 1, .format = .float4, .offset = 12 } };
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &attributes,
+        .buffers = &.{.{ .stride = 28 }},
+        .depth = .standard,
+        .depth_format = .depth32_float,
+    });
+    defer device.destroyPipeline(pipeline);
+    const only_depth = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &attributes,
+        .buffers = &.{.{ .stride = 28 }},
+        .depth = .standard,
+        .color_format = null,
+        .depth_format = .depth32_float,
+    });
+    defer device.destroyPipeline(only_depth);
+
+    // A triangle over the whole target, near and red; then one far and blue.
+    const corners = [_]f32{
+        -1, -1, 0.2, 1, 0, 0, 1, 3, -1, 0.2, 1, 0, 0, 1, -1, 3, 0.2, 1, 0, 0, 1,
+        -1, -1, 0.8, 0, 0, 1, 1, 3, -1, 0.8, 0, 0, 1, 1, -1, 3, 0.8, 0, 0, 1, 1,
+    };
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) });
+    defer device.destroyBuffer(buffer);
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    defer device.destroyTexture(target);
+    const depth = try device.createTexture(.{ .width = 8, .height = 8, .format = .depth32_float, .usage = .{ .sampled = false, .render_target = true } });
+    defer device.destroyTexture(depth);
+
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } }, .depth = .{ .texture = depth } });
+    try cmd.setPipeline(pipeline);
+    try cmd.setVertexBuffer(0, buffer, 0);
+    try cmd.draw(.{ .vertex_count = 6 });
+    try cmd.endPass();
+    try device.submit();
+    {
+        const pixels = try device.readTexture(target, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, texelAt(pixels, 8, 4, 4));
+    }
+
+    // The near triangle into the depth alone, kept; then the far one with
+    // colour, loading that depth: nothing passes, and the clear shows.
+    const pass = device.begin();
+    try pass.beginPass(.{ .depth = .{ .texture = depth } });
+    try pass.setPipeline(only_depth);
+    try pass.setVertexBuffer(0, buffer, 0);
+    try pass.draw(.{ .vertex_count = 3 });
+    try pass.endPass();
+    try pass.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 0, 1, 0, 1 } }, .depth = .{ .texture = depth, .load = .load } });
+    try pass.setPipeline(pipeline);
+    try pass.setVertexBuffer(0, buffer, 0);
+    try pass.draw(.{ .vertex_count = 3, .first_vertex = 3 });
+    try pass.endPass();
+    try device.submit();
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, texelAt(pixels, 8, 4, 4));
 }
 
 test "a surface with no window is refused" {
