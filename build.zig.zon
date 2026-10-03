@@ -28,8 +28,8 @@
         // dependencies of its own to fetch. Pinned to a commit that has the
         // calls the backend binds by slot with, and that names its glue.
         .fluxion_webgl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-webgl#228b85f17702d28660e3fa6745ad7fcb3faa32ee",
-            .hash = "fluxion_webgl-0.1.0-8yvbdRdVAwDPfmGZBp5vku1-TRr6fCwl5ka84zXvguxU",
+            .url = "git+https://github.com/kisstp2006/fluxion-webgl#dd60e818f34f8b150749da85518161c8c9d58de2",
+            .hash = "fluxion_webgl-0.1.0-8yvbdVhWAwCKJS79epMdvTYjXTk20DCy1Ot-YXwM91bx",
         },
         // `Clip`: which clip space a device wants, so a projection is built
         // for the backend that was actually opened.
