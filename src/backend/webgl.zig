@@ -36,9 +36,8 @@
 //!
 //! **What the binding cannot say, the caps do not claim.** `wire` lists what
 //! `fluxion-webgl` has no call for - `texImage3D` (so no volume and no array
-//! texture), `renderbufferStorageMultisample` and `blitFramebuffer` (so no
-//! multisampling), `drawBuffers` (so one colour attachment), the compressed
-//! upload calls, `samplerParameterf` - and the caps leave each of them out
+//! texture), `drawBuffers` (so one colour attachment), the compressed upload
+//! calls, `samplerParameterf` - and the caps leave each of them out
 //! rather than pretend. A test fails the day the binding grows one of them, as
 //! a reminder that a `false` there has become a task.
 //!
@@ -119,10 +118,7 @@ const wire = struct {
     /// `texture_2d_array` cannot be allocated, filled, or - having no
     /// `framebufferTextureLayer` either - drawn into.
     const layered = false;
-    /// `renderbufferStorageMultisample` and `blitFramebuffer`: a multisampled
-    /// target, and the resolve that ends a pass into it. `getInternalformatParameter`
-    /// would say how many samples a format has.
-    const multisample = false;
+    const multisample = true;
     /// `drawBuffers`: without it a framebuffer writes its first colour
     /// attachment and nothing else.
     const draw_buffers = false;
@@ -325,7 +321,7 @@ fn attachmentPoint(format: types.Format) Enum {
 /// What a device can do with a format WebGL 2 has, given whether a
 /// framebuffer around it turned out complete. Kept apart from the asking so
 /// the rules can be tested on answers the stub cannot give.
-fn supportFor(format: types.Format, native: Native, renders: bool) types.FormatSupport {
+fn supportFor(format: types.Format, native: Native, renders: bool, samples: u8) types.FormatSupport {
     if (format.isCompressed()) {
         // Sampled once its extension is on and there is a call to upload it
         // with; neither can be said yet. Never drawn into, never resampled.
@@ -340,13 +336,23 @@ fn supportFor(format: types.Format, native: Native, renders: bool) types.FormatS
         .blendable = renders and native.blend and !depth,
         // `generateMipmap` wants a format that is both drawable and filterable.
         .generate_mips = renders and native.filter and !depth,
-        .sample_counts = if (renders) single_sample else 0,
+        .sample_counts = if (renders) samples else 0,
     };
 }
 
-/// One sample: the only count a target can have while `wire.multisample` is
-/// false. Bit zero, as `FormatSupport.sample_counts` counts.
 const single_sample: u8 = 0b1;
+
+fn sampleCounts(gl: webgl.Context, native: Native) u8 {
+    if (!wire.multisample) return single_sample;
+    var values: [8]i32 = @splat(0);
+    var mask = single_sample;
+    for (gl.internalformatSamples(c.renderbuffer, native.internal, &values)) |value| {
+        if (value <= 1 or !std.math.isPowerOfTwo(value)) continue;
+        const bit = std.math.log2_int(u32, @intCast(value));
+        if (bit < 8) mask |= @as(u8, 1) << @intCast(bit);
+    }
+    return mask;
+}
 
 /// Whether a framebuffer around one texel of a format is complete. The
 /// context's own word on "can this be drawn into", which is right whatever
@@ -397,7 +403,7 @@ fn computeCaps(gl: webgl.Context) types.Caps {
     for (std.enums.values(types.Format)) |format| {
         const native = natives.get(format) orelse continue;
         const renders = !format.isCompressed() and probeRenderable(gl, format, native);
-        var support = supportFor(format, native, renders);
+        var support = supportFor(format, native, renders, if (renders) sampleCounts(gl, native) else 0);
         // No `texImage3D`: a format comes in no shape that needs it.
         if (!wire.layered and (support.sampled or support.render_target)) {
             support.dimensions.remove(.d3);
@@ -432,7 +438,10 @@ const WebGl = struct {
     /// whatever the pass or the read names, and it is emptied again after, so
     /// that a texture destroyed later is not kept alive by it.
     fbo: webgl.Framebuffer = .none,
+    resolve_fbo: webgl.Framebuffer = .none,
     attached: Attached = .{},
+    resolve: ?Resolve = null,
+    pass_size: [2]u32 = .{ 0, 0 },
 
     // Per-submit state. Reset at every pass.
     pipeline: ?*PipelineRes = null,
@@ -474,7 +483,8 @@ const BufferRes = struct {
 const max_tracked_images = 96;
 
 const TextureRes = struct {
-    texture: webgl.Texture,
+    texture: webgl.Texture = .none,
+    renderbuffer: webgl.Renderbuffer = .none,
     /// What it is bound to: `texture_2d`, or `texture_cube_map`.
     target: Enum,
     native: Native,
@@ -491,6 +501,11 @@ const TextureRes = struct {
     /// Whether a linear filter reads it, from the device's caps: a sampler
     /// that asks for one is given a nearest twin otherwise. See `samplerFor`.
     filterable: bool,
+};
+
+const Resolve = union(enum) {
+    surface,
+    texture: *TextureRes,
 };
 
 const SamplerRes = struct {
@@ -601,6 +616,7 @@ fn as(comptime T: type, native: backend.Native) *T {
 fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
     if (self.fbo != .none) self.gl.deleteFramebuffer(self.fbo);
+    if (self.resolve_fbo != .none) self.gl.deleteFramebuffer(self.resolve_fbo);
     self.gpa.destroy(self);
 }
 
@@ -764,18 +780,13 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     // a caller that did not ask first.
     const native = natives.get(desc.format) orelse return error.Unsupported;
     const target = dimension_targets.get(desc.dimension);
-    if (!targetUsable(target) or desc.samples != 1) return error.Unsupported;
+    if (!targetUsable(target)) return error.Unsupported;
     if (desc.format.isCompressed() and !wire.compressed_upload) return error.Unsupported;
 
     const res = try self.gpa.create(TextureRes);
     errdefer self.gpa.destroy(res);
 
-    const texture = gl.createTexture() catch return error.OutOfMemory;
-    errdefer gl.deleteTexture(texture);
-    gl.bindTexture(target, texture);
-
     res.* = .{
-        .texture = texture,
         .target = target,
         .native = native,
         .format = desc.format,
@@ -785,6 +796,21 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
         .levels = desc.mip_levels,
         .filterable = self.caps.formatSupport(desc.format).filterable,
     };
+
+    if (desc.samples > 1) {
+        const renderbuffer = gl.createRenderbuffer() catch return error.OutOfMemory;
+        errdefer gl.deleteRenderbuffer(renderbuffer);
+        gl.bindRenderbuffer(c.renderbuffer, renderbuffer);
+        gl.renderbufferStorageMultisample(c.renderbuffer, @intCast(desc.samples), native.internal, @intCast(desc.width), @intCast(desc.height));
+        gl.bindRenderbuffer(c.renderbuffer, .none);
+        res.renderbuffer = renderbuffer;
+        return res;
+    }
+
+    const texture = gl.createTexture() catch return error.OutOfMemory;
+    errdefer gl.deleteTexture(texture);
+    gl.bindTexture(target, texture);
+    res.texture = texture;
 
     const levels = desc.mip_levels;
     const pitch = desc.effectiveRowPitch();
@@ -813,7 +839,7 @@ fn destroyTexture(impl: backend.Impl, native: backend.Native) void {
     const res = as(TextureRes, native);
     // One left on the framebuffer by a pass that never ended would outlive it.
     detachPass(self);
-    self.gl.deleteTexture(res.texture);
+    if (res.renderbuffer != .none) self.gl.deleteRenderbuffer(res.renderbuffer) else self.gl.deleteTexture(res.texture);
     self.gpa.destroy(res);
 }
 
@@ -932,7 +958,15 @@ fn passFramebuffer(self: *WebGl) Error!webgl.Framebuffer {
 /// Attach one image of a texture to the framebuffer bound now, at the point
 /// its format goes to.
 fn attach(self: *WebGl, res: *const TextureRes, layer: u32, mip: u32) void {
-    self.gl.framebufferTexture2D(c.framebuffer, attachmentPoint(res.format), faceTarget(res.target, layer), res.texture, @intCast(mip));
+    attachTo(self.gl, c.framebuffer, res, layer, mip);
+}
+
+fn attachTo(gl: webgl.Context, target: Enum, res: *const TextureRes, layer: u32, mip: u32) void {
+    if (res.renderbuffer != .none) {
+        gl.framebufferRenderbuffer(target, attachmentPoint(res.format), c.renderbuffer, res.renderbuffer);
+    } else {
+        gl.framebufferTexture2D(target, attachmentPoint(res.format), faceTarget(res.target, layer), res.texture, @intCast(mip));
+    }
 }
 
 /// Empty the framebuffer of whatever a pass or a read put on it, and leave
@@ -943,8 +977,14 @@ fn detachPass(self: *WebGl) void {
     if (!self.attached.color and self.attached.depth == null) return;
     const gl = self.gl;
     gl.bindFramebuffer(c.framebuffer, self.fbo);
-    if (self.attached.color) gl.framebufferTexture2D(c.framebuffer, c.color_attachment0, c.texture_2d, .none, 0);
-    if (self.attached.depth) |point| gl.framebufferTexture2D(c.framebuffer, point, c.texture_2d, .none, 0);
+    if (self.attached.color) {
+        gl.framebufferTexture2D(c.framebuffer, c.color_attachment0, c.texture_2d, .none, 0);
+        gl.framebufferRenderbuffer(c.framebuffer, c.color_attachment0, c.renderbuffer, .none);
+    }
+    if (self.attached.depth) |point| {
+        gl.framebufferTexture2D(c.framebuffer, point, c.texture_2d, .none, 0);
+        gl.framebufferRenderbuffer(c.framebuffer, point, c.renderbuffer, .none);
+    }
     gl.bindFramebuffer(c.framebuffer, .none);
     self.attached = .{};
 }
@@ -1356,13 +1396,7 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
     for (list) |command| {
         switch (command) {
             .begin_pass => |pass| try beginPass(self, device, pass),
-            .end_pass => {
-                // The textures come off the framebuffer, and the canvas is
-                // what is bound again.
-                detachPass(self);
-                gl.bindFramebuffer(c.framebuffer, .none);
-                self.pipeline = null;
-            },
+            .end_pass => try endPass(self),
             .set_pipeline => |h| {
                 const res = as(PipelineRes, device.pipelines.get(h).?.native);
                 bindPipeline(self, res);
@@ -1436,12 +1470,12 @@ fn beginPass(self: *WebGl, device: *Device, pass: types.RenderPassDesc) Error!vo
     const gl = self.gl;
 
     // What the caps left out, for a caller that did not ask: one colour
-    // attachment, and no multisampled target to resolve.
+    // attachment.
     if (pass.extra_colors.len != 0) return error.Unsupported;
-    if (pass.color) |color| if (color.resolve != null) return error.Unsupported;
 
     // Whatever an earlier pass left on the framebuffer, if it never ended.
     detachPass(self);
+    self.resolve = null;
 
     var size: [2]u32 = .{ 0, 0 };
     const to_surface = if (pass.color) |color| color.target == .surface else false;
@@ -1463,6 +1497,10 @@ fn beginPass(self: *WebGl, device: *Device, pass: types.RenderPassDesc) Error!vo
             markDrawn(res, color.layer, color.mip_level);
             self.attached.color = true;
             size = levelExtent(res, color.mip_level);
+            if (color.resolve) |target| self.resolve = switch (target) {
+                .surface => .surface,
+                .texture => |handle| .{ .texture = textureOf(device, handle) },
+            };
         }
         if (pass.depth) |depth| {
             const res = textureOf(device, depth.texture);
@@ -1475,6 +1513,7 @@ fn beginPass(self: *WebGl, device: *Device, pass: types.RenderPassDesc) Error!vo
     }
     self.target_width = size[0];
     self.target_height = size[1];
+    self.pass_size = size;
     self.pipeline = null;
     self.bindings_dirty = true;
 
@@ -1499,6 +1538,41 @@ fn beginPass(self: *WebGl, device: *Device, pass: types.RenderPassDesc) Error!vo
         mask |= c.depth_buffer_bit | c.stencil_buffer_bit;
     };
     if (mask != 0) gl.clear(mask);
+}
+
+fn endPass(self: *WebGl) Error!void {
+    const gl = self.gl;
+    var resolve_attached = false;
+    defer {
+        if (resolve_attached) {
+            gl.bindFramebuffer(c.draw_framebuffer, self.resolve_fbo);
+            gl.framebufferTexture2D(c.draw_framebuffer, c.color_attachment0, c.texture_2d, .none, 0);
+            gl.framebufferRenderbuffer(c.draw_framebuffer, c.color_attachment0, c.renderbuffer, .none);
+        }
+        self.resolve = null;
+        detachPass(self);
+        gl.bindFramebuffer(c.framebuffer, .none);
+        self.pipeline = null;
+    }
+    if (self.resolve) |resolve| {
+        gl.bindFramebuffer(c.read_framebuffer, self.fbo);
+        switch (resolve) {
+            .surface => gl.bindFramebuffer(c.draw_framebuffer, .none),
+            .texture => |target| {
+                if (self.resolve_fbo == .none) self.resolve_fbo = gl.createFramebuffer() catch return error.OutOfMemory;
+                gl.bindFramebuffer(c.draw_framebuffer, self.resolve_fbo);
+                attachTo(gl, c.draw_framebuffer, target, 0, 0);
+                resolve_attached = true;
+                gl.checkFramebuffer(c.draw_framebuffer) catch return error.Failed;
+                markDrawn(target, 0, 0);
+            },
+        }
+        gl.disable(c.scissor_test);
+        const width: i32 = @intCast(self.pass_size[0]);
+        const height: i32 = @intCast(self.pass_size[1]);
+        gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, c.color_buffer_bit, c.nearest);
+        gl.enable(c.scissor_test);
+    }
 }
 
 fn bindPipeline(self: *WebGl, res: *PipelineRes) void {
@@ -2076,8 +2150,7 @@ test "the caps never claim a format the table cannot do, or a flag its rules do 
         if (support.filterable) try testing.expect(support.sampled);
         // A depth format is drawn into and read, never blended or resampled.
         if (format.isDepth()) try testing.expect(!support.blendable and !support.generate_mips);
-        // No multisampling in the binding, and none for what cannot be drawn into.
-        try testing.expect(support.sample_counts <= single_sample);
+        if (support.render_target) try testing.expect(support.supportsSamples(1));
         if (!support.render_target) try testing.expectEqual(@as(u8, 0), support.sample_counts);
         // Nothing compressed until there is a call to upload it with.
         if (format.isCompressed()) try testing.expectEqual(types.FormatSupport{}, support);
@@ -2102,33 +2175,33 @@ test "the stub's caps are what the context reports and what the binding lacks" {
     // The stub calls every framebuffer complete, so everything that can be
     // allocated can be drawn into.
     const rgba8 = answer.formatSupport(.rgba8_unorm);
-    try testing.expectEqual(types.FormatSupport{ .sampled = true, .filterable = true, .render_target = true, .blendable = true, .generate_mips = true, .sample_counts = 1, .dimensions = flat_dimensions }, rgba8);
+    try testing.expectEqual(types.FormatSupport{ .sampled = true, .filterable = true, .render_target = true, .blendable = true, .generate_mips = true, .sample_counts = 0b111, .dimensions = flat_dimensions }, rgba8);
     try testing.expectEqual(rgba8, answer.formatSupport(.bgra8_unorm_srgb));
     // 32-bit float reads and draws, is not filtered or blended, and so has no chain.
     try testing.expectEqual(
-        types.FormatSupport{ .sampled = true, .filterable = false, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 1, .dimensions = flat_dimensions },
+        types.FormatSupport{ .sampled = true, .filterable = false, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 0b111, .dimensions = flat_dimensions },
         answer.formatSupport(.rgba32_float),
     );
     // Half float filters and blends.
     try testing.expect(answer.formatSupport(.rgba16_float).filterable and answer.formatSupport(.rgba16_float).blendable);
     // Depth is drawn into and sampled, and not filtered.
     try testing.expectEqual(
-        types.FormatSupport{ .sampled = true, .filterable = false, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 1, .dimensions = flat_dimensions },
+        types.FormatSupport{ .sampled = true, .filterable = false, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 0b111, .dimensions = flat_dimensions },
         answer.formatSupport(.depth32_float),
     );
 }
 
 test "a format that does not draw is not claimed to, and takes its chain and its samples with it" {
     const float = natives.get(.rgba16_float).?;
-    const yes = supportFor(.rgba16_float, float, true);
-    const no = supportFor(.rgba16_float, float, false);
+    const yes = supportFor(.rgba16_float, float, true, 0b101);
+    const no = supportFor(.rgba16_float, float, false, 0);
     try testing.expect(yes.render_target and yes.blendable and yes.generate_mips);
-    try testing.expectEqual(single_sample, yes.sample_counts);
+    try testing.expectEqual(@as(u8, 0b101), yes.sample_counts);
     // Sampled and filtered all the same: that is the format's own.
     try testing.expectEqual(types.FormatSupport{ .sampled = true, .filterable = true }, no);
 
     // A compressed format is not until there is a call and an extension.
-    try testing.expectEqual(types.FormatSupport{}, supportFor(.bc7_rgba_unorm, natives.get(.bc7_rgba_unorm).?, false));
+    try testing.expectEqual(types.FormatSupport{}, supportFor(.bc7_rgba_unorm, natives.get(.bc7_rgba_unorm).?, false, 0));
 }
 
 test "what the binding lacks is what the caps leave out, until the binding grows it" {
@@ -2141,7 +2214,7 @@ test "what the binding lacks is what the caps leave out, until the binding grows
         .{ "framebufferTextureLayer", wire.layered },
         .{ "renderbufferStorageMultisample", wire.multisample },
         .{ "blitFramebuffer", wire.multisample },
-        .{ "getInternalformatParameter", wire.multisample },
+        .{ "getInternalformatSamples", wire.multisample },
         .{ "drawBuffers", wire.draw_buffers },
         .{ "compressedTexImage2D", wire.compressed_upload },
         .{ "compressedTexSubImage2D", wire.compressed_upload },
@@ -2370,10 +2443,6 @@ test "what the binding cannot do is refused before it is tried, and the reason i
     try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "shape") != null);
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d2_array, .width = 4, .height = 4, .depth_or_layers = 2 }));
     try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "shape") != null);
-
-    // No `renderbufferStorageMultisample`: nothing to resolve.
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 8, .height = 8, .samples = 4, .usage = .{ .sampled = false, .render_target = true } }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "multisample") != null);
 
     // No compressed upload.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 8, .height = 8, .format = .bc1_rgba_unorm }));
@@ -2691,9 +2760,9 @@ test "a pipeline for what the device cannot draw is refused, and says why" {
     defer device.deinit();
 
     const shader = try device.createShader(shader_desc);
-    // Four samples: there is no multisampled target.
-    try testing.expectError(error.PipelineFailed, device.createPipeline(.{ .shader = shader, .attributes = &.{}, .buffers = &.{}, .samples = 4 }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "4 samples") != null);
+    // Eight samples: the stub reports targets up to four.
+    try testing.expectError(error.PipelineFailed, device.createPipeline(.{ .shader = shader, .attributes = &.{}, .buffers = &.{}, .samples = 8 }));
+    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "8 samples") != null);
     // Two colours: there is one attachment.
     try testing.expectError(error.PipelineFailed, device.createPipeline(.{
         .shader = shader,

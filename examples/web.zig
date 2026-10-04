@@ -1283,16 +1283,17 @@ test "the 3D checks run, on what the stub says it can do, and leave nothing behi
     // The stub draws nothing, so what the checks find is not the point -
     // that they run through every call, without one being refused, is.
     try checkThreeD(&state);
-    // All that the checks made is gone, but for the framebuffer the first
-    // pass made, which the device keeps until it is closed.
-    try testing.expectEqual(baseline + 1, webgl.stub.state.live_objects);
+    // All that the checks made is gone, but for the pass and resolve
+    // framebuffers, which the device keeps until it is closed.
+    try testing.expectEqual(baseline + 2, webgl.stub.state.live_objects);
     // Four levels written, thirteen texels of uploads looked at, two of a chain made, three around a
     // pass into a level, six faces and the last level of each, four of a
     // depth pass and its sampling and two of a shadow sampler, three
-    // samplers, ten formats cleared and read and eight written in their own bytes - and four more the stub's caps
-    // rule out: a volume, an array, four samples, and a compressed format.
-    try testing.expectEqual(61, state.checks);
-    try testing.expectEqual(4, state.skipped);
+    // samplers, ten formats cleared and read and eight written in their own
+    // bytes - and three more the stub's caps rule out: a volume, an array,
+    // and a compressed format.
+    try testing.expectEqual(64, state.checks);
+    try testing.expectEqual(3, state.skipped);
 
     deinit();
     try testing.expectEqual(0, webgl.stub.state.live_objects);
