@@ -35,6 +35,7 @@ const backend = @import("../backend.zig");
 const vulkan = @import("vulkan.zig");
 const Vk = vulkan.Vk;
 const swapchain = @import("vulkan_swapchain.zig");
+const readback_texels = @import("readback.zig");
 
 fn as(comptime T: type, native: backend.Native) *T {
     return @ptrCast(@alignCast(native));
@@ -201,7 +202,10 @@ pub const TextureRes = struct {
     format: types.Format,
     vk_format: vk.gen.types.Format,
     /// For a texture made to be drawn into: the framebuffer a pass begins.
+    /// A multisampled one has none: each pass that resolves it makes its own.
     framebuffer: vk.gen.types.Framebuffer = .none,
+    /// Samples a pixel.
+    samples: u8 = 1,
 
     fn aspect(self: *const TextureRes) vk.gen.types.ImageAspectFlags {
         if (!self.format.isDepth()) return .{ .color = true };
@@ -213,12 +217,11 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     const self = vulkan.cast(impl);
     const vkd = self.runtime.vkd;
 
-    // `Device` already filters the dimension, the usage and the format
-    // through `caps`; a mip chain and multisampling are not caps, so they are
-    // refused here.
+    // `Device` already filters the dimension, the usage, the format and the
+    // samples through `caps`; a mip chain is not a cap, so it is refused here.
     if (desc.mip_levels != 1) return error.Unsupported;
-    if (desc.samples != 1) return error.Unsupported;
     const vk_format = vulkan.toVkFormat(desc.format) orelse return error.Unsupported;
+    const samples: u8 = @intCast(desc.samples);
 
     var image: vk.gen.types.Image = .none;
     _ = vkd.createImage(self.runtime.device, &.{
@@ -227,12 +230,14 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
         .extent = .{ .width = desc.width, .height = desc.height, .depth = 1 },
         .mip_levels = 1,
         .array_layers = 1,
-        .samples = .{ .x1 = true },
+        .samples = swapchain.sampleFlags(samples),
         .tiling = .optimal,
         // A depth texture is only drawn into, and kept for the passes that
-        // load it.
+        // load it; so is a multisampled one, resolved where it is read.
         .usage = if (desc.format.isDepth())
             .{ .depth_stencil_attachment = true }
+        else if (samples > 1)
+            .{ .color_attachment = true }
         else
             .{ .transfer_src = true, .transfer_dst = true, .sampled = true, .color_attachment = desc.usage.render_target },
         .sharing_mode = .exclusive,
@@ -255,7 +260,7 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
 
     const res = try self.gpa.create(TextureRes);
     errdefer self.gpa.destroy(res);
-    res.* = .{ .image = image, .memory = memory, .view = .none, .width = desc.width, .height = desc.height, .format = desc.format, .vk_format = vk_format };
+    res.* = .{ .image = image, .memory = memory, .view = .none, .width = desc.width, .height = desc.height, .format = desc.format, .vk_format = vk_format, .samples = samples };
 
     _ = vkd.createImageView(self.runtime.device, &.{
         .image = image,
@@ -277,8 +282,17 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
         return res;
     }
 
+    // Multisampled: into where colour is written, where every pass that
+    // draws into it leaves it.
+    if (samples > 1) {
+        try vulkan.ensureRecording(self);
+        barrier(self, image, .undefined, .color_attachment_optimal, .{}, .{ .color_attachment_write = true }, .{ .top_of_pipe = true }, .{ .color_attachment_output = true });
+        self.has_work = true;
+        return res;
+    }
+
     if (desc.usage.render_target) {
-        const render_pass = try swapchain.getRenderPass(self, vk_format, .clear, .undefined, .shader_read_only_optimal, .none);
+        const render_pass = try swapchain.getRenderPass(self, vk_format, .clear, .undefined, .shader_read_only_optimal, .none, 1, null);
         const attachments = [_]vk.gen.types.ImageView{view};
         _ = vkd.createFramebuffer(self.runtime.device, &.{
             .render_pass = render_pass,
@@ -404,7 +418,7 @@ pub fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subres
     _ = sub;
     const self = vulkan.cast(impl);
     const res = as(TextureRes, native);
-    const texel = res.format.rowBytes(1);
+    const decode = readback_texels.decodeOf(res.format) orelse return error.Unsupported;
     const row_bytes = res.format.rowBytes(res.width);
     const readback = try hostBuffer(self, row_bytes * res.height, .{ .transfer_dst = true }, .{ .host_cached = true });
     defer freeVersion(self, readback);
@@ -435,21 +449,8 @@ pub fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subres
     // The one wait a readback has: the bytes are wanted now.
     try vulkan.waitFor(self, self.submitted);
 
-    const out_row = @as(usize, res.width) * 4;
-    const pixels = try gpa.alloc(u8, out_row * res.height);
-    for (0..res.height) |y| {
-        const source = readback.mapped[y * row_bytes ..];
-        const destination = pixels[y * out_row ..][0..out_row];
-        for (0..res.width) |x| {
-            const at = source[x * texel ..];
-            destination[x * 4 ..][0..4].* = switch (res.format) {
-                .rgba8_unorm => at[0..4].*,
-                .bgra8_unorm => .{ at[2], at[1], at[0], at[3] },
-                .r8_unorm => .{ at[0], at[0], at[0], 255 },
-                else => unreachable,
-            };
-        }
-    }
+    const pixels = try gpa.alloc(u8, @as(usize, res.width) * 4 * res.height);
+    readback_texels.convert(res.format, decode, readback.mapped, row_bytes, res.width, res.height, pixels);
     return pixels;
 }
 
@@ -609,6 +610,8 @@ pub const PipelineRes = struct {
     front_face: vk.gen.types.FrontFace,
     blend: vk.gen.types.PipelineColorBlendAttachmentState,
     depth: types.DepthState,
+    /// Samples a pixel of the passes it draws in.
+    samples: u8,
     variants: [max_variants]?Variant = @splat(null),
 
     const Variant = struct { format: vk.gen.types.Format, depth: vk.gen.types.Format, pipeline: vk.gen.types.Pipeline };
@@ -619,10 +622,6 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
     const vkd = self.runtime.vkd;
     if (desc.extra_color_formats.len > 0) {
         log.writeAll("fluxion-rhi: the Vulkan backend has no multiple render targets yet") catch {};
-        return error.Unsupported;
-    }
-    if (desc.samples != 1) {
-        log.writeAll("fluxion-rhi: the Vulkan backend has no multisampling yet") catch {};
         return error.Unsupported;
     }
     const vk_format: vk.gen.types.Format = if (desc.color_format) |format| vulkan.toVkFormat(format) orelse return error.Unsupported else .undefined;
@@ -652,6 +651,7 @@ pub fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader_nativ
         },
         .front_face = if (desc.front_face == .ccw) .counter_clockwise else .clockwise,
         .depth = desc.depth,
+        .samples = @intCast(desc.samples),
         .blend = .{
             .blend_enable = if (desc.blend.enabled) vk.gen.types.vk_true else vk.gen.types.vk_false,
             .src_color_blend_factor = vkBlendFactor(desc.blend.src_rgb),
@@ -723,7 +723,7 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format, de
         .line_width = 1,
     };
     const multisample: vk.gen.types.PipelineMultisampleStateCreateInfo = .{
-        .rasterization_samples = .{ .x1 = true },
+        .rasterization_samples = swapchain.sampleFlags(res.samples),
         .sample_shading_enable = vk.gen.types.vk_false,
         .min_sample_shading = 0,
         .alpha_to_coverage_enable = vk.gen.types.vk_false,
@@ -755,10 +755,10 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format, de
         .dynamic_states = &dynamic_states,
     };
 
-    // Any render pass whose attachment has this format and one sample is
-    // compatible at `vkCmdBeginRenderPass` time; the load op and the layouts
-    // do not matter.
-    const render_pass = try swapchain.getRenderPass(self, format, .clear, .undefined, .shader_read_only_optimal, .{ .format = depth, .load = if (depth != .undefined) .clear else .dont_care });
+    // Any render pass whose attachments have these formats and this many
+    // samples is compatible at `vkCmdBeginRenderPass` time; the load op, the
+    // layouts and - with one subpass - a resolve do not matter.
+    const render_pass = try swapchain.getRenderPass(self, format, .clear, .undefined, if (res.samples > 1) .color_attachment_optimal else .shader_read_only_optimal, .{ .format = depth, .load = if (depth != .undefined) .clear else .dont_care }, res.samples, null);
 
     const stages = [_]vk.gen.types.PipelineShaderStageCreateInfo{
         .{ .stage = .{ .vertex = true }, .module = res.vertex, .name = "main" },

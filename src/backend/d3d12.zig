@@ -68,6 +68,7 @@ const d3d12 = d3d.d3d12;
 const rc = @import("d3d12_resource.zig");
 const cmdmod = @import("d3d12_command.zig");
 const pl = @import("d3d12_pipeline.zig");
+const readback = @import("readback.zig");
 const dxgi = d3d.dxgi;
 const Guid = d3d.Guid;
 const Hresult = d3d.Hresult;
@@ -92,9 +93,9 @@ comptime {
 
 const max_vertex_slots = 8;
 const max_attributes = 16;
-/// `t0`..`t3` and `s0`..`s3`: the width of the one descriptor table of each
-/// kind the shared root signature has.
-const max_binding_slots = 4;
+/// `b0`..`b7`, `t0`..`t7` and `s0`..`s7`: the root CBVs, and the width of
+/// the one descriptor table of each kind the shared root signature has.
+const max_binding_slots = 8;
 /// How many textures/samplers this device can have alive at once, and how
 /// many textures can be drawn into. A fixed heap size, because a descriptor
 /// heap cannot be resized - see the module comment on the permanent heaps
@@ -103,9 +104,9 @@ const max_srv_descriptors = 4096;
 const max_sampler_descriptors = 256;
 const max_rtv_descriptors = 256;
 const max_dsv_descriptors = 64;
-/// The shader-visible rings, in descriptors: four for every draw whose
-/// textures changed, and four for every draw whose samplers did. A sampler
-/// heap that shaders see holds at most 2048.
+/// The shader-visible rings, in descriptors: a table's worth for every draw
+/// whose textures changed, and one for every draw whose samplers did. A
+/// sampler heap that shaders see holds at most 2048.
 const ring_srv_descriptors = 65536;
 const ring_sampler_descriptors = 2048;
 
@@ -121,8 +122,8 @@ const slot_sampler_descriptors = ring_sampler_descriptors / ring_size;
 const max_lists = 64;
 
 const root_param_cbv0 = 0;
-const root_param_srv_table = 4;
-const root_param_sampler_table = 5;
+const root_param_srv_table = max_binding_slots;
+const root_param_sampler_table = max_binding_slots + 1;
 
 /// What a swap chain is made in, and the one format `createPipeline` accepts
 /// for `color_format`.
@@ -346,6 +347,8 @@ const Target = struct {
     /// stays where depth is written.
     resource: ?*rc.ID3D12Resource,
     texture: ?*TextureRes,
+    /// Where a multisampled colour target is resolved when the pass ends.
+    resolve: ?Resolve = null,
 
     fn bind(self: Target, list: *cmdmod.ID3D12GraphicsCommandList) void {
         const count: u32 = if (self.rtv != null) 1 else 0;
@@ -353,6 +356,13 @@ const Target = struct {
         const dsv: ?*const rc.CpuDescriptorHandle = if (self.dsv) |*held| held else null;
         list.vtable.OMSetRenderTargets(list, count, rtvs, 0, dsv);
     }
+};
+
+/// A target a pass's samples are averaged into: a texture, or a back buffer.
+const Resolve = struct {
+    texture: ?*TextureRes,
+    resource: *rc.ID3D12Resource,
+    format: rc.Format,
 };
 
 const VertexBinding = struct {
@@ -413,6 +423,8 @@ const TextureRes = struct {
     /// Where it is now, as the recording that is open has left it: `sampled`
     /// between submits.
     state: rc.ResourceStates = sampled,
+    /// Samples a pixel: more than one for a target a pass resolves.
+    samples: u32 = 1,
 };
 
 /// What a texture is between submits: readable by any stage, since the root
@@ -506,7 +518,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     const fence = rc.createFence(device, 0, rc.fence_flags_none) catch return error.NoDevice;
     errdefer _ = com.release(fence);
 
-    // The one root signature every pipeline shares: four root CBVs, one
+    // The one root signature every pipeline shares: a root CBV a slot, one
     // CBV_SRV_UAV table, one sampler table. `.all` visibility throughout,
     // matching the Direct3D 11 backend's own choice to bind every stage
     // rather than assume only the pixel shader samples.
@@ -516,14 +528,10 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     const sampler_ranges = [_]pl.DescriptorRange{
         .{ .range_type = .sampler, .num_descriptors = max_binding_slots, .base_shader_register = 0 },
     };
-    const root_params = [_]pl.RootParameter{
-        pl.RootParameter.cbv(0, .all),
-        pl.RootParameter.cbv(1, .all),
-        pl.RootParameter.cbv(2, .all),
-        pl.RootParameter.cbv(3, .all),
-        pl.RootParameter.table(&srv_ranges, .all),
-        pl.RootParameter.table(&sampler_ranges, .all),
-    };
+    var root_params: [max_binding_slots + 2]pl.RootParameter = undefined;
+    for (root_params[0..max_binding_slots], 0..) |*param, slot| param.* = pl.RootParameter.cbv(@intCast(slot), .all);
+    root_params[root_param_srv_table] = pl.RootParameter.table(&srv_ranges, .all);
+    root_params[root_param_sampler_table] = pl.RootParameter.table(&sampler_ranges, .all);
     const root_blob = pl.serializeGraphicsRootSignature(
         library,
         &root_params,
@@ -689,13 +697,64 @@ fn info(impl: backend.Impl) types.Info {
 }
 
 // -------------------------------------------------------------------------
-// Capabilities, as data. `.d2` only, one sample, one mip, `rgba8_unorm`,
-// `bgra8_unorm` and `r8_unorm`, each sampled and drawn into - `Device`
-// refuses everything this does not claim before this file is asked.
+// Capabilities. `.d2` only and one mip; of the uncompressed formats, what
+// the driver says it samples, filters, draws into, blends and multisamples -
+// `Device` refuses everything this does not claim before this file is
+// asked. Depth is drawn into, never sampled.
 // -------------------------------------------------------------------------
 
+/// `D3D12_FEATURE_DATA_FORMAT_SUPPORT`.
+const FormatSupportQuery = extern struct {
+    format: rc.Format,
+    support1: u32 = 0,
+    support2: u32 = 0,
+};
+
+/// `D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS`.
+const SampleQuery = extern struct {
+    format: rc.Format,
+    sample_count: u32,
+    flags: u32 = 0,
+    quality_levels: u32 = 0,
+};
+
+/// `D3D12_FORMAT_SUPPORT1`'s bits this file reads.
+const support_texture2d: u32 = 0x20;
+const support_shader_load: u32 = 0x80;
+const support_shader_sample: u32 = 0x100;
+const support_render_target: u32 = 0x4000;
+const support_blendable: u32 = 0x8000;
+const support_depth_stencil: u32 = 0x10000;
+const support_multisample_resolve: u32 = 0x40000;
+const support_multisample_render_target: u32 = 0x200000;
+
+/// The formats this file makes: every uncompressed one with a DXGI format.
+const offered = [_]types.Format{
+    .r8_unorm,      .rg8_unorm,        .rgba8_unorm,   .bgra8_unorm,
+    .r16_float,     .rg16_float,       .rgba16_float,  .r32_float,
+    .rg32_float,    .rgba32_float,     .rgb10a2_unorm, .rg11b10_float,
+    .depth16_unorm, .depth24_stencil8, .depth32_float, .depth32_float_stencil8,
+};
+
+/// What the device says it does with `format`: nothing, for a query it
+/// refuses.
+fn askFormat(device: *d3d12.ID3D12Device, format: rc.Format) u32 {
+    var query: FormatSupportQuery = .{ .format = format };
+    const result = device.vtable.CheckFeatureSupport(device, .format_support, &query, @sizeOf(FormatSupportQuery));
+    result.check() catch return 0;
+    return query.support1;
+}
+
+/// Whether `format` takes `count` samples a pixel.
+fn askSamples(device: *d3d12.ID3D12Device, format: rc.Format, count: u32) bool {
+    var query: SampleQuery = .{ .format = format, .sample_count = count };
+    const result = device.vtable.CheckFeatureSupport(device, .multisample_quality_levels, &query, @sizeOf(SampleQuery));
+    result.check() catch return false;
+    return query.quality_levels > 0;
+}
+
 fn caps(impl: backend.Impl) types.Caps {
-    _ = impl;
+    const self = cast(impl);
     var answer: types.Caps = .{
         .limits = .{
             .max_texture_2d = 16384,
@@ -710,28 +769,32 @@ fn caps(impl: backend.Impl) types.Caps {
         },
         .features = .{ .sampler_border = true, .sampler_lod_bias = true },
     };
-    const support: types.FormatSupport = .{
-        .sampled = true,
-        .filterable = true,
-        .render_target = true,
-        .blendable = true,
-        .generate_mips = false,
-        .sample_counts = 0b1,
-        .dimensions = blk: {
-            var set = std.EnumSet(types.Dimension).initEmpty();
-            set.insert(.d2);
-            break :blk set;
-        },
-    };
-    answer.formats.set(.rgba8_unorm, support);
-    answer.formats.set(.bgra8_unorm, support);
-    answer.formats.set(.r8_unorm, support);
-    // A depth format is drawn into, not sampled: depth testing, for 3D.
-    var depth = support;
-    depth.sampled = false;
-    depth.filterable = false;
-    depth.blendable = false;
-    for ([_]types.Format{ .depth16_unorm, .depth24_stencil8, .depth32_float, .depth32_float_stencil8 }) |format| answer.formats.set(format, depth);
+    var flat = std.EnumSet(types.Dimension).initEmpty();
+    flat.insert(.d2);
+    for (offered) |format| {
+        const native = textureFormat(format).?;
+        const bits = askFormat(self.device, native);
+        if (bits & support_texture2d == 0) continue;
+        const depth = format.isDepth();
+        const drawn = bits & (if (depth) support_depth_stencil else support_render_target) != 0;
+        var counts: u8 = 0b1;
+        // Several samples a pixel only where they can be drawn into, and a
+        // colour one resolved into one.
+        const multisampled = bits & support_multisample_render_target != 0 and (depth or bits & support_multisample_resolve != 0);
+        if (drawn and multisampled) for ([_]u32{ 2, 4, 8 }) |count| {
+            if (askSamples(self.device, native, count)) counts |= @as(u8, @intCast(count));
+        };
+        answer.formats.set(format, .{
+            // A depth texture is drawn into, not sampled: depth testing, for 3D.
+            .sampled = !depth and bits & (support_shader_load | support_shader_sample) != 0,
+            .filterable = !depth and bits & support_shader_sample != 0,
+            .render_target = drawn,
+            .blendable = !depth and bits & support_blendable != 0,
+            .generate_mips = false,
+            .sample_counts = counts,
+            .dimensions = flat,
+        });
+    }
     return answer;
 }
 
@@ -740,6 +803,15 @@ fn textureFormat(format: types.Format) ?rc.Format {
         .rgba8_unorm => .r8g8b8a8_unorm,
         .bgra8_unorm => .b8g8r8a8_unorm,
         .r8_unorm => .r8_unorm,
+        .rg8_unorm => .r8g8_unorm,
+        .r16_float => .r16_float,
+        .rg16_float => .r16g16_float,
+        .rgba16_float => .r16g16b16a16_float,
+        .r32_float => .r32_float,
+        .rg32_float => .r32g32_float,
+        .rgba32_float => .r32g32b32a32_float,
+        .rgb10a2_unorm => .r10g10b10a2_unorm,
+        .rg11b10_float => .r11g11b10_float,
         .depth16_unorm => .d16_unorm,
         .depth24_stencil8 => .d24_unorm_s8_uint,
         .depth32_float => .d32_float,
@@ -1044,7 +1116,7 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     const self = cast(impl);
     // `Device` has already checked `caps`, so this is defence in depth: a
     // shape or a format outside what `caps` claims never reaches here.
-    if (desc.dimension != .d2 or desc.samples != 1 or desc.mip_levels != 1) return error.Unsupported;
+    if (desc.dimension != .d2 or desc.mip_levels != 1) return error.Unsupported;
     const format = textureFormat(desc.format) orelse return error.Unsupported;
 
     const res = try self.gpa.create(TextureRes);
@@ -1053,7 +1125,8 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     // A depth texture is only ever drawn into: made where depth is written,
     // with a depth-stencil view and a null shader resource view.
     if (desc.format.isDepth()) {
-        const rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_depth_stencil = true, .deny_shader_resource = true });
+        var rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_depth_stencil = true, .deny_shader_resource = true });
+        rdesc.sample = .{ .count = desc.samples };
         const clear: rc.ClearValue = .depthStencil(format, 1, 0);
         const writing: rc.ResourceStates = .{ .depth_write = true };
         const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, writing, &clear) catch return error.Failed;
@@ -1077,27 +1150,31 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
             .dsv_index = dsv,
             .dsv_cpu = dsvHandle(self, dsv),
             .state = writing,
+            .samples = desc.samples,
         };
         rc.createDepthStencilView(self.device, obj, res.dsv_cpu);
         return res;
     }
 
     const target = desc.usage.render_target;
-    const rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_render_target = target });
+    var rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_render_target = target });
+    rdesc.sample = .{ .count = desc.samples };
     const clear: rc.ClearValue = .{ .format = format, .color = desc.clear_color };
     const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, sampled, if (target) &clear else null) catch return error.Failed;
     errdefer _ = com.release(obj);
 
+    // A multisampled texture is drawn into and resolved, never sampled: its
+    // shader resource view is the null one an empty slot reads.
     const slot = try allocSrv(self);
     errdefer freeSrv(self, slot);
     const cpu = srvHandle(self, slot);
-    rc.createShaderResourceView(self.device, obj, &.{
-        .format = format,
+    rc.createShaderResourceView(self.device, if (desc.samples == 1) obj else null, &.{
+        .format = if (desc.samples == 1) format else .r8g8b8a8_unorm,
         .dimension = .texture2d,
         .u = .{ .texture2d = .{ .mip_levels = 1 } },
     }, cpu);
 
-    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu };
+    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu, .samples = desc.samples };
     if (target) {
         const rtv = try allocRtv(self);
         res.rtv_index = rtv;
@@ -1185,16 +1262,17 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     _ = sub;
     const self = cast(impl);
     const res = as(TextureRes, native);
+    if (readback.decodeOf(res.format) == null) return error.Unsupported;
     const footprint = footprintOf(res, res.width, res.height);
     const size = @as(u64, footprint.footprint.row_pitch) * res.height;
 
-    const readback = try transferBuffer(self, .readback, size);
-    defer _ = com.release(readback);
+    const landing = try transferBuffer(self, .readback, size);
+    defer _ = com.release(landing);
 
     if (!self.recording) try beginRecording(self);
     errdefer abandonRecording(self);
     transition(self, res, .{ .copy_source = true });
-    const dst_loc = cmdmod.TextureCopyLocation.placed(readback, footprint);
+    const dst_loc = cmdmod.TextureCopyLocation.placed(landing, footprint);
     const src_loc = cmdmod.TextureCopyLocation.subresource(res.resource, 0);
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, 0, 0, 0, &src_loc, null);
     transition(self, res, sampled);
@@ -1204,25 +1282,12 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
 
     var mapped: ?*anyopaque = null;
     const everything: rc.Range = .{ .begin = 0, .end = @intCast(size) };
-    readback.vtable.Map(readback, 0, &everything, &mapped).check() catch return error.Failed;
-    defer readback.vtable.Unmap(readback, 0, &rc.Range.nothing_read);
+    landing.vtable.Map(landing, 0, &everything, &mapped).check() catch return error.Failed;
+    defer landing.vtable.Unmap(landing, 0, &rc.Range.nothing_read);
     const data: [*]const u8 = @ptrCast(mapped.?);
 
-    const out_row = @as(usize, res.width) * 4;
-    const pixels = try gpa.alloc(u8, out_row * res.height);
-    for (0..res.height) |y| {
-        const source = data[y * footprint.footprint.row_pitch ..];
-        const destination = pixels[y * out_row ..][0..out_row];
-        for (0..res.width) |x| {
-            const texel = destination[x * 4 ..][0..4];
-            switch (res.format) {
-                .rgba8_unorm => @memcpy(texel, source[x * 4 ..][0..4]),
-                .bgra8_unorm => texel.* = .{ source[x * 4 + 2], source[x * 4 + 1], source[x * 4], source[x * 4 + 3] },
-                .r8_unorm => texel.* = .{ source[x], source[x], source[x], 255 },
-                else => unreachable,
-            }
-        }
-    }
+    const pixels = try gpa.alloc(u8, @as(usize, res.width) * 4 * res.height);
+    readback.convert(res.format, readback.decodeOf(res.format).?, data, footprint.footprint.row_pitch, res.width, res.height, pixels);
     return pixels;
 }
 
@@ -1410,8 +1475,8 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
     const self = cast(impl);
     const shader_res = as(ShaderRes, shader);
 
-    if (desc.extra_color_formats.len > 0 or desc.samples != 1) {
-        log.writeAll("fluxion-rhi: the Direct3D 12 backend has no extra colour attachments and no MSAA yet") catch {};
+    if (desc.extra_color_formats.len > 0) {
+        log.writeAll("fluxion-rhi: the Direct3D 12 backend has no extra colour attachments yet") catch {};
         return error.Unsupported;
     }
     if (desc.buffers.len > max_vertex_slots) {
@@ -1495,7 +1560,7 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
         .num_render_targets = if (color_format != null) 1 else 0,
         .rtv_formats = rtv_formats,
         .dsv_format = depth_format,
-        .sample = .{},
+        .sample = .{ .count = desc.samples },
     };
 
     const pso = pl.createGraphicsPipelineState(self.device, &pso_desc) catch {
@@ -1666,6 +1731,20 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                         target = .{ .rtv = res.rtv_cpu, .width = res.width, .height = res.height, .resource = res.resource, .texture = res };
                     },
                 };
+                if (pass.color) |color| if (color.resolve) |into| {
+                    if (target.texture == null) return error.Unsupported;
+                    target.resolve = switch (into) {
+                        .surface => |h| blk: {
+                            const surf = as(SurfaceRes, device.surfaces.get(h).?.native);
+                            const idx = surf.swap_chain.vtable.GetCurrentBackBufferIndex(surf.swap_chain);
+                            break :blk .{ .texture = null, .resource = surf.back_buffers[idx], .format = surface_dxgi_format };
+                        },
+                        .texture => |h| blk: {
+                            const res = as(TextureRes, device.textures.get(h).?.native);
+                            break :blk .{ .texture = res, .resource = res.resource, .format = textureFormat(res.format).? };
+                        },
+                    };
+                };
                 if (pass.depth) |depth| {
                     const res = as(TextureRes, device.textures.get(depth.texture).?.native);
                     const dsv = res.dsv_index orelse return error.Unsupported;
@@ -1783,16 +1862,38 @@ fn setUpList(self: *D3d) void {
     self.list.vtable.SetDescriptorHeaps(self.list, heaps.len, &heaps);
 }
 
-/// End the pass that is open: its texture back to being sampled, or its back
-/// buffer back to being presented.
+/// End the pass that is open: its samples averaged into where it resolves,
+/// and its texture back to being sampled, or its back buffer back to being
+/// presented.
 fn endTarget(self: *D3d) void {
     const target = self.target orelse return;
     self.target = null;
+    if (target.resolve) |into| resolve(self, target.texture.?, into);
     if (target.texture) |res| {
         transition(self, res, sampled);
     } else if (target.resource) |back_buffer| {
         const to_present = cmdmod.ResourceBarrier.transition(back_buffer, .{ .render_target = true }, .{});
         self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{to_present});
+    }
+}
+
+/// A multisampled texture's samples averaged into `into`, which is left as
+/// it was found: a texture sampled, a back buffer presented.
+fn resolve(self: *D3d, source: *TextureRes, into: Resolve) void {
+    const list = self.list;
+    transition(self, source, .{ .resolve_source = true });
+    if (into.texture) |res| {
+        transition(self, res, .{ .resolve_dest = true });
+    } else {
+        const to_dest = cmdmod.ResourceBarrier.transition(into.resource, .{}, .{ .resolve_dest = true });
+        list.vtable.ResourceBarrier(list, 1, &[_]cmdmod.ResourceBarrier{to_dest});
+    }
+    list.vtable.ResolveSubresource(list, into.resource, 0, source.resource, 0, into.format);
+    if (into.texture) |res| {
+        transition(self, res, sampled);
+    } else {
+        const to_present = cmdmod.ResourceBarrier.transition(into.resource, .{ .resolve_dest = true }, .{});
+        list.vtable.ResourceBarrier(list, 1, &[_]cmdmod.ResourceBarrier{to_present});
     }
 }
 
@@ -1902,12 +2003,12 @@ test "opening on WARP, and what it reports" {
     try testing.expect(information.renderer.len > 0);
 }
 
-test "caps: .d2 rgba8, bgra8 and r8, sampled and drawn into, one sample" {
+test "caps: .d2 only; the driver's formats, floats too, sampled, drawn into and multisampled" {
     var device = try warpDevice();
     defer device.deinit();
 
     const c = device.caps();
-    for ([_]types.Format{ .rgba8_unorm, .bgra8_unorm, .r8_unorm }) |format| {
+    for ([_]types.Format{ .rgba8_unorm, .bgra8_unorm, .r8_unorm, .rgba16_float, .rg11b10_float, .rgba32_float }) |format| {
         const support = c.formatSupport(format);
         try testing.expect(support.sampled);
         try testing.expect(support.render_target);
@@ -1915,8 +2016,12 @@ test "caps: .d2 rgba8, bgra8 and r8, sampled and drawn into, one sample" {
         try testing.expect(!support.dimensions.contains(.cube));
         try testing.expect(!support.dimensions.contains(.d3));
         try testing.expect(support.supportsSamples(1));
-        try testing.expect(!support.supportsSamples(4));
     }
+    // What a renderer draws light into before it is toned down: filtered,
+    // blended and multisampled.
+    const hdr = c.formatSupport(.rgba16_float);
+    try testing.expect(hdr.filterable and hdr.blendable and hdr.supportsSamples(4));
+    try testing.expect(c.formatSupport(.depth32_float).supportsSamples(4));
     try testing.expectEqual(@as(u32, 1), c.limits.max_anisotropy);
     try testing.expect(c.features.sampler_border);
 
@@ -2246,12 +2351,165 @@ test "what is not here yet comes back as error.Unsupported" {
     // No cube, volume or array textures.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .cube, .width = 4, .height = 4 }));
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4 }));
-    // No multisampled render targets, and no chains of levels.
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .samples = 4, .usage = .{ .sampled = false, .render_target = true } }));
+    // No chains of levels.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 2 }));
     // No compressed formats, and no depth to sample.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .bc1_rgba_unorm }));
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .sampled = true, .render_target = true } }));
+}
+
+/// A triangle in one colour, at `samples` a pixel, with a depth test where
+/// `depth` is given.
+const Flat = struct {
+    shader: types.Shader,
+    pipeline: types.Pipeline,
+
+    const vs =
+        \\float4 main(float3 position : ATTR0) : SV_POSITION { return float4(position, 1); }
+    ;
+    const ps =
+        \\cbuffer Look : register(b0) { float4 colour; };
+        \\float4 main() : SV_TARGET { return colour; }
+    ;
+
+    fn init(device: *Device, samples: u32, format: types.Format, depth: ?types.Format) !Flat {
+        const shader = device.createShader(.{ .hlsl = .{ .vertex = vs, .fragment = ps } }) catch |err| {
+            std.debug.print("{s}\n", .{device.diagnostics()});
+            return err;
+        };
+        const pipeline = try device.createPipeline(.{
+            .shader = shader,
+            .attributes = &.{.{ .location = 0, .format = .float3, .offset = 0 }},
+            .buffers = &.{.{ .stride = 12 }},
+            .topology = .triangles,
+            .samples = samples,
+            .color_format = format,
+            .depth_format = depth,
+            .depth = if (depth != null) .{ .test_enabled = true, .write = true, .compare = .less } else .{},
+        });
+        return .{ .shader = shader, .pipeline = pipeline };
+    }
+};
+
+test "a float target keeps light over one, which a pass sampling it halves" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    // Cleared to more than white: two in red.
+    const bright = try device.createTexture(.{ .width = 4, .height = 4, .format = .rgba16_float, .usage = .{ .sampled = true, .render_target = true } });
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = bright }, .clear_color = .{ 2, 0.25, 0, 1 } } });
+    try cmd.endPass();
+    try device.submit();
+    const clamped = try device.readTexture(bright, testing.allocator);
+    defer testing.allocator.free(clamped);
+    try testing.expectEqual([4]u8{ 255, 64, 0, 255 }, texelAt(clamped, 4, 1, 1));
+
+    // Halved into another: one and an eighth, so the red was kept.
+    const halving =
+        \\Texture2D picture : register(t0);
+        \\SamplerState picture_sampler : register(s0);
+        \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET { return picture.Sample(picture_sampler, uv) * 0.5; }
+    ;
+    const shader = try device.createShader(.{ .hlsl = .{ .vertex = Quad.vs, .fragment = halving } });
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{.{ .location = 0, .format = .float2, .offset = 0 }},
+        .buffers = &.{.{ .stride = 8 }},
+        .topology = .triangle_strip,
+        .color_format = .rgba16_float,
+    });
+    const quad = try Quad.init(&device);
+    const half = try device.createTexture(.{ .width = 4, .height = 4, .format = .rgba16_float, .usage = .{ .sampled = true, .render_target = true } });
+    const sampler = try device.createSampler(.nearest);
+    const again = device.begin();
+    try again.beginPass(.{ .color = .{ .target = .{ .texture = half } } });
+    try again.setPipeline(pipeline);
+    try again.setVertexBuffer(0, quad.corners, 0);
+    try again.setTexture(0, bright, sampler);
+    try again.draw(.{ .vertex_count = 4 });
+    try again.endPass();
+    try device.submit();
+    const halved = try device.readTexture(half, testing.allocator);
+    defer testing.allocator.free(halved);
+    try testing.expectEqual([4]u8{ 255, 32, 0, 128 }, texelAt(halved, 4, 2, 2));
+}
+
+test "a multisampled target, with multisampled depth, is resolved into a texture at the end of the pass" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    const flat = try Flat.init(&device, 4, .rgba16_float, .depth32_float);
+    const msaa = try device.createTexture(.{ .width = 32, .height = 32, .format = .rgba16_float, .samples = 4, .usage = .{ .sampled = false, .render_target = true } });
+    const depth = try device.createTexture(.{ .width = 32, .height = 32, .format = .depth32_float, .samples = 4, .usage = .{ .sampled = false, .render_target = true } });
+    const resolved = try device.createTexture(.{ .width = 32, .height = 32, .format = .rgba16_float, .usage = .{ .sampled = true, .render_target = true } });
+
+    // A red triangle over blue, with slanted sides, so that some pixels are
+    // only partly covered.
+    const triangle = [_][3]f32{ .{ -0.8, -0.8, 0.5 }, .{ 0, 0.8, 0.5 }, .{ 0.8, -0.8, 0.5 } };
+    const corners = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(triangle)), .data = std.mem.asBytes(&triangle) });
+    const red = try device.createBuffer(.{ .kind = .uniform, .size = 16, .data = std.mem.asBytes(&[4]f32{ 1, 0, 0, 1 }) });
+    const cmd = device.begin();
+    try cmd.beginPass(.{
+        .color = .{ .target = .{ .texture = msaa }, .clear_color = .{ 0, 0, 1, 1 }, .resolve = .{ .texture = resolved } },
+        .depth = .{ .texture = depth },
+    });
+    try cmd.setPipeline(flat.pipeline);
+    try cmd.setUniformBuffer(0, red);
+    try cmd.setVertexBuffer(0, corners, 0);
+    try cmd.draw(.{ .vertex_count = 3 });
+    try cmd.endPass();
+    try device.submit();
+
+    const pixels = try device.readTexture(resolved, testing.allocator);
+    defer testing.allocator.free(pixels);
+    // Inside is red, outside blue, and the edge neither: its samples averaged.
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, texelAt(pixels, 32, 16, 20));
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, texelAt(pixels, 32, 1, 1));
+    var blended: usize = 0;
+    for (0..32 * 32) |i| {
+        const p = pixels[i * 4 ..][0..4];
+        if (p[0] > 0 and p[0] < 255 and p[2] > 0 and p[2] < 255) blended += 1;
+    }
+    try testing.expect(blended > 10);
+    // The multisampled texture itself is not read.
+    try testing.expectError(error.InvalidArgument, device.readTexture(msaa, testing.allocator));
+}
+
+test "the eighth slot of each kind is bound: a uniform buffer and a texture" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    const last =
+        \\cbuffer Look : register(b7) { float4 tint; };
+        \\Texture2D picture : register(t7);
+        \\SamplerState picture_sampler : register(s7);
+        \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET { return picture.Sample(picture_sampler, uv) * tint; }
+    ;
+    const shader = try device.createShader(.{ .hlsl = .{ .vertex = Quad.vs, .fragment = last } });
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{.{ .location = 0, .format = .float2, .offset = 0 }},
+        .buffers = &.{.{ .stride = 8 }},
+        .topology = .triangle_strip,
+    });
+    const quad = try Quad.init(&device);
+    const white = try device.createTexture(.{ .width = 1, .height = 1, .data = &.{ 255, 255, 255, 255 } });
+    const green = try device.createBuffer(.{ .kind = .uniform, .size = 16, .data = std.mem.asBytes(&[4]f32{ 0, 1, 0, 1 }) });
+    const target = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+    const sampler = try device.createSampler(.nearest);
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+    try cmd.setPipeline(pipeline);
+    try cmd.setVertexBuffer(0, quad.corners, 0);
+    try cmd.setUniformBuffer(7, green);
+    try cmd.setTexture(7, white, sampler);
+    try cmd.draw(.{ .vertex_count = 4 });
+    try cmd.endPass();
+    try device.submit();
+    const drawn = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(drawn);
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, texelAt(drawn, 4, 2, 2));
 }
 
 test "a depth texture keeps what is nearer, whichever is drawn last, and a pass can write depth alone" {

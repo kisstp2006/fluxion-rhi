@@ -197,7 +197,7 @@ pub const ID3D12GraphicsCommandList = extern struct {
         CopyTextureRegion: *const fn (*ID3D12GraphicsCommandList, *const TextureCopyLocation, u32, u32, u32, *const TextureCopyLocation, ?*const Box) callconv(.winapi) void,
         CopyResource: *const fn (*ID3D12GraphicsCommandList, *ID3D12Resource, *ID3D12Resource) callconv(.winapi) void,
         CopyTiles: *const anyopaque,
-        ResolveSubresource: *const anyopaque,
+        ResolveSubresource: *const fn (*ID3D12GraphicsCommandList, *ID3D12Resource, u32, *ID3D12Resource, u32, Format) callconv(.winapi) void,
         IASetPrimitiveTopology: *const fn (*ID3D12GraphicsCommandList, PrimitiveTopology) callconv(.winapi) void,
         RSSetViewports: *const fn (*ID3D12GraphicsCommandList, u32, [*]const Viewport) callconv(.winapi) void,
         RSSetScissorRects: *const fn (*ID3D12GraphicsCommandList, u32, [*]const Rect) callconv(.winapi) void,

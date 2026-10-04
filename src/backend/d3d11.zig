@@ -59,6 +59,7 @@ const types = @import("../types.zig");
 const backend = @import("../backend.zig");
 const commands = @import("../commands.zig");
 const Device = @import("../Device.zig");
+const readback = @import("readback.zig");
 
 const Error = backend.Error;
 
@@ -1156,7 +1157,7 @@ fn updateBuffer(impl: backend.Impl, native: backend.Native, offset: usize, bytes
 /// How a texel becomes RGBA8 in `readTexture`: one kernel for each way a texel
 /// can be packed, whatever the format is called. What a format has in each
 /// channel and how many channels it has is `types.Format.info`'s to say.
-const Decode = enum { unorm8, bgra8, float16, float32, rgb10a2, rg11b10_float };
+const Decode = readback.Decode;
 
 /// What Direct3D calls a `types.Format`.
 const Native = struct {
@@ -1380,121 +1381,6 @@ fn caps(impl: backend.Impl) types.Caps {
 }
 
 // -------------------------------------------------------------------------
-// Reading pixels back
-// -------------------------------------------------------------------------
-
-/// Reads the first `channels` values of a texel, in the order they are stored,
-/// each as eight bits.
-const Kernel = *const fn (texel: []const u8, channels: u8) [4]u8;
-
-const kernels = std.EnumArray(Decode, Kernel).init(.{
-    .unorm8 = decodeUnorm8,
-    .bgra8 = decodeBgra8,
-    .float16 = decodeFloat16,
-    .float32 = decodeFloat32,
-    .rgb10a2 = decodeRgb10a2,
-    .rg11b10_float = decodeRg11b10,
-});
-
-/// Which stored value goes to red, green, blue and alpha, for a format that has
-/// this many channels: one is grey, two are red and green, and a format that
-/// has no alpha is opaque.
-const Lane = enum { c0, c1, c2, c3, zero, one };
-const lanes = [_][4]Lane{
-    .{ .zero, .zero, .zero, .one }, // no channels: never asked
-    .{ .c0, .c0, .c0, .one },
-    .{ .c0, .c1, .zero, .one },
-    .{ .c0, .c1, .c2, .one },
-    .{ .c0, .c1, .c2, .c3 },
-};
-
-fn pick(lane: Lane, values: [4]u8) u8 {
-    return switch (lane) {
-        .zero => 0,
-        .one => 255,
-        .c0, .c1, .c2, .c3 => values[@intFromEnum(lane)],
-    };
-}
-
-fn unormFromFloat(value: f32) u8 {
-    // NaN is what `@max` drops, so it reads as zero.
-    return @intFromFloat(@round(@min(@max(value, 0), 1) * 255));
-}
-
-fn decodeUnorm8(texel: []const u8, channels: u8) [4]u8 {
-    var values: [4]u8 = @splat(0);
-    for (0..channels) |c| values[c] = texel[c];
-    return values;
-}
-
-fn decodeBgra8(texel: []const u8, channels: u8) [4]u8 {
-    var values = decodeUnorm8(texel, channels);
-    std.mem.swap(u8, &values[0], &values[2]);
-    return values;
-}
-
-fn decodeFloat16(texel: []const u8, channels: u8) [4]u8 {
-    var values: [4]u8 = @splat(0);
-    for (0..channels) |c| {
-        const half: f16 = @bitCast(std.mem.readInt(u16, texel[c * 2 ..][0..2], .little));
-        values[c] = unormFromFloat(half);
-    }
-    return values;
-}
-
-fn decodeFloat32(texel: []const u8, channels: u8) [4]u8 {
-    var values: [4]u8 = @splat(0);
-    for (0..channels) |c| {
-        const single: f32 = @bitCast(std.mem.readInt(u32, texel[c * 4 ..][0..4], .little));
-        values[c] = unormFromFloat(single);
-    }
-    return values;
-}
-
-fn decodeRgb10a2(texel: []const u8, channels: u8) [4]u8 {
-    _ = channels;
-    const packed_texel = std.mem.readInt(u32, texel[0..4], .little);
-    const ten_bit_max = (1 << 10) - 1;
-    const two_bit_max = (1 << 2) - 1;
-    var values: [4]u8 = undefined;
-    inline for (0..3) |c| {
-        const raw: u32 = (packed_texel >> (c * 10)) & ten_bit_max;
-        values[c] = @intCast((raw * 255 + ten_bit_max / 2) / ten_bit_max);
-    }
-    const alpha: u32 = packed_texel >> 30;
-    values[3] = @intCast((alpha * 255 + two_bit_max / 2) / two_bit_max);
-    return values;
-}
-
-/// The unsigned small floats of `R11G11B10_FLOAT`: five bits of exponent, biased
-/// by 15, and what is left is mantissa, with the special values IEEE gives them.
-fn smallFloat(bits: u32, comptime mantissa_bits: u5) f32 {
-    const exponent_bias = 15;
-    const exponent_all_ones = 31;
-    const exponent = bits >> mantissa_bits;
-    const mantissa: f32 = @floatFromInt(bits & ((1 << mantissa_bits) - 1));
-    const scale: f32 = @floatFromInt(@as(u32, 1) << mantissa_bits);
-    if (exponent == 0) return mantissa / scale * @exp2(@as(f32, 1 - exponent_bias));
-    if (exponent == exponent_all_ones) return if (mantissa == 0) std.math.inf(f32) else std.math.nan(f32);
-    return (1 + mantissa / scale) * @exp2(@as(f32, @floatFromInt(@as(i32, @intCast(exponent)) - exponent_bias)));
-}
-
-fn decodeRg11b10(texel: []const u8, channels: u8) [4]u8 {
-    _ = channels;
-    const packed_texel = std.mem.readInt(u32, texel[0..4], .little);
-    const red_and_green_bits = 11;
-    const red_mantissa = 6;
-    const blue_mantissa = 5;
-    const field = (1 << red_and_green_bits) - 1;
-    return .{
-        unormFromFloat(smallFloat(packed_texel & field, red_mantissa)),
-        unormFromFloat(smallFloat((packed_texel >> red_and_green_bits) & field, red_mantissa)),
-        unormFromFloat(smallFloat(packed_texel >> (2 * red_and_green_bits), blue_mantissa)),
-        0,
-    };
-}
-
-// -------------------------------------------------------------------------
 // Textures
 // -------------------------------------------------------------------------
 
@@ -1701,8 +1587,6 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     const context = self.context;
 
     const decode = res.native.decode orelse return error.Unsupported;
-    const kernel = kernels.get(decode);
-    const row = res.format.info();
     const width = types.mipExtent(res.width, sub.mip);
     const height = types.mipExtent(res.height, sub.mip);
 
@@ -1742,20 +1626,8 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     defer context.vtable.Unmap(context, staging, 0);
     const data = mapped.data orelse return error.Failed;
 
-    const texel: usize = row.block_bytes;
-    const out_row = @as(usize, width) * 4;
-    const pixels = try gpa.alloc(u8, out_row * height);
-    errdefer gpa.free(pixels);
-
-    const layout = lanes[row.channels];
-    for (0..height) |y| {
-        const source = data[y * mapped.row_pitch ..][0 .. width * texel];
-        const destination = pixels[y * out_row ..][0..out_row];
-        for (0..width) |x| {
-            const values = kernel(source[x * texel ..][0..texel], row.channels);
-            for (layout, 0..) |lane, i| destination[x * 4 + i] = pick(lane, values);
-        }
-    }
+    const pixels = try gpa.alloc(u8, @as(usize, width) * 4 * height);
+    readback.convert(res.format, decode, data, mapped.row_pitch, width, height, pixels);
     return pixels;
 }
 

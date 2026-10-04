@@ -145,6 +145,7 @@ test {
     _ = resources;
     _ = Device;
     _ = @import("backend/none.zig");
+    _ = @import("backend/readback.zig");
     _ = @import("backend/gl.zig");
     // Against `fluxion-webgl`'s stub, on whatever machine the tests run on.
     _ = @import("backend/webgl.zig");

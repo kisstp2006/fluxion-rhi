@@ -327,7 +327,7 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
     _ = getImages(self.runtime.device, swapchain, &image_count_actual, &images_buf).check() catch return error.Failed;
     const images = images_buf[0..image_count_actual];
 
-    const render_pass = try getRenderPass(self, chosen_format, .clear, .undefined, .present_src_khr, .none);
+    const render_pass = try getRenderPass(self, chosen_format, .clear, .undefined, .present_src_khr, .none, 1, null);
 
     const views = try self.gpa.alloc(vk.gen.types.ImageView, images.len);
     errdefer self.gpa.free(views);
@@ -406,6 +406,8 @@ pub const RenderPassEntry = struct {
     initial: vk.gen.types.ImageLayout,
     final: vk.gen.types.ImageLayout,
     depth: Depth,
+    samples: u8,
+    resolve: ?vk.gen.types.ImageLayout,
     pass: vk.gen.types.RenderPass,
 };
 
@@ -419,10 +421,12 @@ pub const Depth = struct {
 };
 
 /// The render pass for one `(format, load op, initial layout, final layout,
-/// depth)`, making it the first time it is asked for. A colour format of
-/// `undefined` is a pass that writes depth alone. `vulkan.zig`'s
-/// `Vk.render_passes` is the cache; this is the only function that reads or
-/// writes it.
+/// depth, samples, resolve)`, making it the first time it is asked for. A
+/// colour format of `undefined` is a pass that writes depth alone. With
+/// `resolve`, the colour attachment's samples are averaged at the end of the
+/// pass into a third, one sample of the same format, left in that layout.
+/// `vulkan.zig`'s `Vk.render_passes` is the cache; this is the only function
+/// that reads or writes it.
 ///
 /// A pass that ends in `shader_read_only_optimal` draws into a texture that
 /// is sampled after: its dependencies make the draws of this command buffer,
@@ -436,11 +440,14 @@ pub fn getRenderPass(
     initial: vk.gen.types.ImageLayout,
     final: vk.gen.types.ImageLayout,
     depth: Depth,
+    samples: u8,
+    resolve: ?vk.gen.types.ImageLayout,
 ) types.Error!vk.gen.types.RenderPass {
     for (self.render_passes) |maybe| {
         if (maybe) |entry| {
             if (entry.format == format and entry.load == load and entry.initial == initial and entry.final == final and
-                entry.depth.format == depth.format and entry.depth.load == depth.load) return entry.pass;
+                entry.depth.format == depth.format and entry.depth.load == depth.load and entry.samples == samples and
+                std.meta.eql(entry.resolve, resolve)) return entry.pass;
         }
     }
 
@@ -455,13 +462,14 @@ pub fn getRenderPass(
 
     // The colour attachment first, when there is one, and the depth after
     // it: the order `beginPass` gives the views and the clear values in.
-    var attachments: [2]vk.gen.types.AttachmentDescription = undefined;
+    var attachments: [3]vk.gen.types.AttachmentDescription = undefined;
     var count: u32 = 0;
     const has_color = format != .undefined;
+    const sample_flags = sampleFlags(samples);
     if (has_color) {
         attachments[count] = .{
             .format = format,
-            .samples = .{ .x1 = true },
+            .samples = sample_flags,
             .load_op = load,
             .store_op = .store,
             .stencil_load_op = .dont_care,
@@ -476,7 +484,7 @@ pub fn getRenderPass(
         const stencil = depth.format == .d24_unorm_s8_uint or depth.format == .d32_sfloat_s8_uint;
         attachments[count] = .{
             .format = depth.format,
-            .samples = .{ .x1 = true },
+            .samples = sample_flags,
             .load_op = depth.load,
             .store_op = .store,
             .stencil_load_op = if (stencil) depth.load else .dont_care,
@@ -488,12 +496,29 @@ pub fn getRenderPass(
         };
         count += 1;
     }
+    const resolve_at = count;
+    if (resolve) |left| {
+        attachments[count] = .{
+            .format = format,
+            .samples = .{ .x1 = true },
+            // Written whole by the resolve: what was there does not matter.
+            .load_op = .dont_care,
+            .store_op = .store,
+            .stencil_load_op = .dont_care,
+            .stencil_store_op = .dont_care,
+            .initial_layout = .undefined,
+            .final_layout = left,
+        };
+        count += 1;
+    }
     const color_ref = [_]vk.gen.types.AttachmentReference{.{ .attachment = 0, .layout = .color_attachment_optimal }};
     const depth_ref: vk.gen.types.AttachmentReference = .{ .attachment = depth_at, .layout = .depth_stencil_attachment_optimal };
+    const resolve_ref = [_]vk.gen.types.AttachmentReference{.{ .attachment = resolve_at, .layout = .color_attachment_optimal }};
     const subpass = [_]vk.gen.types.SubpassDescription{.{
         .pipeline_bind_point = .graphics,
         .color_attachment_count = if (has_color) color_ref.len else 0,
         .color_attachments = if (has_color) &color_ref else null,
+        .resolve_attachments = if (resolve != null) &resolve_ref else null,
         .depth_stencil_attachment = if (depth.format != .undefined) &depth_ref else null,
     }};
 
@@ -535,6 +560,16 @@ pub fn getRenderPass(
         .dependencies = &dependencies,
     }, null, &render_pass).check() catch return error.Failed;
 
-    self.render_passes[index] = .{ .format = format, .load = load, .initial = initial, .final = final, .depth = depth, .pass = render_pass };
+    self.render_passes[index] = .{ .format = format, .load = load, .initial = initial, .final = final, .depth = depth, .samples = samples, .resolve = resolve, .pass = render_pass };
     return render_pass;
+}
+
+/// Vulkan's flag for `count` samples a pixel: one, two, four or eight.
+pub fn sampleFlags(count: u8) vk.gen.types.SampleCountFlags {
+    return switch (count) {
+        2 => .{ .x2 = true },
+        4 => .{ .x4 = true },
+        8 => .{ .x8 = true },
+        else => .{ .x1 = true },
+    };
 }

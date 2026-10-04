@@ -83,10 +83,11 @@ pub const ShaderRes = resources.ShaderRes;
 pub const PipelineRes = resources.PipelineRes;
 pub const SurfaceRes = swapchain.SurfaceRes;
 
-/// `set 0`'s width: four uniform-buffer bindings.
-pub const uniform_slots = 4;
-/// `set 1`'s width: four combined-image-sampler bindings.
-pub const texture_slots = 4;
+/// `set 0`'s width: eight uniform-buffer bindings - within the twelve a
+/// stage is promised.
+pub const uniform_slots = 8;
+/// `set 1`'s width: eight combined-image-sampler bindings.
+pub const texture_slots = 8;
 
 /// How many `(uniform, texture)` descriptor set pairs one pool holds. A
 /// submit that changes its bindings more often than that takes another pool;
@@ -114,15 +115,24 @@ const max_lists = 64;
 // Format mapping
 // -------------------------------------------------------------------------
 
-/// The colour formats this backend makes textures and targets of -
-/// everything else is `null`, so `Device`'s caps-driven pre-validation (from
-/// `caps` below never marking another format `sampled`) is what actually
-/// keeps requests for the rest from ever reaching this backend.
+/// The formats this backend makes textures and targets of: the uncompressed
+/// ones. Everything else is `null`, so `Device`'s caps-driven pre-validation
+/// (from `caps` below never marking another format `sampled`) is what
+/// actually keeps requests for the rest from ever reaching this backend.
 pub fn toVkFormat(format: types.Format) ?vk.gen.types.Format {
     return switch (format) {
         .rgba8_unorm => .r8g8b8a8_unorm,
         .bgra8_unorm => .b8g8r8a8_unorm,
         .r8_unorm => .r8_unorm,
+        .rg8_unorm => .r8g8_unorm,
+        .r16_float => .r16_sfloat,
+        .rg16_float => .r16g16_sfloat,
+        .rgba16_float => .r16g16b16a16_sfloat,
+        .r32_float => .r32_sfloat,
+        .rg32_float => .r32g32_sfloat,
+        .rgba32_float => .r32g32b32a32_sfloat,
+        .rgb10a2_unorm => .a2b10g10r10_unorm_pack32,
+        .rg11b10_float => .b10g11r11_ufloat_pack32,
         .depth16_unorm => .d16_unorm,
         .depth24_stencil8 => .d24_unorm_s8_uint,
         .depth32_float => .d32_sfloat,
@@ -375,6 +385,8 @@ pub const Vk = struct {
     pass_format: vk.gen.types.Format = .undefined,
     /// The open pass's depth attachment's format, `undefined` for none.
     pass_depth: vk.gen.types.Format = .undefined,
+    /// The open pass's samples a pixel.
+    pass_samples: u8 = 1,
     pass_extent: [2]u32 = .{ 0, 0 },
     current_pipeline: ?*PipelineRes = null,
     pipeline_dirty: bool = false,
@@ -563,11 +575,12 @@ fn info(impl: backend.Impl) types.Info {
 // Capabilities
 // -------------------------------------------------------------------------
 
-/// `.d2`, one mip, one sample, `rgba8_unorm`, `bgra8_unorm` and `r8_unorm`,
-/// each as the device says it can be sampled, filtered, drawn into and
-/// blended. Every format not listed here defaults to `FormatSupport{}` -
-/// unsupported - so `Device`'s caps-driven pre-validation refuses the rest
-/// before this backend is ever asked.
+/// `.d2` and one mip; the uncompressed formats, each as the device says it
+/// can be sampled, filtered, drawn into and blended, and as many samples a
+/// pixel as its framebuffers take. Depth is drawn into, not sampled. Every
+/// format not listed here defaults to `FormatSupport{}` - unsupported - so
+/// `Device`'s caps-driven pre-validation refuses the rest before this backend
+/// is ever asked.
 fn caps(impl: backend.Impl) types.Caps {
     const self = cast(impl);
     const vki = self.runtime.vki;
@@ -591,18 +604,22 @@ fn caps(impl: backend.Impl) types.Caps {
         .features = .{ .sampler_border = true, .sampler_lod_bias = true },
     };
 
-    for ([_]types.Format{ .rgba8_unorm, .bgra8_unorm, .r8_unorm }) |format| {
+    // Bit n is 2^n samples, as `FormatSupport.sample_counts` counts them.
+    const color_counts: u8 = @truncate(@as(u32, @bitCast(limits.framebuffer_color_sample_counts)) & 0xF);
+    const depth_counts: u8 = @truncate(@as(u32, @bitCast(limits.framebuffer_depth_sample_counts)) & 0xF);
+    for ([_]types.Format{ .rgba8_unorm, .bgra8_unorm, .r8_unorm, .rg8_unorm, .r16_float, .rg16_float, .rgba16_float, .r32_float, .rg32_float, .rgba32_float, .rgb10a2_unorm, .rg11b10_float }) |format| {
         const vk_format = toVkFormat(format).?;
         var fp: vk.gen.types.FormatProperties = undefined;
         vki.getPhysicalDeviceFormatProperties(self.runtime.physical_device, vk_format, &fp);
         const feats = fp.optimal_tiling_features;
+        if (!feats.sampled_image) continue;
         answer.formats.set(format, .{
             .sampled = feats.sampled_image,
             .filterable = feats.sampled_image_filter_linear,
             .render_target = feats.color_attachment,
             .blendable = feats.color_attachment_blend,
             .generate_mips = false,
-            .sample_counts = 0b1,
+            .sample_counts = if (feats.color_attachment) color_counts | 1 else 0b1,
             .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
         });
     }
@@ -617,7 +634,7 @@ fn caps(impl: backend.Impl) types.Caps {
             .render_target = true,
             .blendable = false,
             .generate_mips = false,
-            .sample_counts = 0b1,
+            .sample_counts = depth_counts | 1,
             .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
         });
     }
@@ -871,6 +888,41 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
     if (self.lists >= max_lists) try finish(self);
 }
 
+/// Where a pass's samples are averaged into when it ends: a texture's view, or
+/// a swapchain image's, and the layout it is left in.
+const ResolveInto = struct {
+    view: vk.gen.types.ImageView,
+    final: vk.gen.types.ImageLayout,
+};
+
+/// The image of `surface` this recording draws into, acquired the first time
+/// it is asked for. Its index.
+fn surfaceImage(self: *Vk, surface: *SurfaceRes) types.Error!u32 {
+    if (surface.acquired == null) {
+        // What came before goes now: it has no need to wait for the image
+        // the acquire waits for.
+        if (self.has_work) {
+            try finish(self);
+            try record(self);
+        }
+        if (self.acquired_count >= max_surfaces_per_submit) return error.Unsupported;
+        if (try swapchain.acquire(self, surface, recordingSlot(self).acquires[self.acquired_count])) self.acquired_count += 1;
+    }
+    return surface.acquired.?;
+}
+
+fn resolveInto(self: *Vk, device: *Device, target: types.RenderTarget) types.Error!ResolveInto {
+    return switch (target) {
+        .surface => |h| blk: {
+            const surface = as(SurfaceRes, device.surfaces.get(h).?.native);
+            const index = try surfaceImage(self, surface);
+            surface.drawn[index] = true;
+            break :blk .{ .view = surface.views[index], .final = .present_src_khr };
+        },
+        .texture => |h| .{ .view = as(TextureRes, device.textures.get(h).?.native).view, .final = .shader_read_only_optimal },
+    };
+}
+
 fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error!void {
     if (pass.extra_colors.len > 0) return error.Unsupported;
     const depth_texture: ?*TextureRes = if (pass.depth) |depth| as(TextureRes, device.textures.get(depth.texture).?.native) else null;
@@ -881,26 +933,18 @@ fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error
     var format: vk.gen.types.Format = .undefined;
     var extent: [2]u32 = undefined;
     var color_view: vk.gen.types.ImageView = .none;
+    var samples: u8 = if (depth_texture) |held| held.samples else 1;
+    var resolve: ?ResolveInto = null;
     if (pass.color) |color| switch (color.target) {
         .surface => |h| {
             const surface = as(SurfaceRes, device.surfaces.get(h).?.native);
-            if (surface.acquired == null) {
-                // What came before goes now: it has no need to wait for the
-                // image the acquire waits for.
-                if (self.has_work) {
-                    try finish(self);
-                    try record(self);
-                }
-                if (self.acquired_count >= max_surfaces_per_submit) return error.Unsupported;
-                if (try swapchain.acquire(self, surface, recordingSlot(self).acquires[self.acquired_count])) self.acquired_count += 1;
-            }
-            const index = surface.acquired.?;
+            const index = try surfaceImage(self, surface);
             const load = swapchain.mapLoadOp(color.load);
             // An image drawn into before is presentable; one that never was
             // has nothing in it to keep.
             const initial: vk.gen.types.ImageLayout = if (load == .load and surface.drawn[index]) .present_src_khr else .undefined;
             surface.drawn[index] = true;
-            render_pass = try swapchain.getRenderPass(self, surface.format, load, initial, .present_src_khr, depth);
+            render_pass = try swapchain.getRenderPass(self, surface.format, load, initial, .present_src_khr, depth, 1, null);
             framebuffer = surface.framebuffers[index];
             color_view = surface.views[index];
             format = surface.format;
@@ -908,32 +952,50 @@ fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error
         },
         .texture => |h| {
             const texture = as(TextureRes, device.textures.get(h).?.native);
-            if (texture.framebuffer == .none) return error.Unsupported;
             const load = swapchain.mapLoadOp(color.load);
-            const initial: vk.gen.types.ImageLayout = if (load == .load) .shader_read_only_optimal else .undefined;
-            render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .shader_read_only_optimal, depth);
-            framebuffer = texture.framebuffer;
+            samples = texture.samples;
+            if (texture.samples > 1) {
+                // Drawn into and resolved, never sampled: it stays where
+                // colour is written, and its samples are averaged into the
+                // resolve target when the pass ends.
+                const into = color.resolve orelse return error.Unsupported;
+                resolve = try resolveInto(self, device, into);
+                const initial: vk.gen.types.ImageLayout = if (load == .load) .color_attachment_optimal else .undefined;
+                render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .color_attachment_optimal, depth, texture.samples, resolve.?.final);
+            } else {
+                if (texture.framebuffer == .none or color.resolve != null) return error.Unsupported;
+                const initial: vk.gen.types.ImageLayout = if (load == .load) .shader_read_only_optimal else .undefined;
+                render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .shader_read_only_optimal, depth, 1, null);
+                framebuffer = texture.framebuffer;
+            }
             color_view = texture.view;
             format = texture.vk_format;
             extent = .{ texture.width, texture.height };
         },
     } else {
         // Depth alone: a shadow map, a depth prepass.
-        render_pass = try swapchain.getRenderPass(self, .undefined, .dont_care, .undefined, .undefined, depth);
+        render_pass = try swapchain.getRenderPass(self, .undefined, .dont_care, .undefined, .undefined, depth, samples, null);
         extent = .{ depth_texture.?.width, depth_texture.?.height };
     }
 
-    // A pass with depth has a framebuffer of its own, of its colour view and
-    // its depth view, freed once the GPU is past this recording.
-    if (depth_texture) |held| {
-        var views: [2]vk.gen.types.ImageView = undefined;
+    // A pass with depth, or one that resolves, has a framebuffer of its own:
+    // its colour view, its depth view and the view it resolves into, freed
+    // once the GPU is past this recording.
+    if (depth_texture != null or resolve != null) {
+        var views: [3]vk.gen.types.ImageView = undefined;
         var count: u32 = 0;
         if (color_view != .none) {
             views[count] = color_view;
             count += 1;
         }
-        views[count] = held.view;
-        count += 1;
+        if (depth_texture) |held| {
+            views[count] = held.view;
+            count += 1;
+        }
+        if (resolve) |into| {
+            views[count] = into.view;
+            count += 1;
+        }
         framebuffer = .none;
         _ = self.runtime.vkd.createFramebuffer(self.runtime.device, &.{
             .render_pass = render_pass,
@@ -966,6 +1028,7 @@ fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error
     self.in_pass = true;
     self.pass_format = format;
     self.pass_depth = depth.format;
+    self.pass_samples = samples;
     self.pass_extent = extent;
 
     // A pass begins covering the whole attachment, like every other
@@ -1020,6 +1083,7 @@ fn setScissor(self: *Vk, maybe: ?types.Rect) void {
 fn prepareDraw(self: *Vk) types.Error!void {
     if (self.pipeline_dirty) {
         const res = self.current_pipeline orelse return error.InvalidArgument;
+        if (res.samples != self.pass_samples) return error.InvalidArgument;
         const pipeline = try resources.pipelineFor(self, res, self.pass_format, self.pass_depth);
         self.runtime.vkd.cmdBindPipeline(self.command_buffer, .graphics, pipeline);
         self.pipeline_dirty = false;
@@ -1289,13 +1353,8 @@ test "what is not here yet is refused as Unsupported" {
         .width = 4,
         .height = 4,
     }));
-    // Multisampling.
-    try testing.expectError(error.Unsupported, device.createTexture(.{
-        .width = 4,
-        .height = 4,
-        .samples = 4,
-        .usage = .{ .sampled = false, .render_target = true },
-    }));
+    // A chain of levels.
+    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 2 }));
 }
 
 test "a depth texture keeps what is nearer, whichever is drawn last, and a pass can write depth alone" {
@@ -1369,6 +1428,81 @@ test "a depth texture keeps what is nearer, whichever is drawn last, and a pass 
     const pixels = try device.readTexture(target, testing.allocator);
     defer testing.allocator.free(pixels);
     try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, pixels[(4 * 8 + 4) * 4 ..][0..4]);
+}
+
+test "a float target keeps light over one, read back clamped" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    if (!device.caps().formatSupport(.rgba16_float).render_target) return error.SkipZigTest;
+
+    const bright = try device.createTexture(.{ .width = 4, .height = 4, .format = .rgba16_float, .usage = .{ .sampled = true, .render_target = true } });
+    defer device.destroyTexture(bright);
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = bright }, .clear_color = .{ 2, 0.25, 0, 1 } } });
+    try cmd.endPass();
+    try device.submit();
+    const pixels = try device.readTexture(bright, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqualSlices(u8, &.{ 255, 64, 0, 255 }, pixels[(1 * 4 + 1) * 4 ..][0..4]);
+}
+
+test "a multisampled target, with multisampled depth, is resolved into a texture at the end of the pass" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    const c = device.caps();
+    if (!c.formatSupport(.rgba16_float).supportsSamples(4) or !c.formatSupport(.depth32_float).supportsSamples(4)) return error.SkipZigTest;
+
+    const shader = try device.createShader(.{ .spirv = .{ .vertex = shaded_vertex, .fragment = shaded_fragment } });
+    defer device.destroyShader(shader);
+    const attributes = [_]types.VertexAttribute{ .{ .location = 0, .format = .float3, .offset = 0 }, .{ .location = 1, .format = .float4, .offset = 12 } };
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &attributes,
+        .buffers = &.{.{ .stride = 28 }},
+        .depth = .standard,
+        .color_format = .rgba16_float,
+        .depth_format = .depth32_float,
+        .samples = 4,
+    });
+    defer device.destroyPipeline(pipeline);
+
+    // A red triangle over blue, with slanted sides, so that some pixels are
+    // only partly covered.
+    const corners = [_]f32{ -0.8, -0.8, 0.5, 1, 0, 0, 1, 0.8, -0.8, 0.5, 1, 0, 0, 1, 0, 0.8, 0.5, 1, 0, 0, 1 };
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) });
+    defer device.destroyBuffer(buffer);
+    const msaa = try device.createTexture(.{ .width = 32, .height = 32, .format = .rgba16_float, .samples = 4, .usage = .{ .sampled = false, .render_target = true } });
+    defer device.destroyTexture(msaa);
+    const depth = try device.createTexture(.{ .width = 32, .height = 32, .format = .depth32_float, .samples = 4, .usage = .{ .sampled = false, .render_target = true } });
+    defer device.destroyTexture(depth);
+    const resolved = try device.createTexture(.{ .width = 32, .height = 32, .format = .rgba16_float, .usage = .{ .sampled = true, .render_target = true } });
+    defer device.destroyTexture(resolved);
+
+    // Twice: a second pass loads what the first left, and resolves again.
+    for (0..2) |round| {
+        const cmd = device.begin();
+        try cmd.beginPass(.{
+            .color = .{ .target = .{ .texture = msaa }, .clear_color = .{ 0, 0, 1, 1 }, .load = if (round == 0) .clear else .load, .resolve = .{ .texture = resolved } },
+            .depth = .{ .texture = depth },
+        });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, buffer, 0);
+        try cmd.draw(.{ .vertex_count = 3 });
+        try cmd.endPass();
+        try device.submit();
+    }
+
+    const pixels = try device.readTexture(resolved, testing.allocator);
+    defer testing.allocator.free(pixels);
+    // Inside is red, outside blue, and the edge neither: its samples averaged.
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, pixels[(16 * 32 + 16) * 4 ..][0..4]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, pixels[(1 * 32 + 1) * 4 ..][0..4]);
+    var blended: usize = 0;
+    for (0..32 * 32) |i| {
+        const pixel = pixels[i * 4 ..][0..4];
+        if (pixel[0] > 0 and pixel[0] < 255 and pixel[2] > 0 and pixel[2] < 255) blended += 1;
+    }
+    try testing.expect(blended > 10);
 }
 
 // -------------------------------------------------------------------------
