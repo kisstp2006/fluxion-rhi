@@ -1245,21 +1245,17 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
 
     // The bindings GLSL ES 3.00 cannot state in the source, stated here once.
     // The program remembers them, so a pipeline sharing the shader restates
-    // the same ones.
+    // the same ones. A name the program has not got is one its compiler
+    // dropped, nothing reading it once the rest was worked out, and what is
+    // bound to its slot is then read by nothing, as on every other backend.
     gl.useProgram(program);
     for (desc.uniform_blocks, 0..) |name, slot| {
-        const index = gl.uniformBlockIndex(program, name) orelse {
-            log.print("uniform block `{s}` is not in the shader (or nothing reads it)", .{name}) catch {};
-            return error.PipelineFailed;
-        };
+        const index = gl.uniformBlockIndex(program, name) orelse continue;
         gl.uniformBlockBinding(program, index, @intCast(slot));
     }
     for (desc.textures, 0..) |name, slot| {
         const location = gl.uniformLocation(program, name);
-        if (!location.valid()) {
-            log.print("sampler `{s}` is not in the shader (or nothing reads it)", .{name}) catch {};
-            return error.PipelineFailed;
-        }
+        if (!location.valid()) continue;
         gl.uniform1i(location, @intCast(slot));
     }
 
@@ -1764,20 +1760,18 @@ test "blocks and samplers are bound by name when the pipeline is made" {
     // The second block went to slot one.
     try testing.expectEqual(1, stub.state.last_block_binding.binding);
 
-    // A name the linker removed is a failure here, and not zeros later.
-    try testing.expectError(error.PipelineFailed, device.createPipeline(.{
+    // A name the compiler dropped, nothing reading it, is passed over: its
+    // slot is read by nothing, as on every other backend. The names after
+    // it still go to their own slots.
+    stub.state.last_block_binding = .{};
+    _ = try device.createPipeline(.{
         .shader = shader,
         .attributes = &.{},
         .buffers = &.{},
-        .uniform_blocks = &.{"_gone"},
-    }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "_gone") != null);
-    try testing.expectError(error.PipelineFailed, device.createPipeline(.{
-        .shader = shader,
-        .attributes = &.{},
-        .buffers = &.{},
+        .uniform_blocks = &.{ "_gone", "Light" },
         .textures = &.{"_gone"},
-    }));
+    });
+    try testing.expectEqual(1, stub.state.last_block_binding.binding);
 }
 
 test "the rectangles count from the top left" {

@@ -1780,21 +1780,19 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
     }
 
     // The bindings GLSL 330 cannot state in the source, stated here once.
+    // A name the program has not got is one its compiler dropped, nothing
+    // reading it once the rest was worked out - a value written over before
+    // it is read - and what is bound to its slot is then read by nothing,
+    // as on every other backend.
     api.useProgram(program);
     for (desc.uniform_blocks, 0..) |name, slot| {
         const index = fnOf(api, "getUniformBlockIndex")(program, name.ptr);
-        if (index == invalid_index) {
-            log.print("uniform block `{s}` is not in the shader (or nothing reads it)", .{name}) catch {};
-            return error.PipelineFailed;
-        }
+        if (index == invalid_index) continue;
         fnOf(api, "uniformBlockBinding")(program, index, @intCast(slot));
     }
     for (desc.textures, 0..) |name, slot| {
         const location = api.getUniformLocation(program, name.ptr);
-        if (location < 0) {
-            log.print("sampler `{s}` is not in the shader (or nothing reads it)", .{name}) catch {};
-            return error.PipelineFailed;
-        }
+        if (location < 0) continue;
         api.uniform1i(location, @intCast(slot));
     }
 
