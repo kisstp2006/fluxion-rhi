@@ -2194,9 +2194,9 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
 }
 
 /// Nothing sampled stays bound between passes, so that this pass's target
-/// may be the last pass's texture. Only the slots a frame uses are cleared,
-/// and they are on both stages that `set_texture` binds.
-const unbound_slots = 8;
+/// may be the last pass's texture: every slot `set_texture` binds, on both
+/// stages it binds them on.
+const unbound_slots = types.max_texture_slots;
 
 fn unbindTextures(self: *D3d) void {
     const none: [unbound_slots]?*IShaderResourceView = @splat(null);
@@ -3396,6 +3396,32 @@ test "a texture is bound as the kind it is: array, cube and volume" {
             try expectSolid(pixels, palette[z]);
         }
     }
+}
+
+test "the sixteenth texture slot is bound" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const last =
+        \\Texture2D picture : register(t15);
+        \\SamplerState picture_sampler : register(s15);
+        \\cbuffer Params : register(b0) { float4 param; };
+        \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET { return picture.Sample(picture_sampler, uv); }
+    ;
+    const sampling = try Sampling.init(&device, last, 4, 1);
+    const green = try device.createTexture(.{ .width = 1, .height = 1, .data = &.{ 0, 255, 0, 255 } });
+    const sampler = try device.createSampler(.nearest);
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = sampling.target } } });
+    try cmd.setPipeline(sampling.pipeline);
+    try cmd.setVertexBuffer(0, sampling.quad, 0);
+    try cmd.setUniformBuffer(0, sampling.params);
+    try cmd.setTexture(15, green, sampler);
+    try cmd.draw(.{ .vertex_count = 4 });
+    try cmd.endPass();
+    try device.submit();
+    const drawn = try device.readTexture(sampling.target, testing.allocator);
+    defer testing.allocator.free(drawn);
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, drawn[(2 * 4 + 2) * 4 ..][0..4]);
 }
 
 test "a compressed texture is written in blocks and sampled" {

@@ -700,6 +700,7 @@ fn validate(self: *Device, list: []const commands.Command) Error!void {
             },
             .set_texture => |binding| {
                 if (!in_pass) return self.refuseAt(at, "setTexture outside a pass");
+                if (binding.slot >= types.max_texture_slots) return self.refuseAt(at, "setTexture: past the last slot, 15");
                 const texture = self.textures.get(binding.texture) orelse return self.refuseAt(at, "setTexture: the texture is not alive");
                 if (!texture.usage.sampled) return self.refuseAt(at, "setTexture: the texture was not made with usage.sampled");
                 if (!self.samplers.contains(binding.sampler)) return self.refuseAt(at, "setTexture: the sampler is not alive");
@@ -988,6 +989,20 @@ test "a frame that makes sense goes through, and one that does not is named" {
         const cmd = device.begin();
         try cmd.draw(.{ .vertex_count = 3 });
         try testing.expectError(error.InvalidArgument, device.submit());
+    }
+
+    // A texture past the sixteenth slot.
+    {
+        const picture = try device.createTexture(.{ .width = 1, .height = 1 });
+        const sampler = try device.createSampler(.nearest);
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .surface = surface } } });
+        try cmd.setTexture(types.max_texture_slots - 1, picture, sampler);
+        try cmd.setTexture(types.max_texture_slots, picture, sampler);
+        try cmd.endPass();
+        try testing.expectError(error.InvalidArgument, device.submit());
+        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "command 2") != null);
+        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "last slot") != null);
     }
 
     // A pass into a texture that cannot be drawn into.

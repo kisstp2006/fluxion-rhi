@@ -1015,6 +1015,10 @@ pub const FormatSupport = struct {
 };
 
 /// The numbers a device is bound by.
+/// How many texture slots `CommandList.setTexture` has, `0` to `15`, on
+/// every backend: the most OpenGL 3.3 and WebGL 2 promise a fragment shader.
+pub const max_texture_slots = 16;
+
 pub const Limits = struct {
     /// The largest `width` or `height` of a `.d2` or `.d2_array`.
     max_texture_2d: u32,

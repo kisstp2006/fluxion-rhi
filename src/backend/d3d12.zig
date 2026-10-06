@@ -93,9 +93,11 @@ comptime {
 
 const max_vertex_slots = 8;
 const max_attributes = 16;
-/// `b0`..`b7`, `t0`..`t7` and `s0`..`s7`: the root CBVs, and the width of
-/// the one descriptor table of each kind the shared root signature has.
-const max_binding_slots = 8;
+/// `b0`..`b7`: the root CBVs the shared root signature has.
+const uniform_slots = 8;
+/// `t0`..`t15` and `s0`..`s15`: the width of its one descriptor table of
+/// each kind.
+const texture_slots = types.max_texture_slots;
 /// How many textures/samplers this device can have alive at once, and how
 /// many textures can be drawn into. A fixed heap size, because a descriptor
 /// heap cannot be resized - see the module comment on the permanent heaps
@@ -122,8 +124,8 @@ const slot_sampler_descriptors = ring_sampler_descriptors / ring_size;
 const max_lists = 64;
 
 const root_param_cbv0 = 0;
-const root_param_srv_table = max_binding_slots;
-const root_param_sampler_table = max_binding_slots + 1;
+const root_param_srv_table = uniform_slots;
+const root_param_sampler_table = uniform_slots + 1;
 
 /// What a swap chain is made in, and the one format `createPipeline` accepts
 /// for `color_format`.
@@ -325,9 +327,9 @@ const D3d = struct {
     vertex_bindings: [max_vertex_slots]VertexBinding = @splat(.{}),
     bindings_dirty: bool = false,
     index_view: ?cmdmod.IndexBufferView = null,
-    uniforms: [max_binding_slots]u64 = @splat(0),
-    textures: [max_binding_slots]rc.CpuDescriptorHandle = undefined,
-    samplers: [max_binding_slots]rc.CpuDescriptorHandle = undefined,
+    uniforms: [uniform_slots]u64 = @splat(0),
+    textures: [texture_slots]rc.CpuDescriptorHandle = undefined,
+    samplers: [texture_slots]rc.CpuDescriptorHandle = undefined,
     textures_dirty: bool = true,
     samplers_dirty: bool = true,
     target: ?Target = null,
@@ -527,13 +529,13 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     // matching the Direct3D 11 backend's own choice to bind every stage
     // rather than assume only the pixel shader samples.
     const srv_ranges = [_]pl.DescriptorRange{
-        .{ .range_type = .srv, .num_descriptors = max_binding_slots, .base_shader_register = 0 },
+        .{ .range_type = .srv, .num_descriptors = texture_slots, .base_shader_register = 0 },
     };
     const sampler_ranges = [_]pl.DescriptorRange{
-        .{ .range_type = .sampler, .num_descriptors = max_binding_slots, .base_shader_register = 0 },
+        .{ .range_type = .sampler, .num_descriptors = texture_slots, .base_shader_register = 0 },
     };
-    var root_params: [max_binding_slots + 2]pl.RootParameter = undefined;
-    for (root_params[0..max_binding_slots], 0..) |*param, slot| param.* = pl.RootParameter.cbv(@intCast(slot), .all);
+    var root_params: [uniform_slots + 2]pl.RootParameter = undefined;
+    for (root_params[0..uniform_slots], 0..) |*param, slot| param.* = pl.RootParameter.cbv(@intCast(slot), .all);
     root_params[root_param_srv_table] = pl.RootParameter.table(&srv_ranges, .all);
     root_params[root_param_sampler_table] = pl.RootParameter.table(&sampler_ranges, .all);
     const root_blob = pl.serializeGraphicsRootSignature(
@@ -1850,14 +1852,14 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                 cmd_list.vtable.IASetIndexBuffer(cmd_list, &self.index_view.?);
             },
             .set_uniform_buffer => |b| {
-                if (b.slot >= max_binding_slots) return error.Unsupported;
+                if (b.slot >= uniform_slots) return error.Unsupported;
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
                 const resource = try use(self, res);
                 self.uniforms[b.slot] = resource.vtable.GetGPUVirtualAddress(resource) + b.offset;
                 cmd_list.vtable.SetGraphicsRootConstantBufferView(cmd_list, root_param_cbv0 + b.slot, self.uniforms[b.slot]);
             },
             .set_texture => |b| {
-                if (b.slot >= max_binding_slots) return error.Unsupported;
+                if (b.slot >= texture_slots) return error.Unsupported;
                 const texture = as(TextureRes, device.textures.get(b.texture).?.native);
                 const sampler = as(SamplerRes, device.samplers.get(b.sampler).?.native);
                 if (self.textures[b.slot].ptr != texture.srv_cpu.ptr) {
@@ -1935,13 +1937,13 @@ fn resolve(self: *D3d, source: *TextureRes, into: Resolve) void {
 /// The tables a draw reads, made where its textures or samplers changed, and
 /// its vertex buffers bound.
 fn prepareDraw(self: *D3d) Error!void {
-    const out_of_srvs = self.textures_dirty and self.ring_srv_used + max_binding_slots > slot_srv_descriptors;
-    const out_of_samplers = self.samplers_dirty and self.ring_sampler_used + max_binding_slots > slot_sampler_descriptors;
+    const out_of_srvs = self.textures_dirty and self.ring_srv_used + texture_slots > slot_srv_descriptors;
+    const out_of_samplers = self.samplers_dirty and self.ring_sampler_used + texture_slots > slot_sampler_descriptors;
     if (out_of_srvs or out_of_samplers) try restartRecording(self);
 
     if (self.textures_dirty) {
         const at: u32 = @as(u32, @intCast(self.at)) * slot_srv_descriptors + self.ring_srv_used;
-        self.ring_srv_used += max_binding_slots;
+        self.ring_srv_used += texture_slots;
         const start = rc.cpuHeapStart(self.ring_srv_heap);
         for (self.textures, 0..) |source, i| {
             rc.copyDescriptorsSimple(self.device, 1, start.offsetBy(at + @as(u32, @intCast(i)), self.cbv_srv_uav_increment), source, .cbv_srv_uav);
@@ -1951,7 +1953,7 @@ fn prepareDraw(self: *D3d) Error!void {
     }
     if (self.samplers_dirty) {
         const at: u32 = @as(u32, @intCast(self.at)) * slot_sampler_descriptors + self.ring_sampler_used;
-        self.ring_sampler_used += max_binding_slots;
+        self.ring_sampler_used += texture_slots;
         const start = rc.cpuHeapStart(self.ring_sampler_heap);
         for (self.samplers, 0..) |source, i| {
             rc.copyDescriptorsSimple(self.device, 1, start.offsetBy(at + @as(u32, @intCast(i)), self.sampler_increment), source, .sampler);
@@ -2302,7 +2304,7 @@ test "a submit with more changes of sampler than the ring holds draws them all" 
     try cmd.setVertexBuffer(0, quad.corners, 0);
     // One draw into each column, each with the other sampler: more tables
     // than the sampler ring has room for.
-    const draws = ring_sampler_descriptors / max_binding_slots + 40;
+    const draws = ring_sampler_descriptors / texture_slots + 40;
     for (0..draws) |i| {
         try cmd.setViewport(.{ .x = @floatFromInt(i % 8), .width = 1, .height = 8 });
         try cmd.setTexture(0, texture, if (i % 2 == 0) nearest else linear);
@@ -2595,14 +2597,14 @@ test "a multisampled target, with multisampled depth, is resolved into a texture
     try testing.expectError(error.InvalidArgument, device.readTexture(msaa, testing.allocator));
 }
 
-test "the eighth slot of each kind is bound: a uniform buffer and a texture" {
+test "the last slot of each kind is bound: the eighth uniform buffer and the sixteenth texture" {
     var device = try warpDevice();
     defer device.deinit();
 
     const last =
         \\cbuffer Look : register(b7) { float4 tint; };
-        \\Texture2D picture : register(t7);
-        \\SamplerState picture_sampler : register(s7);
+        \\Texture2D picture : register(t15);
+        \\SamplerState picture_sampler : register(s15);
         \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET { return picture.Sample(picture_sampler, uv) * tint; }
     ;
     const shader = try device.createShader(.{ .hlsl = .{ .vertex = Quad.vs, .fragment = last } });
@@ -2622,7 +2624,7 @@ test "the eighth slot of each kind is bound: a uniform buffer and a texture" {
     try cmd.setPipeline(pipeline);
     try cmd.setVertexBuffer(0, quad.corners, 0);
     try cmd.setUniformBuffer(7, green);
-    try cmd.setTexture(7, white, sampler);
+    try cmd.setTexture(15, white, sampler);
     try cmd.draw(.{ .vertex_count = 4 });
     try cmd.endPass();
     try device.submit();

@@ -154,6 +154,8 @@ pub const CommandList = struct {
         try self.push(.{ .set_uniform_buffer = .{ .slot = slot, .buffer = buffer, .offset = offset, .size = size } });
     }
 
+    /// Bind a texture, read through `sampler`, to `slot`: below
+    /// `max_texture_slots`, sixteen on every backend.
     pub fn setTexture(self: *CommandList, slot: u32, texture: types.Texture, sampler: types.Sampler) Allocator.Error!void {
         try self.push(.{ .set_texture = .{ .slot = slot, .texture = texture, .sampler = sampler } });
     }

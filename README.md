@@ -175,6 +175,11 @@ them, whether a compiler wrote them or a person did:
 | Texture in slot `n` | sampler named in `textures[n]` | `register(tn)` and `register(sn)` |
 | Fragment colour | `out vec4` | `SV_TARGET` |
 
+Every backend has sixteen texture slots, `0` to `15` - `max_texture_slots`,
+the most OpenGL 3.3 and WebGL 2 promise a fragment shader - and eight uniform
+buffer slots, `0` to `7`. A texture slot past the last is refused when the
+list is submitted.
+
 `uniform_blocks` and `textures` exist because neither GLSL has
 `layout(binding = n)`: the OpenGL and WebGL backends bind them by name once,
 when the pipeline is made, and after that `setUniformBuffer(slot, ...)` means

@@ -86,6 +86,7 @@ pub const Format = types.Format;
 pub const FormatInfo = types.FormatInfo;
 pub const FormatSupport = types.FormatSupport;
 pub const Limits = types.Limits;
+pub const max_texture_slots = types.max_texture_slots;
 pub const Features = types.Features;
 /// What a device can do. See `Device.caps`.
 pub const Caps = types.Caps;

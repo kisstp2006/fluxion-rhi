@@ -87,7 +87,7 @@ pub const SurfaceRes = swapchain.SurfaceRes;
 /// stage is promised.
 pub const uniform_slots = 8;
 /// `set 1`'s width: eight combined-image-sampler bindings.
-pub const texture_slots = 8;
+pub const texture_slots = types.max_texture_slots;
 
 /// How many `(uniform, texture)` descriptor set pairs one pool holds. A
 /// submit that changes its bindings more often than that takes another pool;
@@ -1527,6 +1527,69 @@ test "a depth texture drawn into is read by a sampler that compares, and a bias 
         const pixels = try device.readTexture(out, testing.allocator);
         defer testing.allocator.free(pixels);
         const want: [4]u8 = if (case.lit) .{ 255, 255, 255, 255 } else .{ 0, 0, 0, 255 };
+        try testing.expectEqualSlices(u8, &want, pixels[(2 * 4 + 1) * 4 ..][0..4]);
+    }
+}
+
+test "the sixteenth texture slot is bound" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    if (!device.caps().formatSupport(.depth32_float).sampled) return error.SkipZigTest;
+
+    // The shadow map reader, reading binding 15 rather than 0.
+    const last_fragment = comptime blk: {
+        var words: [compare_fragment.len]u32 = compare_fragment[0..compare_fragment.len].*;
+        for (0..words.len - 3) |i| {
+            // OpDecorate %12 Binding 0
+            if (words[i] == 0x00040047 and words[i + 1] == 0x0000000c and words[i + 2] == 0x00000021) {
+                words[i + 3] = 15;
+                break;
+            }
+        } else @compileError("no binding to move");
+        const final = words;
+        break :blk final;
+    };
+    const shader = try device.createShader(.{ .spirv = .{ .vertex = corner_vertex, .fragment = &last_fragment } });
+    defer device.destroyShader(shader);
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{.{ .location = 0, .format = .float2, .offset = 0 }},
+        .buffers = &.{.{ .stride = 8 }},
+        .topology = .triangle_strip,
+    });
+    defer device.destroyPipeline(pipeline);
+    const corners = [_]f32{ -1, -1, 1, -1, -1, 1, 1, 1 };
+    const corner_buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) });
+    defer device.destroyBuffer(corner_buffer);
+    const map = try device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .sampled = true, .render_target = true } });
+    defer device.destroyTexture(map);
+    const compare = try device.createSampler(.{ .compare = .less_equal });
+    defer device.destroySampler(compare);
+    const params = try device.createBuffer(.{ .kind = .uniform, .size = 16 });
+    defer device.destroyBuffer(params);
+    const out = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+    defer device.destroyTexture(out);
+
+    {
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .depth = .{ .texture = map, .clear_depth = 0.5 } });
+        try cmd.endPass();
+        try device.submit();
+    }
+    for ([_]f32{ 0.25, 0.75 }) |depth| {
+        try device.updateBuffer(params, 0, std.mem.asBytes(&[4]f32{ depth, 0, 0, 0 }));
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = out } } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, corner_buffer, 0);
+        try cmd.setUniformBuffer(0, params);
+        try cmd.setTexture(15, map, compare);
+        try cmd.draw(.{ .vertex_count = 4 });
+        try cmd.endPass();
+        try device.submit();
+        const pixels = try device.readTexture(out, testing.allocator);
+        defer testing.allocator.free(pixels);
+        const want: [4]u8 = if (depth < 0.5) .{ 255, 255, 255, 255 } else .{ 0, 0, 0, 255 };
         try testing.expectEqualSlices(u8, &want, pixels[(2 * 4 + 1) * 4 ..][0..4]);
     }
 }
