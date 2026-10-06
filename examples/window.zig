@@ -417,6 +417,55 @@ test "a triangle through the OpenGL backend lands top-left up" {
     try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(pixels, 64, 2, 61));
 }
 
+test "two draws read two parts of one uniform buffer on OpenGL" {
+    var fixture = try TestDevice.open(.gl);
+    defer fixture.close();
+    var device = &fixture.device;
+
+    const target = try device.createTexture(.{ .width = 16, .height = 16, .usage = .{ .render_target = true } });
+    const shader = try device.createShader(.{ .glsl = .{ .vertex = flat_vs, .fragment = flat_fs } });
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{
+            .{ .location = 0, .format = .float2, .offset = 0 },
+            .{ .location = 1, .format = .float4, .offset = 8 },
+        },
+        .buffers = &.{.{ .stride = @sizeOf(Vertex) }},
+        .topology = .triangle_strip,
+        .uniform_blocks = &.{"Frame"},
+    });
+    // The left half and the right half, white: the colour is the block's.
+    const white: [4]f32 = .{ 1, 1, 1, 1 };
+    const vertices = [_]Vertex{
+        .{ .position = .{ -1, -1 }, .colour = white }, .{ .position = .{ -1, 1 }, .colour = white },
+        .{ .position = .{ 0, -1 }, .colour = white },  .{ .position = .{ 0, 1 }, .colour = white },
+        .{ .position = .{ 0, -1 }, .colour = white },  .{ .position = .{ 0, 1 }, .colour = white },
+        .{ .position = .{ 1, -1 }, .colour = white },  .{ .position = .{ 1, 1 }, .colour = white },
+    };
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(vertices)), .data = std.mem.asBytes(&vertices) });
+    const step = device.caps().limits.uniform_offset_alignment;
+    try testing.expect(step >= 1 and step <= 256);
+    const tints = try device.createBuffer(.{ .kind = .uniform, .size = step + 16 });
+    try device.updateBuffer(tints, 0, std.mem.asBytes(&[4]f32{ 1, 0, 0, 1 }));
+    try device.updateBuffer(tints, step, std.mem.asBytes(&[4]f32{ 0, 1, 0, 1 }));
+
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+    try cmd.setPipeline(pipeline);
+    try cmd.setVertexBuffer(0, buffer, 0);
+    try cmd.setUniformBufferRange(0, tints, 0, 16);
+    try cmd.draw(.{ .vertex_count = 4 });
+    try cmd.setUniformBufferRange(0, tints, step, 0);
+    try cmd.draw(.{ .vertex_count = 4, .first_vertex = 4 });
+    try cmd.endPass();
+    try device.submit();
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, at(pixels, 16, 3, 8));
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, at(pixels, 16, 12, 8));
+}
+
 test "a scissor rectangle counts from the top left on OpenGL" {
     var fixture = try TestDevice.open(.gl);
     defer fixture.close();

@@ -389,6 +389,7 @@ fn computeCaps(gl: webgl.Context) types.Caps {
             .max_anisotropy = if (taps > 1) @intCast(taps) else 1,
             // No `drawBuffers`: the first attachment is the only one written.
             .max_color_attachments = if (wire.draw_buffers) @intCast(@max(parameter(more.max_color_attachments), 1)) else 1,
+            .uniform_offset_alignment = @max(gl.limits.uniform_buffer_offset_alignment, 1),
         },
         // ES 3.0 has neither: a border colour is desktop GL's, and a bias is
         // the shader's to add with `texture(sampler, uv, bias)`.
@@ -1430,7 +1431,12 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             },
             .set_uniform_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                gl.bindBufferBase(c.uniform_buffer, b.slot, res.buffer);
+                if (b.whole()) {
+                    gl.bindBufferBase(c.uniform_buffer, b.slot, res.buffer);
+                } else {
+                    const size = if (b.size == 0) res.size - b.offset else b.size;
+                    gl.bindBufferRange(c.uniform_buffer, b.slot, res.buffer, b.offset, @intCast(size));
+                }
             },
             .set_texture => |b| {
                 const texture = textureOf(device, b.texture);
@@ -1846,6 +1852,23 @@ test "blocks and samplers are bound by name when the pipeline is made" {
         .textures = &.{"_gone"},
     });
     try testing.expectEqual(1, stub.state.last_block_binding.binding);
+}
+
+test "a part of a uniform buffer is bound as a range, and the whole as the base" {
+    var device = try openDevice();
+    defer device.deinit();
+    const step = device.caps().limits.uniform_offset_alignment;
+    try testing.expectEqual(@as(u32, 256), step);
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const blocks = try device.createBuffer(.{ .kind = .uniform, .size = step + 64 });
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+    try cmd.setUniformBufferRange(1, blocks, step, 0);
+    try cmd.setUniformBuffer(2, blocks);
+    try cmd.endPass();
+    try device.submit();
+    try testing.expectEqual([2]u32{ step, 64 }, stub.state.uniform_ranges[1]);
+    try testing.expectEqual([2]u32{ 0, 0 }, stub.state.uniform_ranges[2]);
 }
 
 test "the rectangles count from the top left" {

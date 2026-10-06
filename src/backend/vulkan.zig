@@ -391,6 +391,9 @@ pub const Vk = struct {
     current_pipeline: ?*PipelineRes = null,
     pipeline_dirty: bool = false,
     current_ubo: [uniform_slots]?*BufferRes = @splat(null),
+    /// Where in its buffer each slot's block is, and how much of it: nought
+    /// for the whole buffer.
+    current_ubo_range: [uniform_slots]commands.Command.UniformBinding = undefined,
     current_tex: [texture_slots]?TexBinding = @splat(null),
     bindings_dirty: bool = true,
 
@@ -600,6 +603,7 @@ fn caps(impl: backend.Impl) types.Caps {
             .max_anisotropy = 1,
             // No `extra_colors`, so one colour attachment is all a pass has.
             .max_color_attachments = 1,
+            .uniform_offset_alignment = @intCast(@max(limits.min_uniform_buffer_offset_alignment, 1)),
         },
         .features = .{ .sampler_border = true, .sampler_lod_bias = true },
     };
@@ -860,6 +864,7 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
             .set_uniform_buffer => |b| {
                 if (b.slot >= uniform_slots) return error.Unsupported;
                 self.current_ubo[b.slot] = as(BufferRes, device.buffers.get(b.buffer).?.native);
+                self.current_ubo_range[b.slot] = b;
                 self.bindings_dirty = true;
             },
             .set_texture => |b| {
@@ -1124,6 +1129,14 @@ fn flushBindings(self: *Vk) types.Error!void {
         const res = self.current_ubo[i] orelse self.dummy_buffer;
         res.current.busy = recordingSerial(self);
         info_.* = .{ .buffer = res.current.buffer, .offset = 0, .range = vk.gen.types.whole_size };
+        if (self.current_ubo[i] != null) {
+            const range = self.current_ubo_range[i];
+            if (!range.whole()) info_.* = .{
+                .buffer = res.current.buffer,
+                .offset = range.offset,
+                .range = if (range.size == 0) res.size - range.offset else range.size,
+            };
+        }
     }
     var texture_infos: [texture_slots]vk.gen.types.DescriptorImageInfo = undefined;
     for (&texture_infos, 0..) |*info_, i| {
@@ -1446,6 +1459,48 @@ test "a float target keeps light over one, read back clamped" {
     try testing.expectEqualSlices(u8, &.{ 255, 64, 0, 255 }, pixels[(1 * 4 + 1) * 4 ..][0..4]);
 }
 
+test "two draws read two parts of one uniform buffer" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    const shader = try device.createShader(.{ .spirv = .{ .vertex = shaded_vertex, .fragment = look_fragment } });
+    defer device.destroyShader(shader);
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{ .{ .location = 0, .format = .float3, .offset = 0 }, .{ .location = 1, .format = .float4, .offset = 12 } },
+        .buffers = &.{.{ .stride = 28 }},
+    });
+    defer device.destroyPipeline(pipeline);
+    // The left half, then the right half; the colour is the block's.
+    const w = [4]f32{ 1, 1, 1, 1 };
+    const halves = [_][7]f32{
+        .{ -1, -1, 0 } ++ w, .{ -1, 1, 0 } ++ w, .{ 0, -1, 0 } ++ w, .{ 0, -1, 0 } ++ w, .{ -1, 1, 0 } ++ w, .{ 0, 1, 0 } ++ w,
+        .{ 0, -1, 0 } ++ w,  .{ 0, 1, 0 } ++ w,  .{ 1, -1, 0 } ++ w, .{ 1, -1, 0 } ++ w, .{ 0, 1, 0 } ++ w,  .{ 1, 1, 0 } ++ w,
+    };
+    const corners = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(halves)), .data = std.mem.asBytes(&halves) });
+    defer device.destroyBuffer(corners);
+    const step = device.caps().limits.uniform_offset_alignment;
+    const colours = try device.createBuffer(.{ .kind = .uniform, .size = step + 16 });
+    defer device.destroyBuffer(colours);
+    try device.updateBuffer(colours, 0, std.mem.asBytes(&[4]f32{ 1, 0, 0, 1 }));
+    try device.updateBuffer(colours, step, std.mem.asBytes(&[4]f32{ 0, 0, 1, 1 }));
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .sampled = true, .render_target = true } });
+    defer device.destroyTexture(target);
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+    try cmd.setPipeline(pipeline);
+    try cmd.setVertexBuffer(0, corners, 0);
+    try cmd.setUniformBufferRange(0, colours, 0, 16);
+    try cmd.draw(.{ .vertex_count = 6 });
+    try cmd.setUniformBufferRange(0, colours, step, 0);
+    try cmd.draw(.{ .vertex_count = 6, .first_vertex = 6 });
+    try cmd.endPass();
+    try device.submit();
+    const drawn = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(drawn);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, drawn[(4 * 8 + 1) * 4 ..][0..4].*);
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, drawn[(4 * 8 + 6) * 4 ..][0..4].*);
+}
+
 test "a multisampled target, with multisampled depth, is resolved into a texture at the end of the pass" {
     var device = try openTestDevice();
     defer device.deinit();
@@ -1627,6 +1682,28 @@ const shaded_vertex: []const u32 = &.{
     0x00000016, 0x00000017, 0x00000014, 0x00050041, 0x00000019, 0x0000001a, 0x0000000d, 0x0000000f,
     0x0003003e, 0x0000001a, 0x00000018, 0x0004003d, 0x00000007, 0x0000001e, 0x0000001d, 0x0003003e,
     0x0000001b, 0x0000001e, 0x000100fd, 0x00010038,
+};
+
+/// `layout(set = 0, binding = 0) uniform Look { vec4 colour; }`, written
+/// to the target as it is: glslangValidator's output for it.
+const look_fragment: []const u32 = &.{
+    0x07230203, 0x00010000, 0x0008000b, 0x00000012, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00030010, 0x00000004,
+    0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
+    0x00040005, 0x00000009, 0x67726174, 0x00007465, 0x00040005, 0x0000000a, 0x6b6f6f4c, 0x00000000,
+    0x00050006, 0x0000000a, 0x00000000, 0x6f6c6f63, 0x00007275, 0x00030005, 0x0000000c, 0x00000000,
+    0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00030047, 0x0000000a, 0x00000002, 0x00050048,
+    0x0000000a, 0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x0000000c, 0x00000021, 0x00000000,
+    0x00040047, 0x0000000c, 0x00000022, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+    0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004,
+    0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003,
+    0x0003001e, 0x0000000a, 0x00000007, 0x00040020, 0x0000000b, 0x00000002, 0x0000000a, 0x0004003b,
+    0x0000000b, 0x0000000c, 0x00000002, 0x00040015, 0x0000000d, 0x00000020, 0x00000001, 0x0004002b,
+    0x0000000d, 0x0000000e, 0x00000000, 0x00040020, 0x0000000f, 0x00000002, 0x00000007, 0x00050036,
+    0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x00050041, 0x0000000f,
+    0x00000010, 0x0000000c, 0x0000000e, 0x0004003d, 0x00000007, 0x00000011, 0x00000010, 0x0003003e,
+    0x00000009, 0x00000011, 0x000100fd, 0x00010038,
 };
 
 const shaded_fragment: []const u32 = &.{

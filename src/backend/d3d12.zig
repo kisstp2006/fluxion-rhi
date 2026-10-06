@@ -1036,7 +1036,9 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
     const res = try self.gpa.create(BufferRes);
     errdefer self.gpa.destroy(res);
 
-    const size: u32 = @intCast(if (desc.kind == .uniform) std.mem.alignForward(usize, desc.size, 16) else desc.size);
+    // A whole number of 256-byte blocks: a block bound from an offset is read
+    // by the shader as far as it declares, and that stays in the buffer.
+    const size: u32 = @intCast(if (desc.kind == .uniform) std.mem.alignForward(usize, desc.size, 256) else desc.size);
     const shadow = try self.gpa.alloc(u8, @max(size, 1));
     errdefer self.gpa.free(shadow);
     @memset(shadow, 0);
@@ -1819,7 +1821,7 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                 if (b.slot >= max_binding_slots) return error.Unsupported;
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
                 const resource = try use(self, res);
-                self.uniforms[b.slot] = resource.vtable.GetGPUVirtualAddress(resource);
+                self.uniforms[b.slot] = resource.vtable.GetGPUVirtualAddress(resource) + b.offset;
                 cmd_list.vtable.SetGraphicsRootConstantBufferView(cmd_list, root_param_cbv0 + b.slot, self.uniforms[b.slot]);
             },
             .set_texture => |b| {
@@ -2510,6 +2512,37 @@ test "the eighth slot of each kind is bound: a uniform buffer and a texture" {
     const drawn = try device.readTexture(target, testing.allocator);
     defer testing.allocator.free(drawn);
     try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, texelAt(drawn, 4, 2, 2));
+}
+
+test "two draws read two parts of one uniform buffer" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const flat = try Flat.init(&device, 1, .rgba8_unorm, null);
+    // The left half, then the right half.
+    const halves = [_][3]f32{
+        .{ -1, -1, 0 }, .{ -1, 1, 0 }, .{ 0, -1, 0 }, .{ 0, -1, 0 }, .{ -1, 1, 0 }, .{ 0, 1, 0 },
+        .{ 0, -1, 0 },  .{ 0, 1, 0 },  .{ 1, -1, 0 }, .{ 1, -1, 0 }, .{ 0, 1, 0 },  .{ 1, 1, 0 },
+    };
+    const corners = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(halves)), .data = std.mem.asBytes(&halves) });
+    const step = device.caps().limits.uniform_offset_alignment;
+    const colours = try device.createBuffer(.{ .kind = .uniform, .size = step + 16 });
+    try device.updateBuffer(colours, 0, std.mem.asBytes(&[4]f32{ 1, 0, 0, 1 }));
+    try device.updateBuffer(colours, step, std.mem.asBytes(&[4]f32{ 0, 0, 1, 1 }));
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+    try cmd.setPipeline(flat.pipeline);
+    try cmd.setVertexBuffer(0, corners, 0);
+    try cmd.setUniformBufferRange(0, colours, 0, 16);
+    try cmd.draw(.{ .vertex_count = 6 });
+    try cmd.setUniformBufferRange(0, colours, step, 0);
+    try cmd.draw(.{ .vertex_count = 6, .first_vertex = 6 });
+    try cmd.endPass();
+    try device.submit();
+    const drawn = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(drawn);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, texelAt(drawn, 8, 1, 4));
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, texelAt(drawn, 8, 6, 4));
 }
 
 test "a depth texture keeps what is nearer, whichever is drawn last, and a pass can write depth alone" {

@@ -678,6 +678,7 @@ fn buildCaps(self: *Gl, ctx: Context) types.Caps {
             // them *and* the fragment stage has outputs, and the smaller of the two
             // is what can be drawn.
             .max_color_attachments = @min(positive(api, c.max_color_attachments), positive(api, c.max_draw_buffers), most_color_attachments),
+            .uniform_offset_alignment = @max(positive(api, c.uniform_buffer_offset_alignment), 1),
         },
         .features = features,
     };
@@ -1960,7 +1961,12 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             },
             .set_uniform_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                fnOf(api, "bindBufferBase")(c.uniform_buffer, b.slot, res.name);
+                if (b.whole()) {
+                    fnOf(api, "bindBufferBase")(c.uniform_buffer, b.slot, res.name);
+                } else {
+                    const size = if (b.size == 0) res.size - b.offset else b.size;
+                    fnOf(api, "bindBufferRange")(c.uniform_buffer, b.slot, res.name, @intCast(b.offset), @intCast(size));
+                }
             },
             .set_texture => |b| {
                 const texture = as(TextureRes, device.textures.get(b.texture).?.native);

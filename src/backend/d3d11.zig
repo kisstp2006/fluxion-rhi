@@ -654,6 +654,32 @@ const IDeviceContext = extern struct {
     };
 };
 
+/// `ID3D11DeviceContext1`: the same, and a constant buffer bound a part at a
+/// time - Direct3D 11.1, which every Windows from 8 on has. The slots after
+/// `Flush` that `IDeviceContext` leaves out are counted here, up to the last
+/// one anything calls.
+const IDeviceContext1 = extern struct {
+    vtable: *const VTable,
+
+    pub const iid = Guid.parseComptime("{BB2C6FAA-B5FB-4082-8E6B-388B8CFA90E1}");
+
+    pub const VTable = extern struct {
+        base: IDeviceContext.VTable,
+        GetType: *const anyopaque,
+        GetContextFlags: *const anyopaque,
+        FinishCommandList: *const anyopaque,
+        CopySubresourceRegion1: *const anyopaque,
+        UpdateSubresource1: *const anyopaque,
+        DiscardResource: *const anyopaque,
+        DiscardView: *const anyopaque,
+        VSSetConstantBuffers1: *const fn (*IDeviceContext1, u32, u32, [*]const ?*IBuffer, [*]const u32, [*]const u32) callconv(.winapi) void,
+        HSSetConstantBuffers1: *const anyopaque,
+        DSSetConstantBuffers1: *const anyopaque,
+        GSSetConstantBuffers1: *const anyopaque,
+        PSSetConstantBuffers1: *const fn (*IDeviceContext1, u32, u32, [*]const ?*IBuffer, [*]const u32, [*]const u32) callconv(.winapi) void,
+    };
+};
+
 const ISwapChain = extern struct {
     vtable: *const VTable,
 
@@ -833,6 +859,11 @@ const D3d = struct {
     device: d3d11.Device,
     raw: Raw,
     context: *IDeviceContext,
+    /// The same context as Direct3D 11.1 sees it, which binds a part of a
+    /// constant buffer; null where the runtime is older, and a part is copied
+    /// into `range_buffers` instead.
+    context1: ?*IDeviceContext1 = null,
+    range_buffers: [max_uniform_slots]?*IBuffer = @splat(null),
     debug: bool,
     renderer: [128]u8 = undefined,
     renderer_len: usize = 0,
@@ -864,6 +895,11 @@ const Resolve = struct {
 };
 
 const max_vertex_slots = 8;
+/// The constant buffer slots Direct3D 11 has.
+const max_uniform_slots = 14;
+/// What `setUniformBufferRange` binds at most, and what a buffer a part is
+/// copied into holds.
+const max_uniform_range = 65536;
 
 const VertexBinding = struct {
     buffer: ?*IBuffer = null,
@@ -993,6 +1029,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .debug = desc.debug,
         .probes = probes,
     };
+    self.context1 = @ptrCast(com.queryInterface(self.context, IDeviceContext1) catch null);
 
     // The adapter's name, for the log line. WARP has no adapter worth asking.
     if (desc.software) {
@@ -1052,6 +1089,10 @@ fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
     self.context.vtable.ClearState(self.context);
     self.context.vtable.Flush(self.context);
+    for (self.range_buffers) |held| if (held) |buffer| {
+        _ = com.release(buffer);
+    };
+    if (self.context1) |one| _ = com.release(one);
     if (self.compiler) |*compiler| compiler.unload();
     self.device.release();
     _ = com.release(self.factory);
@@ -1076,7 +1117,9 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
     errdefer self.gpa.destroy(res);
 
     const dynamic = desc.dynamic or desc.kind == .uniform;
-    const size: u32 = @intCast(if (desc.kind == .uniform) std.mem.alignForward(usize, desc.size, 16) else desc.size);
+    // A whole number of 256-byte blocks: a part bound from an offset counts
+    // its registers in sixteens, so the last one has room to be counted.
+    const size: u32 = @intCast(if (desc.kind == .uniform) std.mem.alignForward(usize, desc.size, 256) else desc.size);
 
     var shadow: ?[]u8 = null;
     errdefer if (shadow) |s| self.gpa.free(s);
@@ -1108,6 +1151,42 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
         .shadow = shadow,
     };
     return res;
+}
+
+/// A part of a constant buffer as the block at a slot: from its offset on
+/// Direct3D 11.1, or copied into a buffer of the slot's own before it.
+fn bindRange(self: *D3d, b: commands.Command.UniformBinding, res: *BufferRes) Error!void {
+    if (b.slot >= max_uniform_slots) return error.Unsupported;
+    const context = self.context;
+    const size: usize = if (b.size == 0) res.size - b.offset else b.size;
+    if (self.context1) |one| {
+        // The same buffer at another offset is filtered out as the binding it
+        // already has by some runtimes: the slot is emptied first.
+        const none = [_]?*IBuffer{null};
+        context.vtable.VSSetConstantBuffers(context, b.slot, 1, &none);
+        context.vtable.PSSetConstantBuffers(context, b.slot, 1, &none);
+        const buffers = [_]?*IBuffer{res.buffer};
+        const first = [_]u32{b.offset / 16};
+        const count = [_]u32{@intCast(std.mem.alignForward(usize, size, 256) / 16)};
+        one.vtable.VSSetConstantBuffers1(one, b.slot, 1, &buffers, &first, &count);
+        one.vtable.PSSetConstantBuffers1(one, b.slot, 1, &buffers, &first, &count);
+        return;
+    }
+    const shadow = res.shadow orelse return error.Unsupported;
+    const held = &self.range_buffers[b.slot];
+    if (held.* == null) held.* = self.raw.createBuffer(bufferDesc(.uniform, max_uniform_range, true, false), null) catch return error.Failed;
+    const scratch = held.*.?;
+    var mapped: MappedSubresource = .{};
+    context.vtable.Map(context, asResource(scratch), 0, .write_discard, 0, &mapped).check() catch return error.Failed;
+    const data = mapped.data orelse {
+        context.vtable.Unmap(context, asResource(scratch), 0);
+        return error.Failed;
+    };
+    @memcpy(data[0..size], shadow[b.offset..][0..size]);
+    context.vtable.Unmap(context, asResource(scratch), 0);
+    const buffers = [_]?*IBuffer{scratch};
+    context.vtable.VSSetConstantBuffers(context, b.slot, 1, &buffers);
+    context.vtable.PSSetConstantBuffers(context, b.slot, 1, &buffers);
 }
 
 fn bufferDesc(kind: types.BufferKind, size: u32, dynamic: bool, immutable: bool) BufferDesc {
@@ -2074,9 +2153,11 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             },
             .set_uniform_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                const buffers = [_]?*IBuffer{res.buffer};
-                context.vtable.VSSetConstantBuffers(context, b.slot, 1, &buffers);
-                context.vtable.PSSetConstantBuffers(context, b.slot, 1, &buffers);
+                if (b.whole()) {
+                    const buffers = [_]?*IBuffer{res.buffer};
+                    context.vtable.VSSetConstantBuffers(context, b.slot, 1, &buffers);
+                    context.vtable.PSSetConstantBuffers(context, b.slot, 1, &buffers);
+                } else try bindRange(self, b, res);
             },
             .set_texture => |b| {
                 const texture = as(TextureRes, device.textures.get(b.texture).?.native);
@@ -2375,6 +2456,60 @@ test "a uniform buffer update reaches the shader, and a partial one keeps the re
     const pixels = try device.readTexture(target, testing.allocator);
     defer testing.allocator.free(pixels);
     try testing.expectEqual([4]u8{ 255, 255, 0, 255 }, pixels[(2 * 16 + 2) * 4 ..][0..4].*);
+}
+
+test "two draws read two parts of one uniform buffer, bound from Direct3D 11.1 or copied without it" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    const target = try device.createTexture(.{ .width = 16, .height = 16, .usage = .{ .render_target = true } });
+    const shader = try device.createShader(.{ .hlsl = .{ .vertex = flat_vs, .fragment = flat_ps } });
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{
+            .{ .location = 0, .format = .float2, .offset = 0 },
+            .{ .location = 1, .format = .float4, .offset = 8 },
+        },
+        .buffers = &.{.{ .stride = @sizeOf(Vertex) }},
+        .topology = .triangle_strip,
+    });
+    // The left half and the right half, white.
+    const white: [4]f32 = .{ 1, 1, 1, 1 };
+    const vertices = [_]Vertex{
+        .{ .position = .{ -1, -1 }, .colour = white }, .{ .position = .{ -1, 1 }, .colour = white },
+        .{ .position = .{ 0, -1 }, .colour = white },  .{ .position = .{ 0, 1 }, .colour = white },
+        .{ .position = .{ 0, -1 }, .colour = white },  .{ .position = .{ 0, 1 }, .colour = white },
+        .{ .position = .{ 1, -1 }, .colour = white },  .{ .position = .{ 1, 1 }, .colour = white },
+    };
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(vertices)), .data = std.mem.asBytes(&vertices) });
+    const step = device.caps().limits.uniform_offset_alignment;
+    const tints = try device.createBuffer(.{ .kind = .uniform, .size = step + 16 });
+    try device.updateBuffer(tints, 0, std.mem.asBytes(&[4]f32{ 1, 0, 0, 1 }));
+    try device.updateBuffer(tints, step, std.mem.asBytes(&[4]f32{ 0, 1, 0, 1 }));
+
+    for (0..2) |round| {
+        // The second time, as a runtime older than 11.1 binds it.
+        if (round == 1) {
+            const self = cast(device.impl);
+            if (self.context1) |one| _ = com.release(one);
+            self.context1 = null;
+        }
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, buffer, 0);
+        try cmd.setUniformBufferRange(0, tints, 0, 16);
+        try cmd.draw(.{ .vertex_count = 4 });
+        try cmd.setUniformBufferRange(0, tints, step, 16);
+        try cmd.draw(.{ .vertex_count = 4, .first_vertex = 4 });
+        try cmd.endPass();
+        try device.submit();
+
+        const pixels = try device.readTexture(target, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixels[(8 * 16 + 3) * 4 ..][0..4].*);
+        try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, pixels[(8 * 16 + 12) * 4 ..][0..4].*);
+    }
 }
 
 test "a shader that does not compile says why" {

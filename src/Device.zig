@@ -74,6 +74,11 @@ const Device = @This();
 
 pub const Error = types.Error;
 
+/// The most of a buffer one block is bound as: what Direct3D binds, 4096
+/// registers of sixteen bytes, and what nearly every Vulkan and OpenGL
+/// device does.
+const max_uniform_range = 65536;
+
 gpa: Allocator,
 impl: backend.Impl,
 vtable: *const backend.Vtable,
@@ -684,6 +689,14 @@ fn validate(self: *Device, list: []const commands.Command) Error!void {
                 if (!in_pass) return self.refuseAt(at, "setUniformBuffer outside a pass");
                 const buffer = self.buffers.get(binding.buffer) orelse return self.refuseAt(at, "setUniformBuffer: the buffer is not alive");
                 if (buffer.kind != .uniform) return self.refuseAt(at, "setUniformBuffer: not a uniform buffer");
+                if (!binding.whole()) {
+                    const alignment = @max(self.capabilities.limits.uniform_offset_alignment, 1);
+                    if (binding.offset % alignment != 0) return self.refuseAt(at, "setUniformBufferRange: the offset is not a multiple of uniform_offset_alignment");
+                    if (binding.offset >= buffer.size) return self.refuseAt(at, "setUniformBufferRange: the offset is past the end of the buffer");
+                    if (binding.size > buffer.size - binding.offset) return self.refuseAt(at, "setUniformBufferRange: past the end of the buffer");
+                    const size = if (binding.size == 0) buffer.size - binding.offset else binding.size;
+                    if (size > max_uniform_range) return self.refuseAt(at, "setUniformBufferRange: more than 65536 bytes");
+                }
             },
             .set_texture => |binding| {
                 if (!in_pass) return self.refuseAt(at, "setTexture outside a pass");
@@ -896,6 +909,34 @@ test "a surface is shown in the mode it was made with, and in any it is set to" 
     // Only enabled and adaptive wait for the refresh.
     try std.testing.expect(types.PresentMode.enabled.waits() and types.PresentMode.adaptive.waits());
     try std.testing.expect(!types.PresentMode.disabled.waits() and !types.PresentMode.mailbox.waits());
+}
+
+test "a part of a uniform buffer is bound from an aligned offset, inside the buffer" {
+    var device = try nothing();
+    defer device.deinit();
+    const step = device.caps().limits.uniform_offset_alignment;
+    try testing.expectEqual(@as(u32, 256), step);
+    const target = try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } });
+    const blocks = try device.createBuffer(.{ .kind = .uniform, .size = step * 2 });
+
+    const Case = struct { offset: u32, size: u32, wrong: ?[]const u8 };
+    for ([_]Case{
+        .{ .offset = 0, .size = 16, .wrong = null },
+        .{ .offset = step, .size = 0, .wrong = null },
+        .{ .offset = step, .size = step, .wrong = null },
+        .{ .offset = 16, .size = 16, .wrong = "not a multiple" },
+        .{ .offset = step, .size = step + 16, .wrong = "past the end" },
+        .{ .offset = step * 2, .size = 16, .wrong = "past the end" },
+    }) |case| {
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+        try cmd.setUniformBufferRange(0, blocks, case.offset, case.size);
+        try cmd.endPass();
+        if (case.wrong) |why| {
+            try testing.expectError(error.InvalidArgument, device.submit());
+            try testing.expect(std.mem.indexOf(u8, device.diagnostics(), why) != null);
+        } else try device.submit();
+    }
 }
 
 test "a frame that makes sense goes through, and one that does not is named" {

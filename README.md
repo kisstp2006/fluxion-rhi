@@ -183,6 +183,15 @@ the two are not interchangeable, even where the text below the first line is
 the same: WebGL wants `#version 300 es` and a precision, and compiles a shader
 without the version as GLSL ES 1.00.
 
+**Many blocks in one buffer.** `setUniformBufferRange(slot, buffer, offset,
+size)` binds a part of a uniform buffer as the block: every draw's material in
+one buffer, written once, each from an offset that is a multiple of
+`caps().limits.uniform_offset_alignment` - 256 on Direct3D, what the device
+says on Vulkan and OpenGL. Direct3D 11 binds the part from Direct3D 11.1 on,
+and copies it into a buffer of the slot's own on a runtime older than that;
+Direct3D 12 binds its address; Vulkan writes it into the descriptor; OpenGL
+and WebGL call `bindBufferRange`. A part is at most 65536 bytes.
+
 ## The backends
 
 | Backend | Where | Needs | How it presents |

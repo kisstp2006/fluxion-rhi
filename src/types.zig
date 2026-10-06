@@ -1017,6 +1017,10 @@ pub const Limits = struct {
     max_anisotropy: u32,
     /// How many colour attachments a pass can have, `color` and `extra_colors` together.
     max_color_attachments: u32,
+    /// What the offset of `CommandList.setUniformBufferRange` is a multiple
+    /// of: 256 on Direct3D, what the device says on Vulkan and OpenGL. A
+    /// renderer that keeps many blocks in one buffer spaces them by this.
+    uniform_offset_alignment: u32 = 256,
 };
 
 /// Things a device may or may not do, that are not about one format.

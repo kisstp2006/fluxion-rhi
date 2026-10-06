@@ -51,6 +51,17 @@ pub const Command = union(enum) {
     pub const UniformBinding = struct {
         slot: u32,
         buffer: types.Buffer,
+        /// Bytes into the buffer where the block starts: a multiple of
+        /// `Limits.uniform_offset_alignment`.
+        offset: u32 = 0,
+        /// How many bytes from there the block is; nought for the rest of the
+        /// buffer.
+        size: u32 = 0,
+
+        /// Whether it is the whole buffer, as `setUniformBuffer` binds it.
+        pub fn whole(self: UniformBinding) bool {
+            return self.offset == 0 and self.size == 0;
+        }
     };
 
     pub const TextureBinding = struct {
@@ -132,6 +143,15 @@ pub const CommandList = struct {
 
     pub fn setUniformBuffer(self: *CommandList, slot: u32, buffer: types.Buffer) Allocator.Error!void {
         try self.push(.{ .set_uniform_buffer = .{ .slot = slot, .buffer = buffer } });
+    }
+
+    /// `size` bytes of `buffer` from `offset` as the block at `slot`: many
+    /// draws' blocks in one buffer, written once. `offset` is a multiple of
+    /// `Limits.uniform_offset_alignment`; nought for `size` is the rest of
+    /// the buffer. What a draw reads is what the buffer holds when the list
+    /// is submitted, as with `setUniformBuffer`.
+    pub fn setUniformBufferRange(self: *CommandList, slot: u32, buffer: types.Buffer, offset: u32, size: u32) Allocator.Error!void {
+        try self.push(.{ .set_uniform_buffer = .{ .slot = slot, .buffer = buffer, .offset = offset, .size = size } });
     }
 
     pub fn setTexture(self: *CommandList, slot: u32, texture: types.Texture, sampler: types.Sampler) Allocator.Error!void {
