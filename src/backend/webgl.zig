@@ -331,7 +331,9 @@ fn supportFor(format: types.Format, native: Native, renders: bool, samples: u8) 
     const depth = format.isDepth();
     return .{
         .sampled = true,
-        .filterable = native.filter,
+        // For a depth format, whether a sampler that compares filters it:
+        // WebGL 2 does, though it reads one linearly in no other way.
+        .filterable = native.filter or depth,
         .render_target = renders,
         .blendable = renders and native.blend and !depth,
         // `generateMipmap` wants a format that is both drawable and filterable.
@@ -795,7 +797,9 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
         .height = desc.height,
         .faces = desc.layers(),
         .levels = desc.mip_levels,
-        .filterable = self.caps.formatSupport(desc.format).filterable,
+        // Read linearly as it is - for a depth texture, only by a sampler
+        // that compares.
+        .filterable = native.filter,
     };
 
     if (desc.samples > 1) {
@@ -1183,7 +1187,7 @@ fn unfilteredDesc(desc: types.SamplerDesc) types.SamplerDesc {
 /// make incomplete. WebGL samples such a texture as black rather than
 /// filtering it less: a linear read of a depth texture (unless the sampler
 /// compares) and of a 32-bit float one (without an extension no query can
-/// find) both are. `caps` says `filterable` is false for them, and Direct3D
+/// find) both are. A texture's `filterable` is false for them, and Direct3D
 /// would have read them anyway, so here a sampler that would is given a
 /// nearest twin instead.
 fn needsUnfiltered(desc: types.SamplerDesc, filterable: bool) bool {
@@ -1604,6 +1608,12 @@ fn bindPipeline(self: *WebGl, res: *PipelineRes) void {
         gl.disable(c.depth_test);
     }
     gl.depthMask(res.depth.write);
+    if (res.depth.biased()) {
+        gl.enable(c.polygon_offset_fill);
+        gl.polygonOffset(res.depth.slope_bias, @floatFromInt(res.depth.bias));
+    } else {
+        gl.disable(c.polygon_offset_fill);
+    }
     // A pipeline with no colour format is for a pass with no colour: nothing
     // it draws may reach one that is there.
     gl.colorMask(res.writes_color, res.writes_color, res.writes_color, res.writes_color);
@@ -2207,9 +2217,10 @@ test "the stub's caps are what the context reports and what the binding lacks" {
     );
     // Half float filters and blends.
     try testing.expect(answer.formatSupport(.rgba16_float).filterable and answer.formatSupport(.rgba16_float).blendable);
-    // Depth is drawn into and sampled, and not filtered.
+    // Depth is drawn into and sampled, and filtered by a sampler that
+    // compares.
     try testing.expectEqual(
-        types.FormatSupport{ .sampled = true, .filterable = false, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 0b111, .dimensions = flat_dimensions },
+        types.FormatSupport{ .sampled = true, .filterable = true, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 0b111, .dimensions = flat_dimensions },
         answer.formatSupport(.depth32_float),
     );
 }

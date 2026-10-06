@@ -206,10 +206,21 @@ pub const TextureRes = struct {
     framebuffer: vk.gen.types.Framebuffer = .none,
     /// Samples a pixel.
     samples: u8 = 1,
+    /// A depth texture that is sampled as well - a shadow map - kept where
+    /// a shader reads it between the passes that draw into it.
+    sampled_depth: bool = false,
+    /// What a shader reads it through: `view`, but for a depth format with
+    /// stencil, a view of the depth alone, which is all a sampler can read.
+    read_view: vk.gen.types.ImageView = .none,
 
     fn aspect(self: *const TextureRes) vk.gen.types.ImageAspectFlags {
         if (!self.format.isDepth()) return .{ .color = true };
         return .{ .depth = true, .stencil = self.format.hasStencil() };
+    }
+
+    /// The view a descriptor names.
+    pub fn sampledView(self: *const TextureRes) vk.gen.types.ImageView {
+        return if (self.read_view != .none) self.read_view else self.view;
     }
 };
 
@@ -232,10 +243,11 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
         .array_layers = 1,
         .samples = swapchain.sampleFlags(samples),
         .tiling = .optimal,
-        // A depth texture is only drawn into, and kept for the passes that
-        // load it; so is a multisampled one, resolved where it is read.
+        // A depth texture is drawn into, and kept for the passes that load
+        // it - and read too, if it is sampled; a multisampled one is only
+        // drawn into, resolved where it is read.
         .usage = if (desc.format.isDepth())
-            .{ .depth_stencil_attachment = true }
+            .{ .depth_stencil_attachment = true, .sampled = desc.usage.sampled }
         else if (samples > 1)
             .{ .color_attachment = true }
         else
@@ -260,7 +272,7 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
 
     const res = try self.gpa.create(TextureRes);
     errdefer self.gpa.destroy(res);
-    res.* = .{ .image = image, .memory = memory, .view = .none, .width = desc.width, .height = desc.height, .format = desc.format, .vk_format = vk_format, .samples = samples };
+    res.* = .{ .image = image, .memory = memory, .view = .none, .width = desc.width, .height = desc.height, .format = desc.format, .vk_format = vk_format, .samples = samples, .sampled_depth = desc.format.isDepth() and desc.usage.sampled };
 
     _ = vkd.createImageView(self.runtime.device, &.{
         .image = image,
@@ -271,6 +283,26 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     }, null, &res.view).check() catch return error.Failed;
     errdefer vkd.destroyImageView(self.runtime.device, res.view, null);
     const view = res.view;
+
+    if (res.sampled_depth and desc.format.hasStencil()) {
+        _ = vkd.createImageView(self.runtime.device, &.{
+            .image = image,
+            .view_type = .@"2d",
+            .format = vk_format,
+            .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+            .subresource_range = rangeOf(.{ .depth = true }),
+        }, null, &res.read_view).check() catch return error.Failed;
+    }
+    errdefer if (res.read_view != .none) vkd.destroyImageView(self.runtime.device, res.read_view, null);
+
+    // A sampled depth texture into where a shader reads it, where every pass
+    // that draws into it leaves it.
+    if (res.sampled_depth) {
+        try vulkan.ensureRecording(self);
+        barrierOf(self, image, res.aspect(), .undefined, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .top_of_pipe = true }, .{ .fragment_shader = true });
+        self.has_work = true;
+        return res;
+    }
 
     // Into where depth is written, the layout every pass that loads it
     // expects; the framebuffer is the pass's own, with its colour target.
@@ -369,6 +401,7 @@ pub fn destroyTexture(impl: backend.Impl, native: backend.Native) void {
 
 pub fn freeTexture(self: *Vk, res: *TextureRes) void {
     if (res.framebuffer != .none) self.runtime.vkd.destroyFramebuffer(self.runtime.device, res.framebuffer, null);
+    if (res.read_view != .none) self.runtime.vkd.destroyImageView(self.runtime.device, res.read_view, null);
     self.runtime.vkd.destroyImageView(self.runtime.device, res.view, null);
     self.runtime.vkd.destroyImage(self.runtime.device, res.image, null);
     self.runtime.vkd.freeMemory(self.runtime.device, res.memory, null);
@@ -716,10 +749,10 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format, de
         .polygon_mode = .fill,
         .cull_mode = res.cull,
         .front_face = res.front_face,
-        .depth_bias_enable = vk.gen.types.vk_false,
-        .depth_bias_constant_factor = 0,
+        .depth_bias_enable = if (res.depth.biased()) vk.gen.types.vk_true else vk.gen.types.vk_false,
+        .depth_bias_constant_factor = @floatFromInt(res.depth.bias),
         .depth_bias_clamp = 0,
-        .depth_bias_slope_factor = 0,
+        .depth_bias_slope_factor = res.depth.slope_bias,
         .line_width = 1,
     };
     const multisample: vk.gen.types.PipelineMultisampleStateCreateInfo = .{

@@ -1912,6 +1912,8 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
             .front => .front,
         },
         .front_counter_clockwise = if (desc.front_face == .ccw) 1 else 0,
+        .depth_bias = desc.depth.bias,
+        .slope_scaled_depth_bias = desc.depth.slope_bias,
         .multisample_enable = if (desc.samples > 1) 1 else 0,
     }) catch return error.PipelineFailed;
     errdefer _ = com.release(rasterizer);

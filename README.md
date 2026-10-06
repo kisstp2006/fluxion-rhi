@@ -225,14 +225,25 @@ read back, `rgba8`, `bgra8` and `r8`, blending, instancing, scissors - and draw
 the picture Direct3D 11 does, which the sprites example's tests check. Both
 are narrower than it: 2D textures only, one mip level, one sample, no
 anisotropy. Both draw with depth - a depth texture beside a colour target, or
-alone, cleared or kept from an earlier pass - and a depth texture is drawn
-into, not sampled. A submit does not wait for the GPU: up to four are on their
+alone, cleared or kept from an earlier pass - and a depth texture made
+`sampled` is read after, as a shadow map: typeless on Direct3D 12, written
+through a view of its depth format and read through another, and kept where a
+shader reads it between passes on Vulkan. A submit does not wait for the GPU: up to four are on their
 way at once, and a buffer written while the GPU may still read it is
 written into another copy of its memory, which keeps the rest of its bytes -
 so `updateBuffer` means what it means on Direct3D 11. Vulkan gives every
 viewport a negative height, so its clip space is Direct3D's. With
 `DeviceDesc.debug` it turns the Khronos validation layer on, when one is
 installed.
+
+**A shadow map is a depth texture, a bias, and a sampler that compares.**
+`DepthState.bias` and `slope_bias` push each depth a pipeline writes back -
+that many of the format's smallest steps, and that much times the triangle's
+depth slope - so that a surface does not shadow itself; every backend has
+them. A depth texture made with `usage.sampled` is drawn into by a depth-only
+pass and then bound with `setTexture` and a sampler whose `compare` is set,
+which a `texture2d_shadow` in Fluxion Shader reads with `sample_compare`. For
+a depth format, `FormatSupport.filterable` says such a sampler filters it.
 
 **What the OpenGL backend cannot do**, and says so: instancing and a base
 vertex in the same indexed draw (`glDrawElementsInstancedBaseVertex` is 4.2),

@@ -78,6 +78,14 @@ pub const Format = enum(u32) {
     d32_float = 40,
     d24_unorm_s8_uint = 45,
     d16_unorm = 55,
+    // What a depth texture that is sampled is made as, and read through.
+    r32g8x24_typeless = 19,
+    r32_float_x8x24_typeless = 21,
+    r32_typeless = 39,
+    r24g8_typeless = 44,
+    r24_unorm_x8_typeless = 46,
+    r16_typeless = 53,
+    r16_unorm = 56,
     _,
 };
 
@@ -607,11 +615,28 @@ pub fn createRenderTargetView(device: *ID3D12Device, resource: ?*ID3D12Resource,
     create(device, resource, desc, dest);
 }
 
-/// A depth-stencil view of the resource's own format, its first mip and
-/// layer: what a texture made with a depth format is drawn into through.
-pub fn createDepthStencilView(device: *ID3D12Device, resource: *ID3D12Resource, dest: CpuDescriptorHandle) void {
-    const create = slot(*const fn (*ID3D12Device, ?*ID3D12Resource, ?*const anyopaque, CpuDescriptorHandle) callconv(.winapi) void, device.vtable.CreateDepthStencilView);
-    create(device, resource, null, dest);
+/// `D3D12_DSV_DIMENSION`, the ones used.
+pub const DsvDimension = enum(u32) {
+    texture2d = 3,
+    texture2dms = 4,
+};
+
+/// `D3D12_DEPTH_STENCIL_VIEW_DESC` for a whole 2D texture: its first mip.
+/// The union is as large as its largest member, three `UINT`s.
+pub const DepthStencilViewDesc = extern struct {
+    format: Format,
+    dimension: DsvDimension,
+    flags: u32 = 0,
+    mip_slice: u32 = 0,
+    rest: [2]u32 = .{ 0, 0 },
+};
+
+/// A depth-stencil view: what a texture made with a depth format is drawn
+/// into through. With no description, of the resource's own format, its
+/// first mip and layer - which a typeless resource has none of.
+pub fn createDepthStencilView(device: *ID3D12Device, resource: *ID3D12Resource, desc: ?*const DepthStencilViewDesc, dest: CpuDescriptorHandle) void {
+    const create = slot(*const fn (*ID3D12Device, ?*ID3D12Resource, ?*const DepthStencilViewDesc, CpuDescriptorHandle) callconv(.winapi) void, device.vtable.CreateDepthStencilView);
+    create(device, resource, desc, dest);
 }
 
 pub fn createSampler(device: *ID3D12Device, desc: *const SamplerDesc, dest: CpuDescriptorHandle) void {
@@ -683,6 +708,7 @@ test "the descriptions the runtime reads are shaped as it expects" {
     // comment; this is the test that would have caught the bug it describes.
     try testing.expectEqual(@as(usize, 40), @sizeOf(ShaderResourceViewDesc));
     try testing.expectEqual(@as(usize, 24), @sizeOf(RenderTargetViewDesc));
+    try testing.expectEqual(@as(usize, 24), @sizeOf(DepthStencilViewDesc));
     try testing.expectEqual(@as(usize, 16), @offsetOf(ShaderResourceViewDesc, "u"));
     try testing.expectEqual(@as(usize, 8), @offsetOf(RenderTargetViewDesc, "u"));
     try testing.expectEqual(@as(usize, 52), @sizeOf(SamplerDesc));

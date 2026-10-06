@@ -627,14 +627,16 @@ fn caps(impl: backend.Impl) types.Caps {
             .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
         });
     }
-    // A depth format the device draws depth into, for 3D: not sampled.
+    // A depth format the device draws depth into, for 3D, and reads where it
+    // can: a shadow map. For a depth format, filtered means a sampler that
+    // compares filters it.
     for ([_]types.Format{ .depth16_unorm, .depth24_stencil8, .depth32_float, .depth32_float_stencil8 }) |format| {
         var fp: vk.gen.types.FormatProperties = undefined;
         vki.getPhysicalDeviceFormatProperties(self.runtime.physical_device, toVkFormat(format).?, &fp);
         if (!fp.optimal_tiling_features.depth_stencil_attachment) continue;
         answer.formats.set(format, .{
-            .sampled = false,
-            .filterable = false,
+            .sampled = fp.optimal_tiling_features.sampled_image,
+            .filterable = fp.optimal_tiling_features.sampled_image_filter_linear,
             .render_target = true,
             .blendable = false,
             .generate_mips = false,
@@ -931,7 +933,7 @@ fn resolveInto(self: *Vk, device: *Device, target: types.RenderTarget) types.Err
 fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error!void {
     if (pass.extra_colors.len > 0) return error.Unsupported;
     const depth_texture: ?*TextureRes = if (pass.depth) |depth| as(TextureRes, device.textures.get(depth.texture).?.native) else null;
-    const depth: swapchain.Depth = if (pass.depth) |held| .{ .format = depth_texture.?.vk_format, .load = swapchain.mapLoadOp(held.load) } else .none;
+    const depth: swapchain.Depth = if (pass.depth) |held| .{ .format = depth_texture.?.vk_format, .load = swapchain.mapLoadOp(held.load), .sampled = depth_texture.?.sampled_depth } else .none;
 
     var framebuffer: vk.gen.types.Framebuffer = .none;
     var render_pass: vk.gen.types.RenderPass = .none;
@@ -1143,7 +1145,7 @@ fn flushBindings(self: *Vk) types.Error!void {
         const binding = self.current_tex[i];
         const tex = if (binding) |b| b.texture else self.dummy_texture;
         const samp = if (binding) |b| b.sampler else self.dummy_sampler;
-        info_.* = .{ .sampler = samp.sampler, .image_view = tex.view, .image_layout = .shader_read_only_optimal };
+        info_.* = .{ .sampler = samp.sampler, .image_view = tex.sampledView(), .image_layout = .shader_read_only_optimal };
     }
 
     const set_layouts = [_]vk.gen.types.DescriptorSetLayout{ self.set_layout_uniforms, self.set_layout_textures };
@@ -1443,6 +1445,92 @@ test "a depth texture keeps what is nearer, whichever is drawn last, and a pass 
     try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, pixels[(4 * 8 + 4) * 4 ..][0..4]);
 }
 
+test "a depth texture drawn into is read by a sampler that compares, and a bias pushes what is drawn back" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    // A device that cannot read 32-bit float depth: every desktop one can.
+    if (!device.caps().formatSupport(.depth32_float).sampled) return error.SkipZigTest;
+
+    // A plane at depth one half, drawn into two shadow maps: once as it is,
+    // and once pushed back by 2^18 of a 32-bit float's steps at one half,
+    // 2^-24 each - a sixty-fourth.
+    const flat = try device.createShader(.{ .spirv = .{ .vertex = shaded_vertex, .fragment = shaded_fragment } });
+    defer device.destroyShader(flat);
+    const plane = [_]f32{ -1, -1, 0.5, 1, 1, 1, 1, 3, -1, 0.5, 1, 1, 1, 1, -1, 3, 0.5, 1, 1, 1, 1 };
+    const plane_buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(plane)), .data = std.mem.asBytes(&plane) });
+    defer device.destroyBuffer(plane_buffer);
+    const attributes = [_]types.VertexAttribute{ .{ .location = 0, .format = .float3, .offset = 0 }, .{ .location = 1, .format = .float4, .offset = 12 } };
+    var maps: [2]types.Texture = undefined;
+    var pipelines: [2]types.Pipeline = undefined;
+    for (&maps, &pipelines, [_]i32{ 0, 1 << 18 }) |*map, *pipeline, bias| {
+        pipeline.* = try device.createPipeline(.{
+            .shader = flat,
+            .attributes = &attributes,
+            .buffers = &.{.{ .stride = 28 }},
+            .color_format = null,
+            .depth_format = .depth32_float,
+            .depth = .{ .test_enabled = true, .write = true, .compare = .less, .bias = bias },
+        });
+        map.* = try device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .sampled = true, .render_target = true } });
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .depth = .{ .texture = map.* } });
+        try cmd.setPipeline(pipeline.*);
+        try cmd.setVertexBuffer(0, plane_buffer, 0);
+        try cmd.draw(.{ .vertex_count = 3 });
+        try cmd.endPass();
+        try device.submit();
+    }
+    defer for (maps, pipelines) |map, pipeline| {
+        device.destroyTexture(map);
+        device.destroyPipeline(pipeline);
+    };
+
+    // Read through a sampler that compares: lit where the depth asked about
+    // is at or before what is stored.
+    const shader = try device.createShader(.{ .spirv = .{ .vertex = corner_vertex, .fragment = compare_fragment } });
+    defer device.destroyShader(shader);
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{.{ .location = 0, .format = .float2, .offset = 0 }},
+        .buffers = &.{.{ .stride = 8 }},
+        .topology = .triangle_strip,
+    });
+    defer device.destroyPipeline(pipeline);
+    const corners = [_]f32{ -1, -1, 1, -1, -1, 1, 1, 1 };
+    const corner_buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) });
+    defer device.destroyBuffer(corner_buffer);
+    const compare = try device.createSampler(.{ .compare = .less_equal });
+    defer device.destroySampler(compare);
+    const params = try device.createBuffer(.{ .kind = .uniform, .size = 16 });
+    defer device.destroyBuffer(params);
+    const out = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+    defer device.destroyTexture(out);
+
+    const cases = [_]struct { map: usize, depth: f32, lit: bool }{
+        .{ .map = 0, .depth = 0.3, .lit = true },
+        .{ .map = 0, .depth = 0.7, .lit = false },
+        .{ .map = 0, .depth = 0.505, .lit = false },
+        .{ .map = 1, .depth = 0.505, .lit = true },
+        .{ .map = 1, .depth = 0.53, .lit = false },
+    };
+    for (cases) |case| {
+        try device.updateBuffer(params, 0, std.mem.asBytes(&[4]f32{ case.depth, 0, 0, 0 }));
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = out } } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, corner_buffer, 0);
+        try cmd.setUniformBuffer(0, params);
+        try cmd.setTexture(0, maps[case.map], compare);
+        try cmd.draw(.{ .vertex_count = 4 });
+        try cmd.endPass();
+        try device.submit();
+        const pixels = try device.readTexture(out, testing.allocator);
+        defer testing.allocator.free(pixels);
+        const want: [4]u8 = if (case.lit) .{ 255, 255, 255, 255 } else .{ 0, 0, 0, 255 };
+        try testing.expectEqualSlices(u8, &want, pixels[(2 * 4 + 1) * 4 ..][0..4]);
+    }
+}
+
 test "a float target keeps light over one, read back clamped" {
     var device = try openTestDevice();
     defer device.deinit();
@@ -1682,6 +1770,80 @@ const shaded_vertex: []const u32 = &.{
     0x00000016, 0x00000017, 0x00000014, 0x00050041, 0x00000019, 0x0000001a, 0x0000000d, 0x0000000f,
     0x0003003e, 0x0000001a, 0x00000018, 0x0004003d, 0x00000007, 0x0000001e, 0x0000001d, 0x0003003e,
     0x0000001b, 0x0000001e, 0x000100fd, 0x00010038,
+};
+
+/// A quad from its corners, and the uv across it, top row first.
+const corner_vertex: []const u32 = &.{
+    0x07230203, 0x00010000, 0x0008000b, 0x00000024, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0008000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000000b, 0x00000019,
+    0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005,
+    0x00000009, 0x00007675, 0x00040005, 0x0000000b, 0x6e726f63, 0x00007265, 0x00060005, 0x00000017,
+    0x505f6c67, 0x65567265, 0x78657472, 0x00000000, 0x00060006, 0x00000017, 0x00000000, 0x505f6c67,
+    0x7469736f, 0x006e6f69, 0x00070006, 0x00000017, 0x00000001, 0x505f6c67, 0x746e696f, 0x657a6953,
+    0x00000000, 0x00070006, 0x00000017, 0x00000002, 0x435f6c67, 0x4470696c, 0x61747369, 0x0065636e,
+    0x00070006, 0x00000017, 0x00000003, 0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005,
+    0x00000019, 0x00000000, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047, 0x0000000b,
+    0x0000001e, 0x00000000, 0x00030047, 0x00000017, 0x00000002, 0x00050048, 0x00000017, 0x00000000,
+    0x0000000b, 0x00000000, 0x00050048, 0x00000017, 0x00000001, 0x0000000b, 0x00000001, 0x00050048,
+    0x00000017, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x00000017, 0x00000003, 0x0000000b,
+    0x00000004, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
+    0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020, 0x00000008, 0x00000003,
+    0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00040020, 0x0000000a, 0x00000001,
+    0x00000007, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000001, 0x0004002b, 0x00000006, 0x0000000d,
+    0x3f000000, 0x0004002b, 0x00000006, 0x0000000e, 0xbf000000, 0x0005002c, 0x00000007, 0x0000000f,
+    0x0000000d, 0x0000000e, 0x00040017, 0x00000013, 0x00000006, 0x00000004, 0x00040015, 0x00000014,
+    0x00000020, 0x00000000, 0x0004002b, 0x00000014, 0x00000015, 0x00000001, 0x0004001c, 0x00000016,
+    0x00000006, 0x00000015, 0x0006001e, 0x00000017, 0x00000013, 0x00000006, 0x00000016, 0x00000016,
+    0x00040020, 0x00000018, 0x00000003, 0x00000017, 0x0004003b, 0x00000018, 0x00000019, 0x00000003,
+    0x00040015, 0x0000001a, 0x00000020, 0x00000001, 0x0004002b, 0x0000001a, 0x0000001b, 0x00000000,
+    0x0004002b, 0x00000006, 0x0000001d, 0x00000000, 0x0004002b, 0x00000006, 0x0000001e, 0x3f800000,
+    0x00040020, 0x00000022, 0x00000003, 0x00000013, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+    0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000007, 0x0000000c, 0x0000000b, 0x00050085,
+    0x00000007, 0x00000010, 0x0000000c, 0x0000000f, 0x00050050, 0x00000007, 0x00000011, 0x0000000d,
+    0x0000000d, 0x00050081, 0x00000007, 0x00000012, 0x00000010, 0x00000011, 0x0003003e, 0x00000009,
+    0x00000012, 0x0004003d, 0x00000007, 0x0000001c, 0x0000000b, 0x00050051, 0x00000006, 0x0000001f,
+    0x0000001c, 0x00000000, 0x00050051, 0x00000006, 0x00000020, 0x0000001c, 0x00000001, 0x00070050,
+    0x00000013, 0x00000021, 0x0000001f, 0x00000020, 0x0000001d, 0x0000001e, 0x00050041, 0x00000022,
+    0x00000023, 0x00000019, 0x0000001b, 0x0003003e, 0x00000023, 0x00000021, 0x000100fd, 0x00010038,
+};
+
+/// `layout(set = 1, binding = 0) uniform sampler2DShadow map` compared at
+/// `uv` with `param.x` of the block at set 0, binding 0, written as grey.
+const compare_fragment: []const u32 = &.{
+    0x07230203, 0x00010000, 0x0008000b, 0x00000028, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000010, 0x00000024, 0x00030010,
+    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
+    0x00000000, 0x00030005, 0x00000008, 0x00000076, 0x00030005, 0x0000000c, 0x0070616d, 0x00030005,
+    0x00000010, 0x00007675, 0x00040005, 0x00000013, 0x61726150, 0x0000736d, 0x00050006, 0x00000013,
+    0x00000000, 0x61726170, 0x0000006d, 0x00030005, 0x00000015, 0x00000000, 0x00040005, 0x00000024,
+    0x67726174, 0x00007465, 0x00040047, 0x0000000c, 0x00000021, 0x00000000, 0x00040047, 0x0000000c,
+    0x00000022, 0x00000001, 0x00040047, 0x00000010, 0x0000001e, 0x00000000, 0x00030047, 0x00000013,
+    0x00000002, 0x00050048, 0x00000013, 0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x00000015,
+    0x00000021, 0x00000000, 0x00040047, 0x00000015, 0x00000022, 0x00000000, 0x00040047, 0x00000024,
+    0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+    0x00000006, 0x00000020, 0x00040020, 0x00000007, 0x00000007, 0x00000006, 0x00090019, 0x00000009,
+    0x00000006, 0x00000001, 0x00000001, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b,
+    0x0000000a, 0x00000009, 0x00040020, 0x0000000b, 0x00000000, 0x0000000a, 0x0004003b, 0x0000000b,
+    0x0000000c, 0x00000000, 0x00040017, 0x0000000e, 0x00000006, 0x00000002, 0x00040020, 0x0000000f,
+    0x00000001, 0x0000000e, 0x0004003b, 0x0000000f, 0x00000010, 0x00000001, 0x00040017, 0x00000012,
+    0x00000006, 0x00000004, 0x0003001e, 0x00000013, 0x00000012, 0x00040020, 0x00000014, 0x00000002,
+    0x00000013, 0x0004003b, 0x00000014, 0x00000015, 0x00000002, 0x00040015, 0x00000016, 0x00000020,
+    0x00000001, 0x0004002b, 0x00000016, 0x00000017, 0x00000000, 0x00040015, 0x00000018, 0x00000020,
+    0x00000000, 0x0004002b, 0x00000018, 0x00000019, 0x00000000, 0x00040020, 0x0000001a, 0x00000002,
+    0x00000006, 0x00040017, 0x0000001d, 0x00000006, 0x00000003, 0x00040020, 0x00000023, 0x00000003,
+    0x00000012, 0x0004003b, 0x00000023, 0x00000024, 0x00000003, 0x0004002b, 0x00000006, 0x00000026,
+    0x3f800000, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+    0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c,
+    0x0004003d, 0x0000000e, 0x00000011, 0x00000010, 0x00060041, 0x0000001a, 0x0000001b, 0x00000015,
+    0x00000017, 0x00000019, 0x0004003d, 0x00000006, 0x0000001c, 0x0000001b, 0x00050051, 0x00000006,
+    0x0000001e, 0x00000011, 0x00000000, 0x00050051, 0x00000006, 0x0000001f, 0x00000011, 0x00000001,
+    0x00060050, 0x0000001d, 0x00000020, 0x0000001e, 0x0000001f, 0x0000001c, 0x00050051, 0x00000006,
+    0x00000021, 0x00000020, 0x00000002, 0x00060059, 0x00000006, 0x00000022, 0x0000000d, 0x00000020,
+    0x00000021, 0x0003003e, 0x00000008, 0x00000022, 0x0004003d, 0x00000006, 0x00000025, 0x00000008,
+    0x00070050, 0x00000012, 0x00000027, 0x00000025, 0x00000025, 0x00000025, 0x00000026, 0x0003003e,
+    0x00000024, 0x00000027, 0x000100fd, 0x00010038,
 };
 
 /// `layout(set = 0, binding = 0) uniform Look { vec4 colour; }`, written

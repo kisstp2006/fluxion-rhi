@@ -416,6 +416,9 @@ pub const RenderPassEntry = struct {
 pub const Depth = struct {
     format: vk.gen.types.Format = .undefined,
     load: vk.gen.types.AttachmentLoadOp = .dont_care,
+    /// A depth texture that is sampled as well: found and left where a
+    /// shader reads it, rather than where depth is written.
+    sampled: bool = false,
 
     pub const none: Depth = .{};
 };
@@ -446,7 +449,7 @@ pub fn getRenderPass(
     for (self.render_passes) |maybe| {
         if (maybe) |entry| {
             if (entry.format == format and entry.load == load and entry.initial == initial and entry.final == final and
-                entry.depth.format == depth.format and entry.depth.load == depth.load and entry.samples == samples and
+                std.meta.eql(entry.depth, depth) and entry.samples == samples and
                 std.meta.eql(entry.resolve, resolve)) return entry.pass;
         }
     }
@@ -489,10 +492,11 @@ pub fn getRenderPass(
             .store_op = .store,
             .stencil_load_op = if (stencil) depth.load else .dont_care,
             .stencil_store_op = if (stencil) .store else .dont_care,
-            // Kept where depth is written between passes: cleared, what was
-            // there before does not matter.
-            .initial_layout = if (depth.load == .load) .depth_stencil_attachment_optimal else .undefined,
-            .final_layout = .depth_stencil_attachment_optimal,
+            // Kept where depth is written between passes - or where a shader
+            // reads it, for one that is sampled. Cleared, what was there
+            // before does not matter.
+            .initial_layout = if (depth.load != .load) .undefined else if (depth.sampled) .shader_read_only_optimal else .depth_stencil_attachment_optimal,
+            .final_layout = if (depth.sampled) .shader_read_only_optimal else .depth_stencil_attachment_optimal,
         };
         count += 1;
     }

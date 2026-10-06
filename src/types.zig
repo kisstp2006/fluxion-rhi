@@ -713,6 +713,17 @@ pub const DepthState = struct {
     test_enabled: bool = false,
     write: bool = false,
     compare: CompareFn = .less,
+    /// How far each depth written is pushed back: `bias` of the depth
+    /// format's smallest steps, and `slope_bias` times how steeply the
+    /// triangle's depth changes across a pixel. What keeps a shadow map's
+    /// surface from shadowing itself; nought draws depth as it is.
+    bias: i32 = 0,
+    slope_bias: f32 = 0,
+
+    /// Whether anything is pushed back.
+    pub fn biased(self: DepthState) bool {
+        return self.bias != 0 or self.slope_bias != 0;
+    }
 
     /// What 2D wants: draw order decides.
     pub const none: DepthState = .{};

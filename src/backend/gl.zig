@@ -2195,6 +2195,12 @@ fn bindPipeline(self: *Gl, res: *PipelineRes) Error!void {
         api.disable(c.depth_test);
     }
     api.depthMask(if (res.depth.write) gt.gl_true else gt.gl_false);
+    if (res.depth.biased()) {
+        api.enable(c.polygon_offset_fill);
+        api.polygonOffset(res.depth.slope_bias, @floatFromInt(res.depth.bias));
+    } else {
+        api.disable(c.polygon_offset_fill);
+    }
 
     switch (res.cull) {
         .none => api.disable(c.cull_face),

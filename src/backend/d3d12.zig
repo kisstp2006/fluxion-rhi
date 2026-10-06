@@ -344,9 +344,10 @@ const Target = struct {
     height: u32,
     /// What the colour target goes back to when the pass ends: the back
     /// buffer to presenting, a texture to being sampled. A depth texture
-    /// stays where depth is written.
+    /// stays where depth is written, unless it is sampled too.
     resource: ?*rc.ID3D12Resource,
     texture: ?*TextureRes,
+    depth: ?*TextureRes = null,
     /// Where a multisampled colour target is resolved when the pass ends.
     resolve: ?Resolve = null,
 
@@ -425,6 +426,9 @@ const TextureRes = struct {
     state: rc.ResourceStates = sampled,
     /// Samples a pixel: more than one for a target a pass resolves.
     samples: u32 = 1,
+    /// A depth texture that is sampled as well: back to `sampled` when the
+    /// pass that drew into it ends.
+    readable: bool = false,
 };
 
 /// What a texture is between submits: readable by any stage, since the root
@@ -784,10 +788,13 @@ fn caps(impl: backend.Impl) types.Caps {
         if (drawn and multisampled) for ([_]u32{ 2, 4, 8 }) |count| {
             if (askSamples(self.device, native, count)) counts |= @as(u8, @intCast(count));
         };
+        // A depth format is read through a view of another format, the
+        // one `depthFormats` names, and asked about as that.
+        const read_bits = if (depth) askFormat(self.device, depthFormats(format).read) else bits;
         answer.formats.set(format, .{
-            // A depth texture is drawn into, not sampled: depth testing, for 3D.
-            .sampled = !depth and bits & (support_shader_load | support_shader_sample) != 0,
-            .filterable = !depth and bits & support_shader_sample != 0,
+            .sampled = read_bits & (support_shader_load | support_shader_sample) != 0,
+            // For a depth format: whether a sampler that compares filters it.
+            .filterable = read_bits & support_shader_sample != 0,
             .render_target = drawn,
             .blendable = !depth and bits & support_blendable != 0,
             .generate_mips = false,
@@ -796,6 +803,21 @@ fn caps(impl: backend.Impl) types.Caps {
         });
     }
     return answer;
+}
+
+/// What a depth texture that is also sampled - a shadow map - is made as:
+/// typeless, so that depth is written through a view of one format and read
+/// through a view of another.
+const DepthFormats = struct { resource: rc.Format, read: rc.Format };
+
+fn depthFormats(format: types.Format) DepthFormats {
+    return switch (format) {
+        .depth16_unorm => .{ .resource = .r16_typeless, .read = .r16_unorm },
+        .depth24_stencil8 => .{ .resource = .r24g8_typeless, .read = .r24_unorm_x8_typeless },
+        .depth32_float => .{ .resource = .r32_typeless, .read = .r32_float },
+        .depth32_float_stencil8 => .{ .resource = .r32g8x24_typeless, .read = .r32_float_x8x24_typeless },
+        else => unreachable,
+    };
 }
 
 fn textureFormat(format: types.Format) ?rc.Format {
@@ -1124,10 +1146,14 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     const res = try self.gpa.create(TextureRes);
     errdefer self.gpa.destroy(res);
 
-    // A depth texture is only ever drawn into: made where depth is written,
-    // with a depth-stencil view and a null shader resource view.
+    // A depth texture is made where depth is written, with a depth-stencil
+    // view. One that is sampled too - a shadow map - is typeless, written
+    // through a view of its depth format and read through one of the format
+    // `depthFormats` names; one that is not has a null shader resource view.
     if (desc.format.isDepth()) {
-        var rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_depth_stencil = true, .deny_shader_resource = true });
+        const readable = desc.usage.sampled;
+        const formats = depthFormats(desc.format);
+        var rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, if (readable) formats.resource else format, .{ .allow_depth_stencil = true, .deny_shader_resource = !readable });
         rdesc.sample = .{ .count = desc.samples };
         const clear: rc.ClearValue = .depthStencil(format, 1, 0);
         const writing: rc.ResourceStates = .{ .depth_write = true };
@@ -1137,8 +1163,8 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
         errdefer freeDsv(self, dsv);
         const slot = try allocSrv(self);
         const cpu = srvHandle(self, slot);
-        rc.createShaderResourceView(self.device, null, &.{
-            .format = .r8g8b8a8_unorm,
+        rc.createShaderResourceView(self.device, if (readable) obj else null, &.{
+            .format = if (readable) formats.read else .r8g8b8a8_unorm,
             .dimension = .texture2d,
             .u = .{ .texture2d = .{ .mip_levels = 1 } },
         }, cpu);
@@ -1153,8 +1179,11 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
             .dsv_cpu = dsvHandle(self, dsv),
             .state = writing,
             .samples = desc.samples,
+            .readable = readable,
         };
-        rc.createDepthStencilView(self.device, obj, res.dsv_cpu);
+        // A typeless resource's view has to say its format; any other's is
+        // the resource's own.
+        rc.createDepthStencilView(self.device, obj, if (readable) &.{ .format = format, .dimension = .texture2d } else null, res.dsv_cpu);
         return res;
     }
 
@@ -1525,6 +1554,8 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
             .front => .front,
         },
         .front_counter_clockwise = if (desc.front_face == .ccw) 1 else 0,
+        .depth_bias = desc.depth.bias,
+        .slope_scaled_depth_bias = desc.depth.slope_bias,
     };
 
     const topology_type: pl.PrimitiveTopologyType = switch (desc.topology) {
@@ -1752,6 +1783,7 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                     const dsv = res.dsv_index orelse return error.Unsupported;
                     transition(self, res, .{ .depth_write = true });
                     target.dsv = dsvHandle(self, dsv);
+                    target.depth = res;
                     if (pass.color == null) {
                         target.width = res.width;
                         target.height = res.height;
@@ -1871,6 +1903,7 @@ fn endTarget(self: *D3d) void {
     const target = self.target orelse return;
     self.target = null;
     if (target.resolve) |into| resolve(self, target.texture.?, into);
+    if (target.depth) |res| if (res.readable) transition(self, res, sampled);
     if (target.texture) |res| {
         transition(self, res, sampled);
     } else if (target.resource) |back_buffer| {
@@ -2030,7 +2063,9 @@ test "caps: .d2 only; the driver's formats, floats too, sampled, drawn into and 
     // A depth format is drawn into and not sampled; a compressed one is
     // never claimed.
     try testing.expect(c.formatSupport(.depth32_float).render_target);
-    try testing.expect(!c.formatSupport(.depth32_float).sampled);
+    // ... and read, as a shadow map, filtered by a sampler that compares.
+    try testing.expect(c.formatSupport(.depth32_float).sampled);
+    try testing.expect(c.formatSupport(.depth32_float).filterable);
     try testing.expect(!c.formatSupport(.bc1_rgba_unorm).sampled);
 }
 
@@ -2355,9 +2390,91 @@ test "what is not here yet comes back as error.Unsupported" {
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4 }));
     // No chains of levels.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 2 }));
-    // No compressed formats, and no depth to sample.
+    // No compressed formats.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .bc1_rgba_unorm }));
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .sampled = true, .render_target = true } }));
+}
+
+test "a depth texture drawn into is read by a sampler that compares, and a bias pushes what is drawn back" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    // A plane at depth one half, drawn into two shadow maps: once as it is,
+    // and once pushed back by 2^18 of a 32-bit float's steps at one half,
+    // 2^-24 each - a sixty-fourth.
+    const nothing =
+        \\float4 main() : SV_TARGET { return 0; }
+    ;
+    const flat = try device.createShader(.{ .hlsl = .{ .vertex = Flat.vs, .fragment = nothing } });
+    const plane = try device.createBuffer(.{ .kind = .vertex, .size = 72, .data = std.mem.sliceAsBytes(&[_]f32{
+        -1, -1, 0.5, 1, -1, 0.5, -1, 1, 0.5,
+        -1, 1,  0.5, 1, -1, 0.5, 1,  1, 0.5,
+    }) });
+    var maps: [2]types.Texture = undefined;
+    for (&maps, [_]i32{ 0, 1 << 18 }) |*map, bias| {
+        const pipeline = try device.createPipeline(.{
+            .shader = flat,
+            .attributes = &.{.{ .location = 0, .format = .float3, .offset = 0 }},
+            .buffers = &.{.{ .stride = 12 }},
+            .color_format = null,
+            .depth_format = .depth32_float,
+            .depth = .{ .test_enabled = true, .write = true, .compare = .less, .bias = bias },
+        });
+        map.* = try device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .sampled = true, .render_target = true } });
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .depth = .{ .texture = map.* } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, plane, 0);
+        try cmd.draw(.{ .vertex_count = 6 });
+        try cmd.endPass();
+        try device.submit();
+    }
+
+    // Read through a sampler that compares: lit where the depth asked about
+    // is at or before what is stored.
+    const comparing =
+        \\cbuffer Params : register(b0) { float4 param; };
+        \\Texture2D<float> map : register(t0);
+        \\SamplerComparisonState map_sampler : register(s0);
+        \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+        \\    float v = map.SampleCmpLevelZero(map_sampler, uv, param.x);
+        \\    return float4(v, v, v, 1);
+        \\}
+    ;
+    const shader = try device.createShader(.{ .hlsl = .{ .vertex = Quad.vs, .fragment = comparing } });
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{.{ .location = 0, .format = .float2, .offset = 0 }},
+        .buffers = &.{.{ .stride = 8 }},
+        .topology = .triangle_strip,
+    });
+    const quad = try Quad.init(&device);
+    const compare = try device.createSampler(.{ .compare = .less_equal });
+    const params = try device.createBuffer(.{ .kind = .uniform, .size = 16 });
+    const out = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .sampled = true, .render_target = true } });
+
+    const cases = [_]struct { map: usize, depth: f32, lit: bool }{
+        .{ .map = 0, .depth = 0.3, .lit = true },
+        .{ .map = 0, .depth = 0.7, .lit = false },
+        .{ .map = 0, .depth = 0.505, .lit = false },
+        .{ .map = 1, .depth = 0.505, .lit = true },
+        .{ .map = 1, .depth = 0.53, .lit = false },
+    };
+    for (cases) |case| {
+        try device.updateBuffer(params, 0, std.mem.asBytes(&[4]f32{ case.depth, 0, 0, 0 }));
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = out } } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, quad.corners, 0);
+        try cmd.setUniformBuffer(0, params);
+        try cmd.setTexture(0, maps[case.map], compare);
+        try cmd.draw(.{ .vertex_count = 4 });
+        try cmd.endPass();
+        try device.submit();
+        const pixels = try device.readTexture(out, testing.allocator);
+        defer testing.allocator.free(pixels);
+        const want: [4]u8 = if (case.lit) .{ 255, 255, 255, 255 } else .{ 0, 0, 0, 255 };
+        try testing.expectEqual(want, texelAt(pixels, 4, 1, 2));
+    }
 }
 
 /// A triangle in one colour, at `samples` a pixel, with a depth test where
