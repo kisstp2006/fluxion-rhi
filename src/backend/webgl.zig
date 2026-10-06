@@ -30,8 +30,7 @@
 //! or `EXT_color_buffer_half_float` make a float framebuffer complete, and
 //! `EXT_texture_filter_anisotropic` makes its limit answer. A page that wants
 //! float render targets or anisotropy calls `getExtension` on the context it
-//! made, before it instantiates the module - `examples/web/index.html` does,
-//! and `fluxion-platform`'s glue does for every context it makes.
+//! made, before it instantiates the module - `examples/web/index.html` does.
 //! What no query can reveal (`OES_texture_float_linear`, `EXT_float_blend`)
 //! is reported as absent, and the formats that need it say so in `natives`.
 //!
