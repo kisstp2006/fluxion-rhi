@@ -578,9 +578,10 @@ fn info(impl: backend.Impl) types.Info {
 // Capabilities
 // -------------------------------------------------------------------------
 
-/// `.d2` and one mip; the uncompressed formats, each as the device says it
-/// can be sampled, filtered, drawn into and blended, and as many samples a
-/// pixel as its framebuffers take. Depth is drawn into, not sampled. Every
+/// `.d2`, with a chain of levels; the uncompressed formats, each as the
+/// device says it can be sampled, filtered, drawn into and blended, its
+/// levels made by a filtered blit, and as many samples a pixel as its
+/// framebuffers take. Depth is drawn into, not sampled. Every
 /// format not listed here defaults to `FormatSupport{}` - unsupported - so
 /// `Device`'s caps-driven pre-validation refuses the rest before this backend
 /// is ever asked.
@@ -622,7 +623,9 @@ fn caps(impl: backend.Impl) types.Caps {
             .filterable = feats.sampled_image_filter_linear,
             .render_target = feats.color_attachment,
             .blendable = feats.color_attachment_blend,
-            .generate_mips = false,
+            // `generateMips` blits each level down from the one above with
+            // a linear filter, which the format must allow both ways.
+            .generate_mips = feats.blit_src and feats.blit_dst and feats.sampled_image_filter_linear,
             .sample_counts = if (feats.color_attachment) color_counts | 1 else 0b1,
             .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
         });
@@ -885,9 +888,7 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
                 try prepareDraw(self);
                 vkd.cmdDrawIndexed(cmd, d.index_count, d.instance_count, d.first_index, d.base_vertex, 0);
             },
-            // `caps.formats[*].generate_mips` is always false, so `Device`
-            // refuses this before it reaches here.
-            .generate_mips => return error.Unsupported,
+            .generate_mips => |h| resources.generateMips(self, as(TextureRes, device.textures.get(h).?.native)),
         }
     }
 
@@ -926,7 +927,11 @@ fn resolveInto(self: *Vk, device: *Device, target: types.RenderTarget) types.Err
             surface.drawn[index] = true;
             break :blk .{ .view = surface.views[index], .final = .present_src_khr };
         },
-        .texture => |h| .{ .view = as(TextureRes, device.textures.get(h).?.native).view, .final = .shader_read_only_optimal },
+        .texture => |h| blk: {
+            // Level zero: the view of a whole chain is no attachment.
+            const res = as(TextureRes, device.textures.get(h).?.native);
+            break :blk .{ .view = if (res.level_views.len > 0) res.level_views[0] else res.view, .final = .shader_read_only_optimal };
+        },
     };
 }
 
@@ -969,15 +974,20 @@ fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error
                 resolve = try resolveInto(self, device, into);
                 const initial: vk.gen.types.ImageLayout = if (load == .load) .color_attachment_optimal else .undefined;
                 render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .color_attachment_optimal, depth, texture.samples, resolve.?.final);
+                color_view = texture.view;
+                extent = .{ texture.width, texture.height };
             } else {
-                if (texture.framebuffer == .none or color.resolve != null) return error.Unsupported;
+                // The level the pass names, through its own view: the
+                // others keep their layout, and their texels.
+                const level = texture.target(color.mip_level) orelse return error.Unsupported;
+                if (color.resolve != null) return error.Unsupported;
                 const initial: vk.gen.types.ImageLayout = if (load == .load) .shader_read_only_optimal else .undefined;
                 render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .shader_read_only_optimal, depth, 1, null);
-                framebuffer = texture.framebuffer;
+                framebuffer = level.framebuffer;
+                color_view = level.view;
+                extent = texture.levelSize(color.mip_level);
             }
-            color_view = texture.view;
             format = texture.vk_format;
-            extent = .{ texture.width, texture.height };
         },
     } else {
         // Depth alone: a shadow map, a depth prepass.
@@ -1368,8 +1378,6 @@ test "what is not here yet is refused as Unsupported" {
         .width = 4,
         .height = 4,
     }));
-    // A chain of levels.
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 2 }));
 }
 
 test "a depth texture keeps what is nearer, whichever is drawn last, and a pass can write depth alone" {
@@ -1725,6 +1733,166 @@ test "a multisampled target, with multisampled depth, is resolved into a texture
 // fragment stage writes a fixed colour.
 // -------------------------------------------------------------------------
 
+const palette = [_][4]u8{
+    .{ 255, 0, 0, 255 },
+    .{ 0, 255, 0, 255 },
+    .{ 0, 0, 255, 255 },
+    .{ 255, 255, 0, 255 },
+};
+
+fn solidLevel(buffer: []u8, colour: [4]u8) []u8 {
+    for (0..buffer.len / 4) |i| buffer[i * 4 ..][0..4].* = colour;
+    return buffer;
+}
+
+fn expectSolid(pixels: []const u8, colour: [4]u8) !void {
+    var i: usize = 0;
+    while (i < pixels.len) : (i += 4) try testing.expectEqualSlices(u8, &colour, pixels[i..][0..4]);
+}
+
+fn expectNear(expected: [4]u8, actual: [4]u8, tolerance: u8) !void {
+    for (expected, actual) |e, a| {
+        const distance = if (e > a) e - a else a - e;
+        if (distance > tolerance) {
+            std.debug.print("expected {any}, found {any}\n", .{ expected, actual });
+            return error.TestExpectedApproxEqAbs;
+        }
+    }
+}
+
+test "each level of a chain is written and read on its own" {
+    var device = try openTestDevice();
+    defer device.deinit();
+
+    const texture = try device.createTexture(.{ .width = 8, .height = 8, .mip_levels = 0 });
+    defer device.destroyTexture(texture);
+    try testing.expectEqual(@as(u32, 4), (try device.textureInfo(texture)).mip_levels);
+    var buffer: [8 * 8 * 4]u8 = undefined;
+    for (0..4) |mip| {
+        const size: usize = types.mipExtent(8, @intCast(mip));
+        try device.writeTexture(texture, .{ .mip = @intCast(mip) }, solidLevel(buffer[0 .. size * size * 4], palette[mip]), 0, 0);
+    }
+    for (0..4) |mip| {
+        const size: usize = types.mipExtent(8, @intCast(mip));
+        const pixels = try device.readSubresource(texture, .{ .mip = @intCast(mip) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqual(size * size * 4, pixels.len);
+        try expectSolid(pixels, palette[mip]);
+    }
+
+    // A box in level one, and the rest of that level, and the others, keep theirs.
+    try device.writeTexture(texture, .{ .mip = 1, .x = 1, .y = 1, .width = 2, .height = 2 }, solidLevel(buffer[0..16], palette[3]), 0, 0);
+    const one = try device.readSubresource(texture, .{ .mip = 1 }, testing.allocator);
+    defer testing.allocator.free(one);
+    try testing.expectEqualSlices(u8, &palette[3], one[(1 * 4 + 1) * 4 ..][0..4]);
+    try testing.expectEqualSlices(u8, &palette[3], one[(2 * 4 + 2) * 4 ..][0..4]);
+    try testing.expectEqualSlices(u8, &palette[1], one[0..4]);
+    const zero = try device.readSubresource(texture, .{}, testing.allocator);
+    defer testing.allocator.free(zero);
+    try expectSolid(zero, palette[0]);
+}
+
+test "generateMips fills the chain from level zero" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    if (!device.caps().formatSupport(.rgba8_unorm).generate_mips) return error.SkipZigTest;
+
+    // A 4x4 checkerboard of black and white: every level below is grey.
+    var checker: [4 * 4 * 4]u8 = undefined;
+    for (0..16) |i| checker[i * 4 ..][0..4].* = if ((i % 4 + i / 4) % 2 == 0) .{ 255, 255, 255, 255 } else .{ 0, 0, 0, 255 };
+    const texture = try device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 0, .data = &checker });
+    defer device.destroyTexture(texture);
+
+    const cmd = device.begin();
+    try cmd.generateMips(texture);
+    try device.submit();
+
+    const zero = try device.readSubresource(texture, .{}, testing.allocator);
+    defer testing.allocator.free(zero);
+    try testing.expectEqualSlices(u8, &checker, zero);
+    for (1..3) |mip| {
+        const pixels = try device.readSubresource(texture, .{ .mip = @intCast(mip) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        for (0..pixels.len / 4) |i| try expectNear(.{ 127, 127, 127, 255 }, pixels[i * 4 ..][0..4].*, 2);
+    }
+}
+
+test "a sampler reads the level its bias and its range pick" {
+    var device = try openTestDevice();
+    defer device.deinit();
+
+    // Four texels wide, three levels, each one colour: which one a sampler reads shows in the pixel.
+    const chain = try device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 0 });
+    defer device.destroyTexture(chain);
+    var buffer: [4 * 4 * 4]u8 = undefined;
+    for (0..3) |mip| {
+        const size: usize = types.mipExtent(4, @intCast(mip));
+        try device.writeTexture(chain, .{ .mip = @intCast(mip) }, solidLevel(buffer[0 .. size * size * 4], palette[mip]), 0, 0);
+    }
+    const shader = try device.createShader(.{ .spirv = .{ .vertex = picture_vertex, .fragment = picture_fragment } });
+    defer device.destroyShader(shader);
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{.{ .location = 0, .format = .float2, .offset = 0 }},
+        .buffers = &.{.{ .stride = 8 }},
+        .topology = .triangle_strip,
+    });
+    defer device.destroyPipeline(pipeline);
+    const corners = [_]f32{ -1, -1, 1, -1, -1, 1, 1, 1 };
+    const corner_buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) });
+    defer device.destroyBuffer(corner_buffer);
+    // As big as level zero: one texel a pixel, which is level zero unbiased.
+    const out = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+    defer device.destroyTexture(out);
+
+    const cases = [_]struct { types.SamplerDesc, [4]u8 }{
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest }, palette[0] },
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_bias = 1 }, palette[1] },
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_bias = 1, .lod_max = 0 }, palette[0] },
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_min = 2 }, palette[2] },
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .none, .lod_bias = 1 }, palette[0] },
+    };
+    for (cases) |case| {
+        const sampler = try device.createSampler(case[0]);
+        defer device.destroySampler(sampler);
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = out } } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, corner_buffer, 0);
+        try cmd.setTexture(0, chain, sampler);
+        try cmd.draw(.{ .vertex_count = 4 });
+        try cmd.endPass();
+        try device.submit();
+        const pixels = try device.readTexture(out, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolid(pixels, case[1]);
+    }
+}
+
+test "a pass draws into one level of a chain, and the others keep theirs" {
+    var device = try openTestDevice();
+    defer device.deinit();
+
+    const texture = try device.createTexture(.{ .width = 8, .height = 4, .mip_levels = 0, .usage = .{ .render_target = true } });
+    defer device.destroyTexture(texture);
+    var buffer: [8 * 4 * 4]u8 = undefined;
+    for (0..4) |mip| {
+        const size = [2]usize{ types.mipExtent(8, @intCast(mip)), types.mipExtent(4, @intCast(mip)) };
+        try device.writeTexture(texture, .{ .mip = @intCast(mip) }, solidLevel(buffer[0 .. size[0] * size[1] * 4], palette[0]), 0, 0);
+    }
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = texture }, .mip_level = 2, .clear_color = .{ 0, 0, 1, 1 } } });
+    try cmd.endPass();
+    try device.submit();
+
+    for (0..4) |mip| {
+        const pixels = try device.readSubresource(texture, .{ .mip = @intCast(mip) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqual(@as(usize, types.mipExtent(8, @intCast(mip)) * types.mipExtent(4, @intCast(mip)) * 4), pixels.len);
+        try expectSolid(pixels, if (mip == 2) palette[2] else palette[0]);
+    }
+}
+
 fn spirvOp(comptime opcode: u16, comptime operands: []const u32) []const u32 {
     comptime {
         const count: u32 = @intCast(operands.len + 1);
@@ -1942,4 +2110,49 @@ const shaded_fragment: []const u32 = &.{
     0x00000001, 0x00000007, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000001, 0x00050036, 0x00000002,
     0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000007, 0x0000000c,
     0x0000000b, 0x0003003e, 0x00000009, 0x0000000c, 0x000100fd, 0x00010038,
+};
+
+/// A quad from its corners, and the picture at slot 0 read across it, top
+/// row first: Fluxion Shader's SPIR-V for
+/// `uv = corner * vec2(0.5, -0.5) + vec2(0.5, 0.5); position = vec4(corner, 0.0, 1.0);`
+/// and `target = sample(picture, uv);`.
+const picture_vertex: []const u32 = &.{
+    0x07230203, 0x00010000, 0x00000000, 0x0000001d, 0x00000000, 0x00020011, 0x00000001, 0x0003000e,
+    0x00000000, 0x00000001, 0x0008000f, 0x00000000, 0x00000010, 0x6e69616d, 0x00000000, 0x00000004,
+    0x00000006, 0x00000009, 0x00040047, 0x00000004, 0x0000001e, 0x00000000, 0x00040047, 0x00000006,
+    0x0000001e, 0x00000000, 0x00040047, 0x00000009, 0x0000000b, 0x00000000, 0x00040047, 0x0000000d,
+    0x00000022, 0x00000001, 0x00040047, 0x0000000d, 0x00000021, 0x00000000, 0x00030016, 0x00000001,
+    0x00000020, 0x00040017, 0x00000002, 0x00000001, 0x00000002, 0x00040020, 0x00000003, 0x00000001,
+    0x00000002, 0x0004003b, 0x00000003, 0x00000004, 0x00000001, 0x00040020, 0x00000005, 0x00000003,
+    0x00000002, 0x0004003b, 0x00000005, 0x00000006, 0x00000003, 0x00040017, 0x00000007, 0x00000001,
+    0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009,
+    0x00000003, 0x00090019, 0x0000000a, 0x00000001, 0x00000001, 0x00000000, 0x00000000, 0x00000000,
+    0x00000001, 0x00000000, 0x0003001b, 0x0000000b, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000,
+    0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000000, 0x00020013, 0x0000000e, 0x00030021,
+    0x0000000f, 0x0000000e, 0x0004002b, 0x00000001, 0x00000013, 0x3f000000, 0x0004002b, 0x00000001,
+    0x00000014, 0xbf000000, 0x0005002c, 0x00000002, 0x00000015, 0x00000013, 0x00000014, 0x0005002c,
+    0x00000002, 0x00000017, 0x00000013, 0x00000013, 0x0004002b, 0x00000001, 0x0000001a, 0x00000000,
+    0x0004002b, 0x00000001, 0x0000001b, 0x3f800000, 0x00050036, 0x0000000e, 0x00000010, 0x00000000,
+    0x0000000f, 0x000200f8, 0x00000011, 0x0004003d, 0x00000002, 0x00000012, 0x00000004, 0x00050085,
+    0x00000002, 0x00000016, 0x00000012, 0x00000015, 0x00050081, 0x00000002, 0x00000018, 0x00000016,
+    0x00000017, 0x0003003e, 0x00000006, 0x00000018, 0x0004003d, 0x00000002, 0x00000019, 0x00000004,
+    0x00060050, 0x00000007, 0x0000001c, 0x00000019, 0x0000001a, 0x0000001b, 0x0003003e, 0x00000009,
+    0x0000001c, 0x000100fd, 0x00010038,
+};
+const picture_fragment: []const u32 = &.{
+    0x07230203, 0x00010000, 0x00000000, 0x00000013, 0x00000000, 0x00020011, 0x00000001, 0x0003000e,
+    0x00000000, 0x00000001, 0x0007000f, 0x00000004, 0x0000000e, 0x6e69616d, 0x00000000, 0x00000004,
+    0x00000007, 0x00030010, 0x0000000e, 0x00000007, 0x00040047, 0x00000004, 0x0000001e, 0x00000000,
+    0x00040047, 0x00000007, 0x0000001e, 0x00000000, 0x00040047, 0x0000000b, 0x00000022, 0x00000001,
+    0x00040047, 0x0000000b, 0x00000021, 0x00000000, 0x00030016, 0x00000001, 0x00000020, 0x00040017,
+    0x00000002, 0x00000001, 0x00000002, 0x00040020, 0x00000003, 0x00000001, 0x00000002, 0x0004003b,
+    0x00000003, 0x00000004, 0x00000001, 0x00040017, 0x00000005, 0x00000001, 0x00000004, 0x00040020,
+    0x00000006, 0x00000003, 0x00000005, 0x0004003b, 0x00000006, 0x00000007, 0x00000003, 0x00090019,
+    0x00000008, 0x00000001, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000,
+    0x0003001b, 0x00000009, 0x00000008, 0x00040020, 0x0000000a, 0x00000000, 0x00000009, 0x0004003b,
+    0x0000000a, 0x0000000b, 0x00000000, 0x00020013, 0x0000000c, 0x00030021, 0x0000000d, 0x0000000c,
+    0x00050036, 0x0000000c, 0x0000000e, 0x00000000, 0x0000000d, 0x000200f8, 0x0000000f, 0x0004003d,
+    0x00000009, 0x00000010, 0x0000000b, 0x0004003d, 0x00000002, 0x00000011, 0x00000004, 0x00050057,
+    0x00000005, 0x00000012, 0x00000010, 0x00000011, 0x0003003e, 0x00000007, 0x00000012, 0x000100fd,
+    0x00010038,
 };
