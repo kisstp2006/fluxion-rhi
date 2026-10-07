@@ -15,29 +15,38 @@ pub fn build(b: *std.Build) void {
 
     // The importable module. Consumers do:
     //   const rhi = @import("fluxion_rhi");
+    const imports: []const std.Build.Module.Import = &.{
+        .{ .name = "fluxion_gl", .module = gl.module("fluxion_gl") },
+        // Imported on every target, analysed only on Windows: the module
+        // refuses to compile anywhere else, and `Device` never names it
+        // there.
+        .{ .name = "fluxion_d3d", .module = d3d.module("fluxion_d3d") },
+        .{ .name = "fluxion_vulkan", .module = vulkan.module("fluxion_vulkan") },
+        .{ .name = "fluxion_math", .module = math.module("fluxion_math") },
+        .{ .name = "fluxion_id", .module = id.module("fluxion_id") },
+        // A browser's WebGL on wasm, and a stub on every other target -
+        // which is what the WebGL backend's tests run against.
+        .{ .name = "fluxion_webgl", .module = webgl.module("fluxion_webgl") },
+    };
     const mod = b.addModule("fluxion_rhi", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "fluxion_gl", .module = gl.module("fluxion_gl") },
-            // Imported on every target, analysed only on Windows: the module
-            // refuses to compile anywhere else, and `Device` never names it
-            // there.
-            .{ .name = "fluxion_d3d", .module = d3d.module("fluxion_d3d") },
-            .{ .name = "fluxion_vulkan", .module = vulkan.module("fluxion_vulkan") },
-            .{ .name = "fluxion_math", .module = math.module("fluxion_math") },
-            .{ .name = "fluxion_id", .module = id.module("fluxion_id") },
-            // A browser's WebGL on wasm, and a stub on every other target -
-            // which is what the WebGL backend's tests run against.
-            .{ .name = "fluxion_webgl", .module = webgl.module("fluxion_webgl") },
-        },
+        .imports = imports,
     });
 
-    // zig build test
+    // zig build test. On Linux with the C library: the system's Vulkan and
+    // OpenGL are opened with its `dlopen`, and without it every test that
+    // draws there would skip itself, as if the machine had no GPU.
     const tests = b.addTest(.{
         .name = "fluxion-rhi-tests",
-        .root_module = mod,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+            .link_libc = if (target.result.os.tag == .linux) true else null,
+        }),
     });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the library test suite");
