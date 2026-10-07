@@ -1,0 +1,30 @@
+# The tests on Linux and on Windows, for each push to main and each pull
+# request. On Windows the Direct3D 11 and 12 tests run on WARP, the system's
+# software device, so a change made on Linux is checked where Direct3D really
+# is. The Linux job also builds for Windows, which compiles the Direct3D
+# backends there too.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Test
+        run: zig build test --summary all
+      - name: Build for Windows from Linux
+        if: runner.os == 'Linux'
+        run: zig build -Dtarget=x86_64-windows --summary all
