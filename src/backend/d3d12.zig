@@ -9,10 +9,11 @@
 //! and `d3d12_pipeline.zig`, siblings of this file, are those declarations -
 //! typed fresh here, the way `IFactory2` below is typed fresh over
 //! `fluxion-d3d`'s `dxgi.IDXGIFactory1`. It is narrower than the Direct3D 11
-//! backend on purpose: `.d2` textures in `rgba8`, `bgra8` and `r8`, one mip,
-//! one sample, no depth, no compute - and within that, everything a 2D
+//! backend on purpose: `.d2` textures, no compute - and within that, what a
 //! renderer asks: textures drawn into and sampled after, written in part and
-//! read back. What the narrowness buys is simplicity in the parts a real
+//! read back, a level at a time, and their chains of levels filled by
+//! `generateMips`, which Direct3D 12 has no call for: each level is drawn
+//! from the one above with a linear filter (see `generateMips`). What the narrowness buys is simplicity in the parts a real
 //! Direct3D 12 renderer usually spends the most code on:
 //!
 //! **Buffers are always upload-heap.** CPU-writable, mapped once at creation
@@ -307,6 +308,21 @@ const D3d = struct {
     /// in the permanent heaps.
     null_srv: rc.CpuDescriptorHandle,
     plain_sampler: rc.CpuDescriptorHandle,
+    /// What work on one level at a time draws with, in the permanent heaps
+    /// and written again each time: a list reads a render target view, and
+    /// copies a shader resource view into its ring, as it records the call
+    /// that names it, so one of each serves every texture. The pass into a
+    /// level other than the first has its own render target view, which the
+    /// target is bound with again if the recording restarts.
+    scratch_srv: rc.CpuDescriptorHandle,
+    pass_rtv: rc.CpuDescriptorHandle,
+    mip_rtv: rc.CpuDescriptorHandle,
+    /// Linear, clamped to the edge: what a level is filtered down with.
+    mip_sampler: rc.CpuDescriptorHandle,
+    /// `generateMips`'s shader, compiled the first time it is asked for, and
+    /// its pipeline for each format it has filled.
+    mip_shader: ?MipShader = null,
+    mip_pipelines: std.EnumArray(types.Format, ?*pl.ID3D12PipelineState) = .initFill(null),
 
     /// The shader-visible rings the root descriptor tables point into; see
     /// the module comment. `*_used` is how far into its slot's part of each
@@ -431,11 +447,40 @@ const TextureRes = struct {
     /// A depth texture that is sampled as well: back to `sampled` when the
     /// pass that drew into it ends.
     readable: bool = false,
+    /// Levels in its chain; its shader resource view reads them all.
+    mip_levels: u32 = 1,
+
+    /// How big level `mip` is, across and down.
+    fn levelSize(self: *const TextureRes, mip: u32) [2]u32 {
+        return .{ types.mipExtent(self.width, mip), types.mipExtent(self.height, mip) };
+    }
 };
 
 /// What a texture is between submits: readable by any stage, since the root
 /// signature lets every stage see the tables.
 const sampled: rc.ResourceStates = .{ .pixel_shader_resource = true, .non_pixel_shader_resource = true };
+
+/// The bytecode of the shader every level of a chain is drawn with.
+const MipShader = struct { vertex: []u8, pixel: []u8 };
+
+/// A triangle over the whole target, and the level above read at the middle
+/// of each of its pixels: between four texels of the level above, which a
+/// linear filter averages.
+const mip_vertex =
+    \\struct Out { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
+    \\Out main(uint id : SV_VertexID) {
+    \\    Out o;
+    \\    float2 corner = float2((id << 1) & 2, id & 2);
+    \\    o.uv = corner;
+    \\    o.position = float4(corner * float2(2, -2) + float2(-1, 1), 0, 1);
+    \\    return o;
+    \\}
+;
+const mip_pixel =
+    \\Texture2D above : register(t0);
+    \\SamplerState linear_clamp : register(s0);
+    \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET { return above.SampleLevel(linear_clamp, uv, 0); }
+;
 
 const SamplerRes = struct {
     index: u32,
@@ -581,6 +626,11 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     }, null_srv);
     const plain_sampler = rc.cpuHeapStart(sampler_heap);
     rc.createSampler(device, &.{ .min_lod = 0, .max_lod = 0 }, plain_sampler);
+    // The second of each, and the first two render target views: what work
+    // on one level draws with. See `D3d.scratch_srv`.
+    const mip_sampler = rc.cpuHeapStart(sampler_heap).offsetBy(1, sampler_increment);
+    rc.createSampler(device, &.{}, mip_sampler);
+    const rtv_increment = rc.descriptorHandleIncrementSize(device, .rtv);
 
     const self = try gpa.create(D3d);
     errdefer gpa.destroy(self);
@@ -595,18 +645,23 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .list = list,
         .fence = fence,
         .root_signature = root_signature,
-        .rtv_increment = rc.descriptorHandleIncrementSize(device, .rtv),
+        .rtv_increment = rtv_increment,
         .cbv_srv_uav_increment = srv_increment,
         .sampler_increment = sampler_increment,
         .srv_heap = srv_heap,
-        .srv_next = 1,
+        .srv_next = 2,
         .sampler_heap = sampler_heap,
-        .sampler_next = 1,
+        .sampler_next = 2,
         .rtv_heap = rtv_heap,
+        .rtv_next = 2,
         .dsv_heap = dsv_heap,
         .dsv_increment = rc.descriptorHandleIncrementSize(device, .dsv),
         .null_srv = null_srv,
         .plain_sampler = plain_sampler,
+        .scratch_srv = rc.cpuHeapStart(srv_heap).offsetBy(1, srv_increment),
+        .pass_rtv = rc.cpuHeapStart(rtv_heap),
+        .mip_rtv = rc.cpuHeapStart(rtv_heap).offsetBy(1, rtv_increment),
+        .mip_sampler = mip_sampler,
         .ring_srv_heap = ring_srv_heap,
         .ring_sampler_heap = ring_sampler_heap,
         .debug = desc.debug,
@@ -673,6 +728,13 @@ fn deinit(impl: backend.Impl) void {
     self.graveyard.deinit(self.gpa);
     self.used_buffers.deinit(self.gpa);
     for (self.slots) |one| _ = com.release(one.allocator);
+    for (self.mip_pipelines.values) |held| if (held) |pso| {
+        _ = com.release(pso);
+    };
+    if (self.mip_shader) |shader| {
+        self.gpa.free(shader.vertex);
+        self.gpa.free(shader.pixel);
+    }
     if (self.compiler) |*c| c.unload();
     com.releaseAll(.{
         self.ring_sampler_heap,
@@ -799,7 +861,8 @@ fn caps(impl: backend.Impl) types.Caps {
             .filterable = read_bits & support_shader_sample != 0,
             .render_target = drawn,
             .blendable = !depth and bits & support_blendable != 0,
-            .generate_mips = false,
+            // Each level drawn from the one above, filtered.
+            .generate_mips = !depth and drawn and bits & support_shader_sample != 0,
             .sample_counts = counts,
             .dimensions = flat,
         });
@@ -1142,8 +1205,11 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     const self = cast(impl);
     // `Device` has already checked `caps`, so this is defence in depth: a
     // shape or a format outside what `caps` claims never reaches here.
-    if (desc.dimension != .d2 or desc.mip_levels != 1) return error.Unsupported;
+    if (desc.dimension != .d2) return error.Unsupported;
     const format = textureFormat(desc.format) orelse return error.Unsupported;
+    // A chain of levels; not of depth, which nothing here fills.
+    const levels = desc.mip_levels;
+    if (levels > 1 and desc.format.isDepth()) return error.Unsupported;
 
     const res = try self.gpa.create(TextureRes);
     errdefer self.gpa.destroy(res);
@@ -1189,11 +1255,16 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
         return res;
     }
 
+    // A chain `generateMips` can fill is drawn into a level at a time, by
+    // that call if not by a pass.
     const target = desc.usage.render_target;
-    var rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_render_target = target });
+    const bits = askFormat(self.device, format);
+    const drawn = target or (levels > 1 and bits & support_render_target != 0 and bits & support_shader_sample != 0);
+    var rdesc = rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_render_target = drawn });
     rdesc.sample = .{ .count = desc.samples };
+    rdesc.mip_levels = @intCast(levels);
     const clear: rc.ClearValue = .{ .format = format, .color = desc.clear_color };
-    const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, sampled, if (target) &clear else null) catch return error.Failed;
+    const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, sampled, if (drawn) &clear else null) catch return error.Failed;
     errdefer _ = com.release(obj);
 
     // A multisampled texture is drawn into and resolved, never sampled: its
@@ -1204,10 +1275,10 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     rc.createShaderResourceView(self.device, if (desc.samples == 1) obj else null, &.{
         .format = if (desc.samples == 1) format else .r8g8b8a8_unorm,
         .dimension = .texture2d,
-        .u = .{ .texture2d = .{ .mip_levels = 1 } },
+        .u = .{ .texture2d = .{ .mip_levels = levels } },
     }, cpu);
 
-    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu, .samples = desc.samples };
+    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu, .samples = desc.samples, .mip_levels = levels };
     if (target) {
         const rtv = try allocRtv(self);
         res.rtv_index = rtv;
@@ -1252,7 +1323,7 @@ fn transferBuffer(self: *D3d, heap: rc.HeapType, size: u64) Error!*rc.ID3D12Reso
     return rc.createCommittedResource(self.device, .of(heap), rc.heap_flags_none, .buffer(size), state, null) catch return error.Failed;
 }
 
-/// Any box of level zero, through a one-off staging buffer laid out the way
+/// Any box of any level, through a one-off staging buffer laid out the way
 /// a copy wants its rows padded, and `CopyTextureRegion` onto the texture.
 /// Records into a slot of its own, as `submit` does, without waiting:
 /// writing happens between submits, never while one is being recorded.
@@ -1279,7 +1350,7 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     if (!self.recording) try beginRecording(self);
     errdefer abandonRecording(self);
     transition(self, res, .{ .copy_dest = true });
-    const dst_loc = cmdmod.TextureCopyLocation.subresource(res.resource, 0);
+    const dst_loc = cmdmod.TextureCopyLocation.subresource(res.resource, region.mip);
     const src_loc = cmdmod.TextureCopyLocation.placed(staging, footprint);
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, region.x, region.y, 0, &src_loc, null);
     transition(self, res, sampled);
@@ -1288,16 +1359,16 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     buried = true;
 }
 
-/// Level zero, copied into a readback buffer and handed back as RGBA, eight
+/// One level, copied into a readback buffer and handed back as RGBA, eight
 /// bits a channel, top row first - as Direct3D keeps a texture - with one
 /// channel repeated into red, green and blue as the Direct3D 11 backend does.
 fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresource, gpa: Allocator) Error![]u8 {
-    _ = sub;
     const self = cast(impl);
     const res = as(TextureRes, native);
     if (readback.decodeOf(res.format) == null) return error.Unsupported;
-    const footprint = footprintOf(res, res.width, res.height);
-    const size = @as(u64, footprint.footprint.row_pitch) * res.height;
+    const level = res.levelSize(sub.mip);
+    const footprint = footprintOf(res, level[0], level[1]);
+    const size = @as(u64, footprint.footprint.row_pitch) * level[1];
 
     const landing = try transferBuffer(self, .readback, size);
     defer _ = com.release(landing);
@@ -1306,7 +1377,7 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     errdefer abandonRecording(self);
     transition(self, res, .{ .copy_source = true });
     const dst_loc = cmdmod.TextureCopyLocation.placed(landing, footprint);
-    const src_loc = cmdmod.TextureCopyLocation.subresource(res.resource, 0);
+    const src_loc = cmdmod.TextureCopyLocation.subresource(res.resource, sub.mip);
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, 0, 0, 0, &src_loc, null);
     transition(self, res, sampled);
     try closeAndExecute(self);
@@ -1319,8 +1390,8 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     defer landing.vtable.Unmap(landing, 0, &rc.Range.nothing_read);
     const data: [*]const u8 = @ptrCast(mapped.?);
 
-    const pixels = try gpa.alloc(u8, @as(usize, res.width) * 4 * res.height);
-    readback.convert(res.format, readback.decodeOf(res.format).?, data, footprint.footprint.row_pitch, res.width, res.height, pixels);
+    const pixels = try gpa.alloc(u8, @as(usize, level[0]) * 4 * level[1]);
+    readback.convert(res.format, readback.decodeOf(res.format).?, data, footprint.footprint.row_pitch, level[0], level[1], pixels);
     return pixels;
 }
 
@@ -1763,7 +1834,17 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                         const res = as(TextureRes, device.textures.get(h).?.native);
                         if (res.rtv_index == null) return error.Unsupported;
                         transition(self, res, .{ .render_target = true });
-                        target = .{ .rtv = res.rtv_cpu, .width = res.width, .height = res.height, .resource = res.resource, .texture = res };
+                        // A level below the first through a view of its own.
+                        const level = res.levelSize(color.mip_level);
+                        const rtv = if (color.mip_level == 0) res.rtv_cpu else blk: {
+                            rc.createRenderTargetView(self.device, res.resource, &.{
+                                .format = textureFormat(res.format).?,
+                                .dimension = .texture2d,
+                                .u = .{ .texture2d = .{ .mip_slice = color.mip_level } },
+                            }, self.pass_rtv);
+                            break :blk self.pass_rtv;
+                        };
+                        target = .{ .rtv = rtv, .width = level[0], .height = level[1], .resource = res.resource, .texture = res };
                     },
                 };
                 if (pass.color) |color| if (color.resolve) |into| {
@@ -1879,15 +1960,112 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                 try prepareDraw(self);
                 cmd_list.vtable.DrawIndexedInstanced(cmd_list, d.index_count, d.instance_count, d.first_index, d.base_vertex, 0);
             },
-            // Unreachable in practice: every texture here has one mip level,
-            // and `Device.submit`'s own validation refuses `generateMips` on
-            // one before any backend sees it.
-            .generate_mips => return error.Unsupported,
+            .generate_mips => |h| try generateMips(self, as(TextureRes, device.textures.get(h).?.native)),
         }
     }
 
     self.lists += 1;
     if (self.lists >= max_lists) try closeAndExecute(self);
+}
+
+/// Every level below the first, each drawn from the one above it: a
+/// triangle over the level, reading the level above with a linear filter at
+/// the middle of each pixel - the average of the four texels under it. The
+/// level being drawn is a render target and every other stays sampled,
+/// barrier by barrier. Outside any pass; the pipeline and the textures the
+/// submit had bound are bound again before its next draw.
+fn generateMips(self: *D3d, res: *TextureRes) Error!void {
+    const pso = try mipPipelineOf(self, res.format);
+    const list = self.list;
+    const format = textureFormat(res.format).?;
+    transition(self, res, sampled);
+    list.vtable.SetPipelineState(list, pso);
+    list.vtable.IASetPrimitiveTopology(list, .triangle_list);
+    const textures = self.textures;
+    const samplers = self.samplers;
+    for (1..res.mip_levels) |level| {
+        const mip: u32 = @intCast(level);
+        const size = res.levelSize(mip);
+        rc.createShaderResourceView(self.device, res.resource, &.{
+            .format = format,
+            .dimension = .texture2d,
+            .u = .{ .texture2d = .{ .most_detailed_mip = mip - 1, .mip_levels = 1 } },
+        }, self.scratch_srv);
+        rc.createRenderTargetView(self.device, res.resource, &.{
+            .format = format,
+            .dimension = .texture2d,
+            .u = .{ .texture2d = .{ .mip_slice = mip } },
+        }, self.mip_rtv);
+        levelBarrier(self, res, mip, sampled, .{ .render_target = true });
+        list.vtable.OMSetRenderTargets(list, 1, @ptrCast(&self.mip_rtv), 0, null);
+        list.vtable.RSSetViewports(list, 1, &[_]cmdmod.Viewport{.{ .width = @floatFromInt(size[0]), .height = @floatFromInt(size[1]) }});
+        list.vtable.RSSetScissorRects(list, 1, &[_]cmdmod.Rect{.{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) }});
+        self.textures[0] = self.scratch_srv;
+        self.samplers[0] = self.mip_sampler;
+        self.textures_dirty = true;
+        self.samplers_dirty = true;
+        // The ring takes its copy of the view now, so the next level can
+        // write the same slot.
+        try prepareDraw(self);
+        list.vtable.DrawInstanced(list, 3, 1, 0, 0);
+        levelBarrier(self, res, mip, .{ .render_target = true }, sampled);
+    }
+    self.textures = textures;
+    self.samplers = samplers;
+    self.textures_dirty = true;
+    self.samplers_dirty = true;
+    if (self.current_pipeline) |p| {
+        list.vtable.SetPipelineState(list, p.pso);
+        list.vtable.IASetPrimitiveTopology(list, p.topology);
+    }
+}
+
+/// One level of a texture from one state to another; the texture as a whole
+/// is kept in `res.state`, which every level is back in afterwards.
+fn levelBarrier(self: *D3d, res: *TextureRes, mip: u32, before: rc.ResourceStates, after: rc.ResourceStates) void {
+    const barrier: cmdmod.ResourceBarrier = .{
+        .type = .transition,
+        .u = .{ .transition = .{ .resource = res.resource, .subresource = mip, .state_before = before, .state_after = after } },
+    };
+    self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{barrier});
+}
+
+/// The pipeline that draws a level of `format` from the one above: its
+/// shader compiled the first time, the pipeline made once for each format.
+fn mipPipelineOf(self: *D3d, format: types.Format) Error!*pl.ID3D12PipelineState {
+    if (self.mip_pipelines.get(format)) |held| return held;
+    if (self.mip_shader == null) {
+        var discard: Io.Writer.Discarding = .init(&.{});
+        const compiler = try compilerOf(self, &discard.writer);
+        const vs_blob = try compileStage(compiler, mip_vertex, "vs_5_0", &discard.writer);
+        defer _ = com.release(vs_blob);
+        const ps_blob = try compileStage(compiler, mip_pixel, "ps_5_0", &discard.writer);
+        defer _ = com.release(ps_blob);
+        const vertex = try self.gpa.dupe(u8, vs_blob.bytes());
+        errdefer self.gpa.free(vertex);
+        self.mip_shader = .{ .vertex = vertex, .pixel = try self.gpa.dupe(u8, ps_blob.bytes()) };
+    }
+    const shader = self.mip_shader.?;
+    var blend: pl.BlendDesc = .{};
+    blend.render_target[0] = .{ .render_target_write_mask = pl.color_write_all };
+    var rtv_formats: [8]rc.Format = @splat(.unknown);
+    rtv_formats[0] = textureFormat(format).?;
+    const pso = pl.createGraphicsPipelineState(self.device, &.{
+        .root_signature = self.root_signature,
+        .vs = .of(shader.vertex),
+        .ps = .of(shader.pixel),
+        .blend_state = blend,
+        .rasterizer_state = .{ .cull_mode = .none },
+        .depth_stencil_state = .{ .depth_enable = 0, .depth_write_mask = .zero },
+        .input_layout = .{ .elements = null, .count = 0 },
+        .primitive_topology_type = .triangle,
+        .num_render_targets = 1,
+        .rtv_formats = rtv_formats,
+        .dsv_format = .unknown,
+        .sample = .{ .count = 1 },
+    }) catch return error.Failed;
+    self.mip_pipelines.set(format, pso);
+    return pso;
 }
 
 /// What every recording starts with: the one root signature, and the rings
@@ -2390,8 +2568,6 @@ test "what is not here yet comes back as error.Unsupported" {
     // No cube, volume or array textures.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .cube, .width = 4, .height = 4 }));
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4 }));
-    // No chains of levels.
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 2 }));
     // No compressed formats.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .bc1_rgba_unorm }));
 }
@@ -2740,6 +2916,167 @@ test "a depth texture keeps what is nearer, whichever is drawn last, and a pass 
     const pixels = try device.readTexture(target, testing.allocator);
     defer testing.allocator.free(pixels);
     try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, texelAt(pixels, 8, 4, 4));
+}
+
+const level_palette = [_][4]u8{
+    .{ 255, 0, 0, 255 },
+    .{ 0, 255, 0, 255 },
+    .{ 0, 0, 255, 255 },
+    .{ 255, 255, 0, 255 },
+};
+
+fn solidLevel(buffer: []u8, colour: [4]u8) []u8 {
+    for (0..buffer.len / 4) |i| buffer[i * 4 ..][0..4].* = colour;
+    return buffer;
+}
+
+fn expectSolidLevel(pixels: []const u8, colour: [4]u8) !void {
+    var i: usize = 0;
+    while (i < pixels.len) : (i += 4) try testing.expectEqualSlices(u8, &colour, pixels[i..][0..4]);
+}
+
+fn expectNearTexel(expected: [4]u8, actual: [4]u8, tolerance: u8) !void {
+    for (expected, actual) |e, a| {
+        const distance = if (e > a) e - a else a - e;
+        if (distance > tolerance) {
+            std.debug.print("expected {any}, found {any}\n", .{ expected, actual });
+            return error.TestExpectedApproxEqAbs;
+        }
+    }
+}
+
+test "each level of a chain is written and read on its own" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    const texture = try device.createTexture(.{ .width = 8, .height = 8, .mip_levels = 0 });
+    try testing.expectEqual(@as(u32, 4), (try device.textureInfo(texture)).mip_levels);
+    var buffer: [8 * 8 * 4]u8 = undefined;
+    for (0..4) |mip| {
+        const size: usize = types.mipExtent(8, @intCast(mip));
+        try device.writeTexture(texture, .{ .mip = @intCast(mip) }, solidLevel(buffer[0 .. size * size * 4], level_palette[mip]), 0, 0);
+    }
+    for (0..4) |mip| {
+        const size: usize = types.mipExtent(8, @intCast(mip));
+        const pixels = try device.readSubresource(texture, .{ .mip = @intCast(mip) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqual(size * size * 4, pixels.len);
+        try expectSolidLevel(pixels, level_palette[mip]);
+    }
+
+    // A box in level one, and the rest of that level, and the others, keep theirs.
+    try device.writeTexture(texture, .{ .mip = 1, .x = 1, .y = 1, .width = 2, .height = 2 }, solidLevel(buffer[0..16], level_palette[3]), 0, 0);
+    const one = try device.readSubresource(texture, .{ .mip = 1 }, testing.allocator);
+    defer testing.allocator.free(one);
+    try testing.expectEqualSlices(u8, &level_palette[3], one[(1 * 4 + 1) * 4 ..][0..4]);
+    try testing.expectEqualSlices(u8, &level_palette[3], one[(2 * 4 + 2) * 4 ..][0..4]);
+    try testing.expectEqualSlices(u8, &level_palette[1], one[0..4]);
+    const zero = try device.readSubresource(texture, .{}, testing.allocator);
+    defer testing.allocator.free(zero);
+    try expectSolidLevel(zero, level_palette[0]);
+}
+
+test "generateMips draws each level from the one above" {
+    var device = try warpDevice();
+    defer device.deinit();
+    try testing.expect(device.caps().formatSupport(.rgba8_unorm).generate_mips);
+
+    // A 4x4 checkerboard of black and white: every level below is grey.
+    var checker: [4 * 4 * 4]u8 = undefined;
+    for (0..16) |i| checker[i * 4 ..][0..4].* = if ((i % 4 + i / 4) % 2 == 0) .{ 255, 255, 255, 255 } else .{ 0, 0, 0, 255 };
+    // Only sampled, and filled all the same.
+    const texture = try device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 0, .data = &checker });
+
+    const cmd = device.begin();
+    try cmd.generateMips(texture);
+    try device.submit();
+
+    const zero = try device.readSubresource(texture, .{}, testing.allocator);
+    defer testing.allocator.free(zero);
+    try testing.expectEqualSlices(u8, &checker, zero);
+    for (1..3) |mip| {
+        const pixels = try device.readSubresource(texture, .{ .mip = @intCast(mip) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        for (0..pixels.len / 4) |i| try expectNearTexel(.{ 127, 127, 127, 255 }, pixels[i * 4 ..][0..4].*, 2);
+    }
+
+    // And a draw after it in the same submit has its own pipeline and textures.
+    const quad = try Quad.init(&device);
+    const out = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+    const red = try device.createTexture(.{ .width = 1, .height = 1, .data = &level_palette[0] });
+    const sampler = try device.createSampler(.{});
+    const again = device.begin();
+    try again.generateMips(texture);
+    try again.beginPass(.{ .color = .{ .target = .{ .texture = out } } });
+    try again.setPipeline(quad.pipeline);
+    try again.setVertexBuffer(0, quad.corners, 0);
+    try again.setTexture(0, red, sampler);
+    try again.draw(.{ .vertex_count = 4 });
+    try again.endPass();
+    try device.submit();
+    const drawn = try device.readTexture(out, testing.allocator);
+    defer testing.allocator.free(drawn);
+    try expectSolidLevel(drawn, level_palette[0]);
+}
+
+test "a sampler reads the level its bias and its range pick" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    // Four texels wide, three levels, each one colour: which one a sampler reads shows in the pixel.
+    const chain = try device.createTexture(.{ .width = 4, .height = 4, .mip_levels = 0 });
+    var buffer: [4 * 4 * 4]u8 = undefined;
+    for (0..3) |mip| {
+        const size: usize = types.mipExtent(4, @intCast(mip));
+        try device.writeTexture(chain, .{ .mip = @intCast(mip) }, solidLevel(buffer[0 .. size * size * 4], level_palette[mip]), 0, 0);
+    }
+    const quad = try Quad.init(&device);
+    // As big as level zero: one texel a pixel, which is level zero unbiased.
+    const out = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+    const cases = [_]struct { types.SamplerDesc, [4]u8 }{
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest }, level_palette[0] },
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_bias = 1 }, level_palette[1] },
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_bias = 1, .lod_max = 0 }, level_palette[0] },
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_min = 2 }, level_palette[2] },
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .none, .lod_bias = 1 }, level_palette[0] },
+    };
+    for (cases) |case| {
+        const sampler = try device.createSampler(case[0]);
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = out } } });
+        try cmd.setPipeline(quad.pipeline);
+        try cmd.setVertexBuffer(0, quad.corners, 0);
+        try cmd.setTexture(0, chain, sampler);
+        try cmd.draw(.{ .vertex_count = 4 });
+        try cmd.endPass();
+        try device.submit();
+        const pixels = try device.readTexture(out, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolidLevel(pixels, case[1]);
+    }
+}
+
+test "a pass draws into one level of a chain, and the others keep theirs" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    const texture = try device.createTexture(.{ .width = 8, .height = 4, .mip_levels = 0, .usage = .{ .render_target = true } });
+    var buffer: [8 * 4 * 4]u8 = undefined;
+    for (0..4) |mip| {
+        const size = [2]usize{ types.mipExtent(8, @intCast(mip)), types.mipExtent(4, @intCast(mip)) };
+        try device.writeTexture(texture, .{ .mip = @intCast(mip) }, solidLevel(buffer[0 .. size[0] * size[1] * 4], level_palette[0]), 0, 0);
+    }
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = texture }, .mip_level = 2, .clear_color = .{ 0, 0, 1, 1 } } });
+    try cmd.endPass();
+    try device.submit();
+
+    for (0..4) |mip| {
+        const pixels = try device.readSubresource(texture, .{ .mip = @intCast(mip) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqual(@as(usize, types.mipExtent(8, @intCast(mip)) * types.mipExtent(4, @intCast(mip)) * 4), pixels.len);
+        try expectSolidLevel(pixels, if (mip == 2) level_palette[2] else level_palette[0]);
+    }
 }
 
 test "a surface with no window is refused" {

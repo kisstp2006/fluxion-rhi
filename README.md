@@ -228,8 +228,11 @@ build could open.
 renderer asks - textures drawn into and sampled after, written in part and
 read back, `rgba8`, `bgra8` and `r8`, blending, instancing, scissors - and draw
 the picture Direct3D 11 does, which the sprites example's tests check. Both
-are narrower than it: 2D textures only, one mip level, one sample, no
-anisotropy. Both draw with depth - a depth texture beside a colour target, or
+are narrower than it: 2D textures only, no anisotropy. Both take a chain of
+levels, written and read a level at a time, drawn into a level at a time,
+and filled by `generateMips` - Vulkan blits each level down from the one
+above with a linear filter, and Direct3D 12, which has no call for it, draws
+each level from the one above with a shader of its own. Both draw with depth - a depth texture beside a colour target, or
 alone, cleared or kept from an earlier pass - and a depth texture made
 `sampled` is read after, as a shadow map: typeless on Direct3D 12, written
 through a view of its depth format and read through another, and kept where a
