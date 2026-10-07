@@ -829,10 +829,9 @@ fn caps(impl: backend.Impl) types.Caps {
             .max_texture_3d = 2048,
             .max_texture_cube = 16384,
             .max_texture_layers = 2048,
-            // Clamped to one: `Device.createSampler` clamps every request to
-            // this, so "no anisotropy above one" is enforced here rather than
-            // by this file refusing a sampler by hand.
-            .max_anisotropy = 1,
+            // What `Device.createSampler` clamps a request to: feature level
+            // 11.0's.
+            .max_anisotropy = 16,
             .max_color_attachments = 1,
         },
         .features = .{ .sampler_border = true, .sampler_lod_bias = true },
@@ -1410,9 +1409,13 @@ fn addressMode(w: types.Wrap) rc.TextureAddressMode {
 
 fn samplerFilter(desc: types.SamplerDesc) rc.Filter {
     // `D3D12_FILTER`'s bit encoding: bit 0x10 linear-minifies, 0x04
-    // linear-magnifies, 0x01 linear-filters between mips, 0x80 compares.
-    // `max_anisotropy` is always clamped to one by `Device`, so the
-    // anisotropic encoding is never needed here.
+    // linear-magnifies, 0x01 linear-filters between mips, 0x80 compares,
+    // and 0x55 is anisotropic - given, as on Direct3D 11, only to a sampler
+    // whose two filters are linear.
+    const compares: u32 = if (desc.compare != null) 0x80 else 0;
+    if (desc.max_anisotropy > 1 and desc.min_filter == .linear and desc.mag_filter == .linear) {
+        return @enumFromInt(@intFromEnum(rc.Filter.anisotropic) | compares);
+    }
     var bits: u32 = 0;
     if (desc.min_filter == .linear) bits |= 0x10;
     if (desc.mag_filter == .linear) bits |= 0x04;
@@ -2237,7 +2240,7 @@ test "caps: .d2 only; the driver's formats, floats too, sampled, drawn into and 
     const hdr = c.formatSupport(.rgba16_float);
     try testing.expect(hdr.filterable and hdr.blendable and hdr.supportsSamples(4));
     try testing.expect(c.formatSupport(.depth32_float).supportsSamples(4));
-    try testing.expectEqual(@as(u32, 1), c.limits.max_anisotropy);
+    try testing.expectEqual(@as(u32, 16), c.limits.max_anisotropy);
     try testing.expect(c.features.sampler_border);
 
     // A depth format is drawn into and not sampled; a compressed one is
@@ -3077,6 +3080,35 @@ test "a pass draws into one level of a chain, and the others keep theirs" {
         try testing.expectEqual(@as(usize, types.mipExtent(8, @intCast(mip)) * types.mipExtent(4, @intCast(mip)) * 4), pixels.len);
         try expectSolidLevel(pixels, if (mip == 2) level_palette[2] else level_palette[0]);
     }
+}
+
+test "anisotropy is asked for by a number, and given to a sampler whose filters are linear" {
+    const cases = [_]struct { types.SamplerDesc, u32 }{
+        .{ .{ .max_anisotropy = 8, .mip_filter = .linear }, 0x55 },
+        .{ .{ .max_anisotropy = 8, .min_filter = .nearest }, 0x04 },
+        .{ .{ .max_anisotropy = 4, .compare = .greater }, 0xd5 },
+        .{ .{ .mip_filter = .linear }, 0x15 },
+    };
+    for (cases) |case| try testing.expectEqual(case[1], @intFromEnum(samplerFilter(case[0])));
+
+    var device = try warpDevice();
+    defer device.deinit();
+    const quad = try Quad.init(&device);
+    var red_texels: [2 * 2 * 4]u8 = undefined;
+    const red = try device.createTexture(.{ .width = 2, .height = 2, .data = solidLevel(&red_texels, level_palette[0]) });
+    const sampler = try device.createSampler(.{ .max_anisotropy = 16, .mip_filter = .linear });
+    const out = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = out } } });
+    try cmd.setPipeline(quad.pipeline);
+    try cmd.setVertexBuffer(0, quad.corners, 0);
+    try cmd.setTexture(0, red, sampler);
+    try cmd.draw(.{ .vertex_count = 4 });
+    try cmd.endPass();
+    try device.submit();
+    const pixels = try device.readTexture(out, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try expectSolidLevel(pixels, level_palette[0]);
 }
 
 test "a surface with no window is refused" {

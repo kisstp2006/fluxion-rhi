@@ -592,8 +592,11 @@ pub fn createSampler(impl: backend.Impl, desc: types.SamplerDesc) types.Error!ba
         .address_mode_v = vkWrap(desc.wrap_v),
         .address_mode_w = vkWrap(desc.wrap_w),
         .mip_lod_bias = desc.lod_bias,
-        .anisotropy_enable = vk.gen.types.vk_false,
-        .max_anisotropy = 1,
+        // Anisotropy only where both filters are linear, as on Direct3D: a
+        // way of filtering linearly along a stretched footprint. `Device`
+        // has clamped it to what `caps` said the device takes.
+        .anisotropy_enable = if (anisotropic(desc)) vk.gen.types.vk_true else vk.gen.types.vk_false,
+        .max_anisotropy = if (anisotropic(desc)) @floatFromInt(desc.max_anisotropy) else 1,
         .compare_enable = if (desc.compare != null) vk.gen.types.vk_true else vk.gen.types.vk_false,
         .compare_op = vkCompare(desc.compare orelse .always),
         // "Level zero only" is a range with one level in it, as on Direct3D.
@@ -610,6 +613,10 @@ pub fn createSampler(impl: backend.Impl, desc: types.SamplerDesc) types.Error!ba
     const res = try self.gpa.create(SamplerRes);
     res.* = .{ .sampler = sampler };
     return res;
+}
+
+fn anisotropic(desc: types.SamplerDesc) bool {
+    return desc.max_anisotropy > 1 and desc.min_filter == .linear and desc.mag_filter == .linear;
 }
 
 pub fn destroySampler(impl: backend.Impl, native: backend.Native) void {

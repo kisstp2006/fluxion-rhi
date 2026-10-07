@@ -171,6 +171,10 @@ pub const Runtime = struct {
     vki: vk.gen.commands.Instance,
     vkd: vk.gen.commands.Device,
     memory_properties: vk.gen.types.PhysicalDeviceMemoryProperties,
+    /// The most a sampler may take along a stretched footprint: the device's
+    /// limit, where it has anisotropic filtering and it was turned on, and
+    /// one where it has none.
+    max_anisotropy: f32 = 1,
 
     /// Opens a Vulkan execution context that can present: the instance asks
     /// for `VK_KHR_surface` and every `VK_KHR_*_surface` extension the
@@ -260,6 +264,15 @@ pub const Runtime = struct {
         var device_info: vk.DeviceCreateInfo = .{};
         device_info.setQueues(&queues);
         device_info.setExtensions(&device_ext);
+        // Anisotropic filtering is a feature a device is made with, and
+        // nearly every one has it: turned on where it is there.
+        var offered: vk.PhysicalDeviceFeatures = .{};
+        vki.getPhysicalDeviceFeatures(physical_device, &offered);
+        const anisotropic = offered.sampler_anisotropy != vk.gen.types.vk_false;
+        const wanted: vk.PhysicalDeviceFeatures = .{ .sampler_anisotropy = if (anisotropic) vk.gen.types.vk_true else vk.gen.types.vk_false };
+        device_info.enabled_features = &wanted;
+        var chosen: vk.PhysicalDeviceProperties = undefined;
+        vki.getPhysicalDeviceProperties(physical_device, &chosen);
 
         var device: vk.Device = undefined;
         _ = vki.createDevice(physical_device, &device_info, null, &device).check() catch return error.NoDevice;
@@ -286,6 +299,7 @@ pub const Runtime = struct {
             .vki = vki,
             .vkd = vkd,
             .memory_properties = memory_properties,
+            .max_anisotropy = if (anisotropic) @max(1, chosen.limits.max_sampler_anisotropy) else 1,
         };
     }
 
@@ -599,9 +613,9 @@ fn caps(impl: backend.Impl) types.Caps {
             .max_texture_3d = limits.max_image_dimension_3d,
             .max_texture_cube = limits.max_image_dimension_cube,
             .max_texture_layers = limits.max_image_array_layers,
-            // Anisotropic filtering is not here yet, so one is the most
-            // `createSampler` will ever be asked to give.
-            .max_anisotropy = 1,
+            // What `createSampler` clamps a request to: one where the device
+            // was made without anisotropic filtering.
+            .max_anisotropy = @intFromFloat(@floor(self.runtime.max_anisotropy)),
             // No `extra_colors`, so one colour attachment is all a pass has.
             .max_color_attachments = 1,
             .uniform_offset_alignment = @intCast(@max(limits.min_uniform_buffer_offset_alignment, 1)),
@@ -1851,6 +1865,9 @@ test "a sampler reads the level its bias and its range pick" {
         .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_bias = 1, .lod_max = 0 }, palette[0] },
         .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_min = 2 }, palette[2] },
         .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .none, .lod_bias = 1 }, palette[0] },
+        // Anisotropy with nearest filters is no anisotropy; with linear ones, of one colour, the colour.
+        .{ .{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .max_anisotropy = 16 }, palette[0] },
+        .{ .{ .mip_filter = .linear, .max_anisotropy = 16, .lod_max = 0 }, palette[0] },
     };
     for (cases) |case| {
         const sampler = try device.createSampler(case[0]);
