@@ -455,6 +455,20 @@ const WebGl = struct {
     /// The base vertex the attribute pointers were last specified for.
     flushed_base_vertex: i32 = 0,
     index: ?IndexBinding = null,
+    /// Where the vertex array bound has its attributes pointed, slot by
+    /// slot, and the element buffer it holds: a draw points again only the
+    /// slots that changed since. Null for a slot not known - every one, when
+    /// another vertex array is bound, or none, or a buffer is gone. See
+    /// `flushBindings`.
+    pointed: [max_vertex_slots]?Pointed = @splat(null),
+    pointed_index: webgl.Buffer = .none,
+};
+
+/// Where a slot's attributes point: its buffer, and how far into it - the
+/// base vertex's vertices in, for a slot that steps once a vertex.
+const Pointed = struct {
+    buffer: webgl.Buffer,
+    at: i64,
 };
 
 const max_vertex_slots = 8;
@@ -541,6 +555,9 @@ const PipelineRes = struct {
     shader: *ShaderRes,
     program: webgl.Program,
     vao: webgl.VertexArray,
+    /// Whether `vao` has its attributes turned on: done the first time it
+    /// is bound, and kept by it.
+    vao_ready: bool = false,
     attributes: []types.VertexAttribute,
     buffers: []types.VertexBufferLayout,
     topology: Enum,
@@ -655,7 +672,10 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
     const buffer = gl.createBuffer() catch return error.OutOfMemory;
     // An element buffer bound while a vertex array is bound becomes that
     // array's, so none is bound for the making of one.
-    if (target == c.element_array_buffer) gl.bindVertexArray(.none);
+    if (target == c.element_array_buffer) {
+        gl.bindVertexArray(.none);
+        forgetPointers(self);
+    }
     gl.bindBuffer(target, buffer);
     const usage: Enum = if (desc.dynamic or desc.kind == .uniform) c.dynamic_draw else c.static_draw;
     if (desc.data) |data| {
@@ -677,6 +697,9 @@ fn destroyBuffer(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(BufferRes, native);
     self.gl.deleteBuffer(res.buffer);
+    // It is let go of by the vertex array bound: what pointed into it
+    // points nowhere.
+    forgetPointers(self);
     self.gpa.destroy(res);
 }
 
@@ -685,9 +708,20 @@ fn updateBuffer(impl: backend.Impl, native: backend.Native, offset: usize, bytes
     const res = as(BufferRes, native);
     // As in `createBuffer`: an update must not leave a pipeline's vertex
     // array pointing at the element buffer it happened to be bound for.
-    if (res.target == c.element_array_buffer) self.gl.bindVertexArray(.none);
+    if (res.target == c.element_array_buffer) {
+        self.gl.bindVertexArray(.none);
+        forgetPointers(self);
+    }
     self.gl.bindBuffer(res.target, res.buffer);
     self.gl.bufferSubData(res.target, offset, bytes);
+    self.bindings_dirty = true;
+}
+
+/// Nothing is known of where the vertex array bound points any more:
+/// another is bound, or none, or a buffer one of them pointed into is gone.
+fn forgetPointers(self: *WebGl) void {
+    self.pointed = @splat(null);
+    self.pointed_index = .none;
     self.bindings_dirty = true;
 }
 
@@ -1588,10 +1622,19 @@ fn endPass(self: *WebGl) Error!void {
 fn bindPipeline(self: *WebGl, res: *PipelineRes) void {
     const gl = self.gl;
     self.pipeline = res;
-    self.bindings_dirty = true;
+    forgetPointers(self);
 
     gl.useProgram(res.program);
     gl.bindVertexArray(res.vao);
+    // That an attribute is on, and whether it steps once an instance, a
+    // vertex array keeps: said the first time it is bound, and by no draw.
+    if (!res.vao_ready) {
+        res.vao_ready = true;
+        for (res.attributes) |attribute| {
+            gl.enableVertexAttribArray(attribute.location);
+            gl.vertexAttribDivisor(attribute.location, if (res.buffers[attribute.buffer].step == .instance) 1 else 0);
+        }
+    }
 
     if (res.blend.enabled) {
         gl.enable(c.blend);
@@ -1638,16 +1681,30 @@ fn bindPipeline(self: *WebGl, res: *PipelineRes) void {
 /// Done at the draw, because a vertex array object remembers pointers and
 /// not slots. Which is also what makes the missing base vertex cheap: the
 /// pointer is being written anyway, so moving it is an addition.
+///
+/// Only the slots whose buffer or place in it changed since the last draw
+/// are pointed again, their buffer bound once for all of their attributes:
+/// each call here is one out to the page, and a draw of a mesh with its
+/// instances made fifty of them.
 fn flushBindings(self: *WebGl, pipeline: *PipelineRes, base_vertex: i32) Error!void {
     if (!self.bindings_dirty and base_vertex == self.flushed_base_vertex) return;
     const gl = self.gl;
 
-    for (pipeline.attributes) |attribute| {
-        const binding = self.vertex_bindings[attribute.buffer];
-        const layout = pipeline.buffers[attribute.buffer];
-
+    // Where each slot points now, and whether that is where it pointed.
+    var wanted: [max_vertex_slots]Pointed = undefined;
+    var changed: [max_vertex_slots]bool = undefined;
+    for (pipeline.buffers, 0..) |layout, slot| {
+        const binding = self.vertex_bindings[slot];
         const moved: i64 = if (layout.step == .vertex) @as(i64, base_vertex) * layout.stride else 0;
-        const at: i64 = @as(i64, binding.offset) + attribute.offset + moved;
+        wanted[slot] = .{ .buffer = binding.buffer, .at = @as(i64, binding.offset) + moved };
+        changed[slot] = if (self.pointed[slot]) |held| held.buffer != wanted[slot].buffer or held.at != wanted[slot].at else true;
+    }
+
+    var bound: ?u32 = null;
+    for (pipeline.attributes) |attribute| {
+        if (!changed[attribute.buffer]) continue;
+        const layout = pipeline.buffers[attribute.buffer];
+        const at: i64 = wanted[attribute.buffer].at + attribute.offset;
         // A base vertex that reaches back before the start of the buffer
         // has no pointer to become.
         if (at < 0 or at > std.math.maxInt(i32)) return error.Unsupported;
@@ -1655,7 +1712,10 @@ fn flushBindings(self: *WebGl, pipeline: *PipelineRes, base_vertex: i32) Error!v
         const stride: i32 = @intCast(layout.stride);
         const comps: i32 = @intCast(attribute.format.components());
 
-        gl.bindBuffer(c.array_buffer, binding.buffer);
+        if (bound != attribute.buffer) {
+            gl.bindBuffer(c.array_buffer, wanted[attribute.buffer].buffer);
+            bound = attribute.buffer;
+        }
         switch (attribute.format) {
             .float, .float2, .float3, .float4 => gl.vertexAttribPointer(attribute.location, comps, c.float, false, stride, offset),
             .ubyte4_norm => gl.vertexAttribPointer(attribute.location, comps, c.unsigned_byte, true, stride, offset),
@@ -1663,10 +1723,12 @@ fn flushBindings(self: *WebGl, pipeline: *PipelineRes, base_vertex: i32) Error!v
             .uint => gl.vertexAttribIPointer(attribute.location, comps, c.unsigned_int, stride, offset),
             .int => gl.vertexAttribIPointer(attribute.location, comps, c.int, stride, offset),
         }
-        gl.enableVertexAttribArray(attribute.location);
-        gl.vertexAttribDivisor(attribute.location, if (layout.step == .instance) 1 else 0);
     }
-    if (self.index) |index| gl.bindBuffer(c.element_array_buffer, index.buffer);
+    for (pipeline.buffers, 0..) |_, slot| self.pointed[slot] = wanted[slot];
+    if (self.index) |index| if (index.buffer != self.pointed_index) {
+        gl.bindBuffer(c.element_array_buffer, index.buffer);
+        self.pointed_index = index.buffer;
+    };
 
     self.bindings_dirty = false;
     self.flushed_base_vertex = base_vertex;
