@@ -8,8 +8,8 @@
     .dependencies = .{
         // The three backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#d4887d3ca907b71fe5eda2537b8d0a7e929ee9e5",
-            .hash = "fluxion_gl-0.1.0-F9AI4lllBQDMizdNIdX6Qff0Yzip8x_2vu-mh5kebWkw",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#60d8ce3d22cc387195aa61a311d51a1badd6454a",
+            .hash = "fluxion_gl-0.1.0-F9AI4gBqBQAfUaLWitMOOvvS5WHxYILOMnLMa0Kwt5LT",
         },
         .fluxion_d3d = .{
             .url = "git+https://github.com/kisstp2006/fluxion-d3d#161140d820bbec900735dff877dda80133f4e295",
