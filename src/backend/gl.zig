@@ -746,6 +746,12 @@ const Gl = struct {
     vertex_bindings: [max_vertex_slots]VertexBinding = @splat(.{}),
     bindings_dirty: bool = false,
     index: ?IndexBinding = null,
+    /// Where the vertex array bound has its attributes pointed, slot by
+    /// slot, and the element buffer it holds: a draw points again only the
+    /// slots that changed since. Null for a slot not known - every one, when
+    /// another vertex array is bound or a buffer is gone. See `flushBindings`.
+    pointed: [max_vertex_slots]?VertexBinding = @splat(null),
+    pointed_index: gt.Uint = 0,
     /// The framebuffer of the pass in progress, and its size, for the resolve
     /// at `endPass`; and what each of its colours resolves into.
     pass_framebuffer: gt.Uint = 0,
@@ -885,6 +891,9 @@ const ShaderRes = struct {
 const PipelineRes = struct {
     program: gt.Uint,
     vao: gt.Uint,
+    /// Whether `vao` has its attributes turned on: done the first time it
+    /// is bound, and kept by it.
+    vao_ready: bool = false,
     attributes: []types.VertexAttribute,
     buffers: []types.VertexBufferLayout,
     topology: gt.Enum,
@@ -1035,18 +1044,44 @@ fn useContext(self: *Gl, to: ?*SurfaceRes) void {
     self.current = to;
 }
 
-/// The vertex array of `pipeline` in the context current: its own in the
-/// device's, and one made the first time in another window's.
-fn vertexArrayOf(self: *Gl, pipeline: *PipelineRes) Error!gt.Uint {
-    const surface = self.current orelse return pipeline.vao;
-    if (surface.vaos.get(pipeline)) |vao| return vao;
-    var vao: gt.Uint = 0;
-    fnOf(&self.api, "genVertexArrays")(1, @ptrCast(&vao));
-    surface.vaos.put(self.gpa, pipeline, vao) catch {
-        fnOf(&self.api, "deleteVertexArrays")(1, @ptrCast(&vao));
-        return error.OutOfMemory;
+/// Bind the vertex array of `pipeline` in the context current: its own in
+/// the device's, and one made the first time in another window's. One bound
+/// for the first time has its attributes turned on, and said which of them
+/// step once an instance: a vertex array keeps both, so no draw says them
+/// again.
+fn bindVertexArrayOf(self: *Gl, pipeline: *PipelineRes) Error!void {
+    const api = &self.api;
+    var fresh = false;
+    const vao = if (self.current) |surface| held: {
+        if (surface.vaos.get(pipeline)) |known| break :held known;
+        var made: gt.Uint = 0;
+        fnOf(api, "genVertexArrays")(1, @ptrCast(&made));
+        surface.vaos.put(self.gpa, pipeline, made) catch {
+            fnOf(api, "deleteVertexArrays")(1, @ptrCast(&made));
+            return error.OutOfMemory;
+        };
+        fresh = true;
+        break :held made;
+    } else held: {
+        fresh = !pipeline.vao_ready;
+        pipeline.vao_ready = true;
+        break :held pipeline.vao;
     };
-    return vao;
+    fnOf(api, "bindVertexArray")(vao);
+    if (!fresh) return;
+    const vertex_attrib_divisor = fnOf(api, "vertexAttribDivisor");
+    for (pipeline.attributes) |attribute| {
+        api.enableVertexAttribArray(attribute.location);
+        vertex_attrib_divisor(attribute.location, if (pipeline.buffers[attribute.buffer].step == .instance) 1 else 0);
+    }
+}
+
+/// Nothing is known of where the vertex array bound points any more:
+/// another is bound, or a buffer one of them pointed into is gone.
+fn forgetPointers(self: *Gl) void {
+    self.pointed = @splat(null);
+    self.pointed_index = 0;
+    self.bindings_dirty = true;
 }
 
 fn hasEs3Functions(api: *const Api) bool {
@@ -1159,6 +1194,8 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
     var name: gt.Uint = 0;
     api.genBuffers(1, @ptrCast(&name));
     api.bindBuffer(target, name);
+    // The vertex array bound holds this one as its element buffer now.
+    if (target == c.element_array_buffer) forgetPointers(self);
     const usage: gt.Enum = if (desc.dynamic or desc.kind == .uniform) c.dynamic_draw else c.static_draw;
     if (desc.data) |data| {
         if (data.len == size) {
@@ -1179,6 +1216,9 @@ fn destroyBuffer(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(BufferRes, native);
     self.api.deleteBuffers(1, @ptrCast(&res.name));
+    // It is let go of by the vertex array bound, and its name may be the
+    // next buffer's: what pointed into it points nowhere.
+    forgetPointers(self);
     self.gpa.destroy(res);
 }
 
@@ -1189,7 +1229,10 @@ fn updateBuffer(impl: backend.Impl, native: backend.Native, offset: usize, bytes
     self.api.bufferSubData(res.target, @intCast(offset), @intCast(bytes.len), bytes.ptr);
     // A vertex array remembers the element buffer it last saw; a bind here
     // for an update must not leave it pointing at a stray one.
-    if (res.target == c.element_array_buffer) self.index = null;
+    if (res.target == c.element_array_buffer) {
+        self.index = null;
+        self.pointed_index = 0;
+    }
     self.bindings_dirty = true;
 }
 
@@ -2169,10 +2212,10 @@ fn endPass(self: *Gl) Error!void {
 fn bindPipeline(self: *Gl, res: *PipelineRes) Error!void {
     const api = &self.api;
     self.pipeline = res;
-    self.bindings_dirty = true;
+    forgetPointers(self);
 
     api.useProgram(res.program);
-    fnOf(api, "bindVertexArray")(try vertexArrayOf(self, res));
+    try bindVertexArrayOf(self, res);
 
     // A pipeline for a depth-only pass has no colour format and must not
     // write one, whatever the draw buffers of the framebuffer it is bound
@@ -2218,17 +2261,29 @@ fn bindPipeline(self: *Gl, res: *PipelineRes) Error!void {
 
 /// Point the pipeline's attributes at whatever buffers are bound now. Done at
 /// the draw, because a vertex array object remembers pointers and not slots.
+///
+/// Only the slots whose buffer or offset changed since the last draw are
+/// pointed again, their buffer bound once for all of their attributes: a
+/// run of draws that share their vertices and differ in their instances -
+/// or the other way round - says the one, not both, and what a vertex array
+/// keeps by itself is said once, as it is first bound.
 fn flushBindings(self: *Gl, pipeline: *PipelineRes) void {
     if (!self.bindings_dirty) return;
     self.bindings_dirty = false;
     const api = &self.api;
     const vertex_attrib_i_pointer = fnOf(api, "vertexAttribIPointer");
-    const vertex_attrib_divisor = fnOf(api, "vertexAttribDivisor");
 
+    var bound: ?u32 = null;
     for (pipeline.attributes) |attribute| {
         const binding = self.vertex_bindings[attribute.buffer];
+        if (self.pointed[attribute.buffer]) |held| {
+            if (held.name == binding.name and held.offset == binding.offset) continue;
+        }
         const layout = pipeline.buffers[attribute.buffer];
-        api.bindBuffer(c.array_buffer, binding.name);
+        if (bound != attribute.buffer) {
+            api.bindBuffer(c.array_buffer, binding.name);
+            bound = attribute.buffer;
+        }
         const pointer = opengl.offset(@as(usize, binding.offset) + attribute.offset);
         const comps: gt.Int = @intCast(attribute.format.components());
         switch (attribute.format) {
@@ -2238,10 +2293,12 @@ fn flushBindings(self: *Gl, pipeline: *PipelineRes) void {
             .uint => vertex_attrib_i_pointer(attribute.location, comps, c.unsigned_int, @intCast(layout.stride), pointer),
             .int => vertex_attrib_i_pointer(attribute.location, comps, c.int, @intCast(layout.stride), pointer),
         }
-        api.enableVertexAttribArray(attribute.location);
-        vertex_attrib_divisor(attribute.location, if (layout.step == .instance) 1 else 0);
     }
-    if (self.index) |index| api.bindBuffer(c.element_array_buffer, index.name);
+    for (pipeline.buffers, 0..) |_, slot| self.pointed[slot] = self.vertex_bindings[slot];
+    if (self.index) |index| if (index.name != self.pointed_index) {
+        api.bindBuffer(c.element_array_buffer, index.name);
+        self.pointed_index = index.name;
+    };
 }
 
 fn factor(f: types.BlendFactor) gt.Enum {
