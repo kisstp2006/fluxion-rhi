@@ -752,6 +752,10 @@ const Gl = struct {
     /// another vertex array is bound or a buffer is gone. See `flushBindings`.
     pointed: [max_vertex_slots]?VertexBinding = @splat(null),
     pointed_index: gt.Uint = 0,
+    /// Whether the driver binds a vertex buffer to a slot, apart from what
+    /// the attributes read of it - OpenGL 4.3's - so that a draw with other
+    /// vertices is one call a slot. See `bySlot`.
+    slot_bindings: bool = false,
     /// The framebuffer of the pass in progress, and its size, for the resolve
     /// at `endPass`; and what each of its colours resolves into.
     pass_framebuffer: gt.Uint = 0,
@@ -894,6 +898,9 @@ const PipelineRes = struct {
     /// Whether `vao` has its attributes turned on: done the first time it
     /// is bound, and kept by it.
     vao_ready: bool = false,
+    /// Whether its buffers are bound by slot: where the driver can, and
+    /// its layout is one a slot takes. See `bySlot`.
+    by_slot: bool = false,
     attributes: []types.VertexAttribute,
     buffers: []types.VertexBufferLayout,
     topology: gt.Enum,
@@ -999,6 +1006,14 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     self.capabilities = buildCaps(self, .{ .version = version, .extensions = names.set() });
     _ = self.api.checkError();
 
+    // Buffers bound by slot: OpenGL 4.3's, or the extension it came from,
+    // where the driver has every call of it.
+    if (comptime !is_gles) {
+        const said = version.atLeast(4, 3) or names.set().has("GL_ARB_vertex_attrib_binding");
+        self.slot_bindings = said and self.api.bindVertexBuffer != null and self.api.vertexAttribFormat != null and
+            self.api.vertexAttribIFormat != null and self.api.vertexAttribBinding != null and self.api.vertexBindingDivisor != null;
+    }
+
     if (!is_gles and desc.debug) {
         if (self.api.debugMessageCallback) |set| {
             self.api.enable(c.debug_output);
@@ -1069,11 +1084,48 @@ fn bindVertexArrayOf(self: *Gl, pipeline: *PipelineRes) Error!void {
     };
     fnOf(api, "bindVertexArray")(vao);
     if (!fresh) return;
+    if (pipeline.by_slot) return describeBySlot(self, pipeline);
     const vertex_attrib_divisor = fnOf(api, "vertexAttribDivisor");
     for (pipeline.attributes) |attribute| {
         api.enableVertexAttribArray(attribute.location);
         vertex_attrib_divisor(attribute.location, if (pipeline.buffers[attribute.buffer].step == .instance) 1 else 0);
     }
+}
+
+/// The furthest into a vertex an attribute bound by slot may start: what
+/// every OpenGL 4.3 driver takes.
+const most_relative_offset = 2047;
+
+/// Whether `pipeline`'s buffers are bound by slot: the driver has the
+/// calls, every slot says how far apart its vertices are - nought would
+/// read one vertex for all, where a pointer works the distance out - and no
+/// attribute starts further into a vertex than a slot's format can say.
+fn bySlot(self: *const Gl, attributes: []const types.VertexAttribute, buffers: []const types.VertexBufferLayout) bool {
+    if (!self.slot_bindings) return false;
+    for (buffers) |layout| if (layout.stride == 0) return false;
+    for (attributes) |attribute| if (attribute.offset > most_relative_offset) return false;
+    return true;
+}
+
+/// Say, once, what each attribute of the vertex array bound reads of its
+/// slot and how each slot steps: a draw then binds a buffer to a slot and
+/// says no more.
+fn describeBySlot(self: *Gl, pipeline: *PipelineRes) void {
+    if (comptime is_gles) unreachable;
+    const api = &self.api;
+    for (pipeline.attributes) |attribute| {
+        api.enableVertexAttribArray(attribute.location);
+        const comps: gt.Int = @intCast(attribute.format.components());
+        switch (attribute.format) {
+            .float, .float2, .float3, .float4 => api.vertexAttribFormat.?(attribute.location, comps, c.float, gt.gl_false, attribute.offset),
+            .ubyte4_norm => api.vertexAttribFormat.?(attribute.location, comps, c.unsigned_byte, gt.gl_true, attribute.offset),
+            .ubyte4 => api.vertexAttribIFormat.?(attribute.location, comps, c.unsigned_byte, attribute.offset),
+            .uint => api.vertexAttribIFormat.?(attribute.location, comps, c.unsigned_int, attribute.offset),
+            .int => api.vertexAttribIFormat.?(attribute.location, comps, c.int, attribute.offset),
+        }
+        api.vertexAttribBinding.?(attribute.location, attribute.buffer);
+    }
+    for (pipeline.buffers, 0..) |layout, slot| api.vertexBindingDivisor.?(@intCast(slot), if (layout.step == .instance) 1 else 0);
 }
 
 /// Nothing is known of where the vertex array bound points any more:
@@ -1848,6 +1900,7 @@ fn createPipeline(impl: backend.Impl, desc: types.PipelineDesc, shader: backend.
     res.* = .{
         .program = program,
         .vao = vao,
+        .by_slot = bySlot(self, attributes, buffers),
         .attributes = attributes,
         .buffers = buffers,
         .topology = switch (desc.topology) {
@@ -2266,11 +2319,29 @@ fn bindPipeline(self: *Gl, res: *PipelineRes) Error!void {
 /// pointed again, their buffer bound once for all of their attributes: a
 /// run of draws that share their vertices and differ in their instances -
 /// or the other way round - says the one, not both, and what a vertex array
-/// keeps by itself is said once, as it is first bound.
+/// keeps by itself is said once, as it is first bound. Where the driver
+/// binds a buffer to a slot - `bySlot` - a slot that changed is one call,
+/// whatever reads it.
 fn flushBindings(self: *Gl, pipeline: *PipelineRes) void {
     if (!self.bindings_dirty) return;
     self.bindings_dirty = false;
     const api = &self.api;
+    if (pipeline.by_slot) {
+        if (comptime is_gles) unreachable;
+        for (pipeline.buffers, 0..) |layout, slot| {
+            const binding = self.vertex_bindings[slot];
+            if (self.pointed[slot]) |held| {
+                if (held.name == binding.name and held.offset == binding.offset) continue;
+            }
+            api.bindVertexBuffer.?(@intCast(slot), binding.name, @intCast(binding.offset), @intCast(layout.stride));
+            self.pointed[slot] = binding;
+        }
+        if (self.index) |index| if (index.name != self.pointed_index) {
+            api.bindBuffer(c.element_array_buffer, index.name);
+            self.pointed_index = index.name;
+        };
+        return;
+    }
     const vertex_attrib_i_pointer = fnOf(api, "vertexAttribIPointer");
 
     var bound: ?u32 = null;
