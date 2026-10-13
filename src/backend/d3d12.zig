@@ -94,8 +94,9 @@ comptime {
 
 const max_vertex_slots = 8;
 const max_attributes = 16;
-/// `b0`..`b7`: the root CBVs the shared root signature has.
-const uniform_slots = 8;
+/// `b0`..`b11`: the root CBVs the shared root signature has - two words
+/// each, 26 of its 64 with the two tables.
+const uniform_slots = 12;
 /// `t0`..`t15` and `s0`..`s15`: the width of its one descriptor table of
 /// each kind.
 const texture_slots = types.max_texture_slots;

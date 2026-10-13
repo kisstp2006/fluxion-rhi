@@ -83,9 +83,9 @@ pub const ShaderRes = resources.ShaderRes;
 pub const PipelineRes = resources.PipelineRes;
 pub const SurfaceRes = swapchain.SurfaceRes;
 
-/// `set 0`'s width: eight uniform-buffer bindings - within the twelve a
-/// stage is promised.
-pub const uniform_slots = 8;
+/// `set 0`'s width: twelve uniform-buffer bindings - the twelve a stage
+/// is promised. A 3D renderer binds blocks up to slot 8 and more.
+pub const uniform_slots = 12;
 /// `set 1`'s width: eight combined-image-sampler bindings.
 pub const texture_slots = types.max_texture_slots;
 
