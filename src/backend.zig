@@ -90,6 +90,9 @@ pub const Vtable = struct {
     /// Execute a list that `Device` has already validated: every handle in it
     /// is alive, every draw is inside a pass, every pass is closed.
     submit: *const fn (Impl, *Device, []const commands.Command) Error!void,
+    /// How full the card's memory is, where the driver says: null for a
+    /// backend, or a driver, that does not. See `Device.memory`.
+    memory: ?*const fn (Impl) ?types.Memory = null,
 };
 
 /// What opening a backend gives back: its state, and its table.

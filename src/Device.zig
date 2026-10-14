@@ -256,6 +256,17 @@ pub fn caps(self: *const Device) *const types.Caps {
     return &self.capabilities;
 }
 
+/// How full the card's memory is, and how often the driver has had to move
+/// things out of it, where the driver says - null where it does not: OpenGL
+/// on NVIDIA's driver (`GL_NVX_gpu_memory_info`) and AMD's
+/// (`GL_ATI_meminfo`, without the evictions). A game whose card fills -
+/// another program taking its memory - can see it here, and make again
+/// what was moved out: its render targets, drawn into every frame.
+pub fn memory(self: *Device) ?types.Memory {
+    const ask = self.vtable.memory orelse return null;
+    return ask(self.impl);
+}
+
 /// The last shader log or validation message. Empty when nothing went wrong.
 pub fn diagnostics(self: *const Device) []const u8 {
     return self.log_buffer[0..self.log_len];
@@ -868,6 +879,12 @@ test "a device that draws nothing still keeps its books" {
     device.destroyBuffer(vertices);
     try testing.expectError(error.InvalidHandle, device.updateBuffer(vertices, 0, "abcd"));
     try testing.expectError(error.InvalidHandle, device.updateBuffer(vertices, 0, "abcd"));
+}
+
+test "a device whose driver does not say how full the card is says nothing" {
+    var device = try nothing();
+    defer device.deinit();
+    try testing.expectEqual(@as(?types.Memory, null), device.memory());
 }
 
 test "creation refuses what no backend could do" {

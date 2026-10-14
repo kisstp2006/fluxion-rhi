@@ -1070,6 +1070,22 @@ pub const Caps = struct {
 };
 
 /// What a device is, once open.
+/// How full the card's own memory is, as its driver says: see
+/// `Device.memory`. In kibibytes.
+pub const Memory = struct {
+    /// The card's own memory, all of it.
+    total_kib: u64,
+    /// What of it is free now.
+    available_kib: u64,
+    /// How many times since the program started the driver has moved what a
+    /// program held out of the card's memory into the slower memory of the
+    /// machine, to make room - for this program or another - and how much
+    /// it moved. What it moved is drawn from there, slowly, until it is made
+    /// again.
+    evictions: u64 = 0,
+    evicted_kib: u64 = 0,
+};
+
 pub const Info = struct {
     backend: Backend,
     /// What the driver calls itself. Points into the device; valid while it

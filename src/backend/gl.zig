@@ -706,6 +706,8 @@ const Gl = struct {
     debug: bool,
     renderer: [128]u8 = undefined,
     renderer_len: usize = 0,
+    /// Which way the driver tells how full the card's memory is: see `memory`.
+    memory_info: MemoryInfo = .none,
     /// What the driver's debug output last complained about, kept rather
     /// than printed: `submit` turns it into `error.Failed`, and a test that
     /// wants to read it can.
@@ -1005,6 +1007,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
     defer gpa.free(names.storage);
     self.capabilities = buildCaps(self, .{ .version = version, .extensions = names.set() });
     _ = self.api.checkError();
+    self.memory_info = if (names.set().has("GL_NVX_gpu_memory_info")) .nvx else if (names.set().has("GL_ATI_meminfo")) .ati else .none;
 
     // Buffers bound by slot: OpenGL 4.3's, or the extension it came from,
     // where the driver has every call of it.
@@ -1196,6 +1199,7 @@ const vtable: backend.Vtable = .{
     .surfaceSize = surfaceSize,
     .present = present,
     .submit = submit,
+    .memory = memory,
 };
 
 fn cast(impl: backend.Impl) *Gl {
@@ -1216,6 +1220,42 @@ fn deinit(impl: backend.Impl) void {
 
 fn caps(impl: backend.Impl) types.Caps {
     return cast(impl).capabilities;
+}
+
+const MemoryInfo = enum { none, nvx, ati };
+
+/// `GL_NVX_gpu_memory_info`'s and `GL_ATI_meminfo`'s names, which no core
+/// header has.
+const memory_token = struct {
+    const dedicated_vidmem_nvx: gt.Enum = 0x9047;
+    const current_available_vidmem_nvx: gt.Enum = 0x9049;
+    const eviction_count_nvx: gt.Enum = 0x904A;
+    const evicted_memory_nvx: gt.Enum = 0x904B;
+    /// Four numbers, the first the free kibibytes of the pool textures use.
+    const texture_free_memory_ati: gt.Enum = 0x87FC;
+};
+
+fn memory(impl: backend.Impl) ?types.Memory {
+    const self = cast(impl);
+    const api = &self.api;
+    switch (self.memory_info) {
+        .none => return null,
+        .nvx => {
+            const total = integer(api, memory_token.dedicated_vidmem_nvx);
+            if (total <= 0) return null;
+            return .{
+                .total_kib = @intCast(total),
+                .available_kib = @intCast(@max(0, integer(api, memory_token.current_available_vidmem_nvx))),
+                .evictions = @intCast(@max(0, integer(api, memory_token.eviction_count_nvx))),
+                .evicted_kib = @intCast(@max(0, integer(api, memory_token.evicted_memory_nvx))),
+            };
+        },
+        .ati => {
+            var free: [4]gt.Int = @splat(0);
+            api.getIntegerv(memory_token.texture_free_memory_ati, &free);
+            return .{ .total_kib = 0, .available_kib = @intCast(@max(0, free[0])) };
+        },
+    }
 }
 
 fn info(impl: backend.Impl) types.Info {

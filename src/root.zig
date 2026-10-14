@@ -72,6 +72,7 @@ pub const Opener = backend.Opener;
 pub const Select = types.Select;
 pub const Error = types.Error;
 pub const Info = types.Info;
+pub const Memory = types.Memory;
 
 pub const Buffer = types.Buffer;
 pub const Texture = types.Texture;
