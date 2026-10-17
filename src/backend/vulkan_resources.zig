@@ -4,11 +4,12 @@
 //! the Vulkan backend. `vulkan.zig` owns the device and the frame; this file
 //! only ever receives a `*Vk` and hands back a `Native` it made.
 //!
-//! **Buffers are simple on purpose.** Every one of them - vertex, index or
-//! uniform - is host-visible, host-coherent memory, mapped once at creation
-//! and never unmapped until it is destroyed. `updateBuffer` is a `memcpy`.
-//! Nothing here is the fastest a driver could do; it is the smallest thing
-//! that is unambiguously correct.
+//! **Static geometry lives with the GPU.** Vertex and index buffers use
+//! device-local memory; bounded staging copies upload their contents. Dynamic
+//! buffers and uniform blocks stay mapped and coherent. On unified-memory
+//! devices static buffers prefer mapped device-local memory too, avoiding a
+//! needless copy. Writes keep the existing versioning contract: a recording
+//! never sees a later write to a buffer it already bound.
 //!
 //! **Textures are device-local** and always `shader_read_only_optimal`
 //! between one command buffer and the next, every level of them: a write or
@@ -59,6 +60,33 @@ fn memoryTypeIndex(self: *Vk, allowed: u32, wanted: vk.gen.types.MemoryPropertyF
     return null;
 }
 
+/// A driver's memory refusal is not necessarily the process running out of
+/// RAM: say which heap and request it refused, keeping its own reason.
+fn allocationFailed(self: *Vk, kind: []const u8, size: u64, type_index: u32, err: anyerror) types.Error {
+    const properties = self.runtime.memory_properties;
+    const memory_type = properties.memory_types[type_index];
+    const heap = properties.memory_heaps[memory_type.heap_index];
+    std.log.scoped(.fluxion_rhi).err("Vulkan {s} allocation failed: {t}; requested {d} bytes, memory type {d}, heap {d} ({d} bytes, device local: {})", .{
+        kind, err, size, type_index, memory_type.heap_index, heap.size, heap.flags.device_local,
+    });
+    return allocationError(err);
+}
+
+fn allocationError(err: anyerror) types.Error {
+    return switch (err) {
+        error.OutOfHostMemory, error.OutOfDeviceMemory => error.OutOfMemory,
+        error.DeviceLost => error.DeviceLost,
+        else => error.Failed,
+    };
+}
+
+test "only a driver's memory refusal is reported as out of memory" {
+    try std.testing.expectEqual(error.OutOfMemory, allocationError(error.OutOfHostMemory));
+    try std.testing.expectEqual(error.OutOfMemory, allocationError(error.OutOfDeviceMemory));
+    try std.testing.expectEqual(error.DeviceLost, allocationError(error.DeviceLost));
+    try std.testing.expectEqual(error.Failed, allocationError(error.TooManyObjects));
+}
+
 // -------------------------------------------------------------------------
 // Buffers
 // -------------------------------------------------------------------------
@@ -68,7 +96,7 @@ fn memoryTypeIndex(self: *Vk, allowed: u32, wanted: vk.gen.types.MemoryPropertyF
 pub const Version = struct {
     buffer: vk.gen.types.Buffer,
     memory: vk.gen.types.DeviceMemory,
-    mapped: [*]u8,
+    mapped: ?[*]u8 = null,
     busy: u64 = 0,
 };
 
@@ -93,27 +121,44 @@ pub fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) types.Error!back
         .index => usage.index_buffer = true,
         .uniform => usage.uniform_buffer = true,
     }
-    // A uniform block is read in whole vec4s, as on the other backends.
-    const size = if (desc.kind == .uniform) std.mem.alignForward(usize, desc.size, 16) else desc.size;
-    const shadow = try self.gpa.alloc(u8, @max(size, 1));
+    const dynamic = desc.dynamic or desc.kind == .uniform;
+    if (!dynamic) usage.transfer_dst = true;
+    // Copies work in whole words, uniform blocks in whole vec4s. The public
+    // size stays unchanged, including for a partial write of a few bytes.
+    const size = std.mem.alignForward(usize, @max(desc.size, 1), if (desc.kind == .uniform) 16 else 4);
+    const shadow = try self.gpa.alloc(u8, size);
     errdefer self.gpa.free(shadow);
-    const version = try hostBuffer(self, size, usage, .{});
-    errdefer freeVersion(self, version);
+    @memset(shadow, 0);
+    const version = if (dynamic)
+        try hostBuffer(self, size, usage, .{})
+    else if (self.runtime.unified_memory)
+        try hostBuffer(self, size, usage, .{ .device_local = true })
+    else
+        try deviceBuffer(self, size, usage);
+    errdefer vulkan.bury(self, .{ .buffer = version });
     const res = try self.gpa.create(BufferRes);
+    errdefer self.gpa.destroy(res);
     res.* = .{ .current = version, .shadow = shadow, .written = 0, .size = size, .usage = usage };
     if (desc.data) |data| {
-        @memcpy(version.mapped[0..data.len], data);
         @memcpy(shadow[0..data.len], data);
         res.written = data.len;
+        if (version.mapped) |mapped| @memcpy(mapped[0..data.len], data) else try uploadBuffer(self, res, 0, std.mem.alignForward(usize, data.len, 4));
     }
     return res;
 }
 
 /// A buffer's memory the CPU writes and reads through a mapping kept for its
-/// life: a version of every buffer here, and the staging and readback ones.
-/// `cached` is asked for where the CPU reads it back, when the driver has
-/// such memory.
+/// life: dynamic buffers and staging/readback. Prefer the extra properties
+/// where available, falling back to coherent host memory.
 fn hostBuffer(self: *Vk, size: usize, usage: vk.gen.types.BufferUsageFlags, extra: vk.gen.types.MemoryPropertyFlags) types.Error!Version {
+    return allocateBuffer(self, size, usage, .{ .host_visible = true, .host_coherent = true }, extra, true);
+}
+
+fn deviceBuffer(self: *Vk, size: usize, usage: vk.gen.types.BufferUsageFlags) types.Error!Version {
+    return allocateBuffer(self, size, usage, .{ .device_local = true }, .{}, false);
+}
+
+fn allocateBuffer(self: *Vk, size: usize, usage: vk.gen.types.BufferUsageFlags, wanted: vk.gen.types.MemoryPropertyFlags, extra: vk.gen.types.MemoryPropertyFlags, map: bool) types.Error!Version {
     const vkd = self.runtime.vkd;
     var buffer: vk.gen.types.Buffer = .none;
     _ = vkd.createBuffer(self.runtime.device, &.{
@@ -125,29 +170,58 @@ fn hostBuffer(self: *Vk, size: usize, usage: vk.gen.types.BufferUsageFlags, extr
 
     var requirements: vk.gen.types.MemoryRequirements = undefined;
     vkd.getBufferMemoryRequirements(self.runtime.device, buffer, &requirements);
-    var wanted: vk.gen.types.MemoryPropertyFlags = .{ .host_visible = true, .host_coherent = true };
-    const plain = wanted;
-    if (extra.host_cached) wanted.host_cached = true;
-    const type_index = memoryTypeIndex(self, requirements.memory_type_bits, wanted) orelse
-        memoryTypeIndex(self, requirements.memory_type_bits, plain) orelse return error.NoDevice;
+    const preferred: vk.gen.types.MemoryPropertyFlags = @bitCast(@as(u32, @bitCast(wanted)) | @as(u32, @bitCast(extra)));
+    const type_index = memoryTypeIndex(self, requirements.memory_type_bits, preferred) orelse
+        memoryTypeIndex(self, requirements.memory_type_bits, wanted) orelse return error.NoDevice;
 
     var memory: vk.gen.types.DeviceMemory = .none;
     _ = vkd.allocateMemory(self.runtime.device, &.{
         .allocation_size = requirements.size,
         .memory_type_index = type_index,
-    }, null, &memory).check() catch return error.OutOfMemory;
+    }, null, &memory).check() catch |err| {
+        return allocationFailed(self, "buffer", requirements.size, type_index, err);
+    };
     errdefer vkd.freeMemory(self.runtime.device, memory, null);
     _ = vkd.bindBufferMemory(self.runtime.device, buffer, memory, 0).check() catch return error.Failed;
 
     var mapped: ?*anyopaque = null;
-    _ = vkd.mapMemory(self.runtime.device, memory, 0, vk.gen.types.whole_size, .{}, &mapped).check() catch return error.Failed;
-    return .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped.?) };
+    if (map) _ = vkd.mapMemory(self.runtime.device, memory, 0, vk.gen.types.whole_size, .{}, &mapped).check() catch return error.Failed;
+    return .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped) };
 }
 
 pub fn freeVersion(self: *Vk, version: Version) void {
-    self.runtime.vkd.unmapMemory(self.runtime.device, version.memory);
+    if (version.mapped != null) self.runtime.vkd.unmapMemory(self.runtime.device, version.memory);
     self.runtime.vkd.destroyBuffer(self.runtime.device, version.buffer, null);
     self.runtime.vkd.freeMemory(self.runtime.device, version.memory, null);
+}
+
+/// Upload whole words from the CPU copy, in the same bounded batches as
+/// textures. Each staging buffer lives until the recording's fence passes.
+fn uploadBuffer(self: *Vk, res: *BufferRes, offset: usize, len: usize) types.Error!void {
+    var done: usize = 0;
+    while (done < len) {
+        const size = @min(len - done, vulkan.upload_budget);
+        try vulkan.prepareUpload(self, size);
+        const staging = try hostBuffer(self, size, .{ .transfer_src = true }, .{});
+        @memcpy(staging.mapped.?[0..size], res.shadow[offset + done ..][0..size]);
+        const copy = [_]vk.gen.types.BufferCopy{.{ .src_offset = 0, .dst_offset = offset + done, .size = size }};
+        self.runtime.vkd.cmdCopyBuffer(self.command_buffer, staging.buffer, res.current.buffer, copy.len, &copy);
+        const ready = [_]vk.gen.types.BufferMemoryBarrier{.{
+            .src_access_mask = .{ .transfer_write = true },
+            .dst_access_mask = .{ .vertex_attribute_read = true, .index_read = true },
+            .src_queue_family_index = vk.gen.types.queue_family_ignored,
+            .dst_queue_family_index = vk.gen.types.queue_family_ignored,
+            .buffer = res.current.buffer,
+            .offset = offset + done,
+            .size = size,
+        }};
+        self.runtime.vkd.cmdPipelineBarrier(self.command_buffer, .{ .transfer = true }, .{ .vertex_input = true }, .{}, 0, null, ready.len, &ready, 0, null);
+        res.current.busy = vulkan.recordingSerial(self);
+        self.has_work = true;
+        self.upload_bytes += size;
+        vulkan.bury(self, .{ .buffer = staging });
+        done += size;
+    }
 }
 
 pub fn destroyBuffer(impl: backend.Impl, native: backend.Native) void {
@@ -165,29 +239,40 @@ pub fn destroyBuffer(impl: backend.Impl, native: backend.Native) void {
 pub fn updateBuffer(impl: backend.Impl, native: backend.Native, offset: usize, bytes: []const u8) types.Error!void {
     const self = vulkan.cast(impl);
     const res = as(BufferRes, native);
+    if (bytes.len == 0) return;
     const end = offset + bytes.len;
     if (res.current.busy > self.completed) vulkan.poll(self);
-    if (res.current.busy > self.completed) {
+    const renamed = res.current.busy > self.completed;
+    if (renamed) {
         try res.spare.ensureUnusedCapacity(self.gpa, 1);
         const fresh = try spareVersion(self, res);
         res.spare.appendAssumeCapacity(res.current);
         res.current = fresh;
-        // Everything else written is in the new one too.
-        const before = @min(offset, res.written);
-        @memcpy(fresh.mapped[0..before], res.shadow[0..before]);
-        if (res.written > end) @memcpy(fresh.mapped[end..res.written], res.shadow[end..res.written]);
+        if (fresh.mapped) |mapped| {
+            const before = @min(offset, res.written);
+            @memcpy(mapped[0..before], res.shadow[0..before]);
+            if (res.written > end) @memcpy(mapped[end..res.written], res.shadow[end..res.written]);
+        }
     }
-    @memcpy(res.current.mapped[offset..end], bytes);
     @memcpy(res.shadow[offset..end], bytes);
     res.written = @max(res.written, end);
+    if (res.current.mapped) |mapped| {
+        @memcpy(mapped[offset..end], bytes);
+    } else {
+        // A fresh version needs the unchanged prefix/suffix too. Updating
+        // one the GPU finished with only copies the touched whole words.
+        const from = if (renamed) 0 else std.mem.alignBackward(usize, offset, 4);
+        const until = std.mem.alignForward(usize, if (renamed) res.written else end, 4);
+        try uploadBuffer(self, res, from, until - from);
+    }
 }
 
-/// A version of `res` the GPU is done with, or a new one.
+/// A version of `res` the GPU is done with, or a new one of the same kind.
 fn spareVersion(self: *Vk, res: *BufferRes) types.Error!Version {
     for (res.spare.items, 0..) |version, i| {
         if (version.busy <= self.completed) return res.spare.swapRemove(i);
     }
-    return hostBuffer(self, res.size, res.usage, .{});
+    return if (res.current.mapped != null) hostBuffer(self, res.size, res.usage, .{}) else deviceBuffer(self, res.size, res.usage);
 }
 
 // -------------------------------------------------------------------------
@@ -292,7 +377,9 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     _ = vkd.allocateMemory(self.runtime.device, &.{
         .allocation_size = requirements.size,
         .memory_type_index = type_index,
-    }, null, &memory).check() catch return error.OutOfMemory;
+    }, null, &memory).check() catch |err| {
+        return allocationFailed(self, "texture", requirements.size, type_index, err);
+    };
     errdefer vkd.freeMemory(self.runtime.device, memory, null);
     _ = vkd.bindImageMemory(self.runtime.device, image, memory, 0).check() catch return error.Failed;
 
@@ -308,6 +395,14 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
         res.read_view = try imageView(self, image, vk_format, rangeOf(.{ .depth = true }, 0, 1));
     }
     errdefer if (res.read_view != .none) vkd.destroyImageView(self.runtime.device, res.read_view, null);
+
+    // Initial layout transitions and upload batches may already reference
+    // the image when a later staging allocation fails. Retire those commands
+    // before the errdefers above destroy the image and its bound memory.
+    errdefer {
+        vulkan.flush(self) catch {};
+        vulkan.waitIdle(self);
+    }
 
     // A sampled depth texture into where a shader reads it, where every pass
     // that draws into it leaves it.
@@ -478,27 +573,35 @@ pub fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Te
 /// every level is between commands.
 fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []const u8, row_pitch: usize) types.Error!void {
     const row_bytes = res.format.rowBytes(region.width);
-    const staging = try hostBuffer(self, row_bytes * region.height, .{ .transfer_src = true }, .{});
-    var buried = false;
-    defer if (!buried) freeVersion(self, staging);
-    for (0..region.height) |y| @memcpy(staging.mapped[y * row_bytes ..][0..row_bytes], bytes[y * row_pitch ..][0..row_bytes]);
+    const rows_per_upload = @max(1, vulkan.upload_budget / row_bytes);
+    var first: u32 = 0;
+    while (first < region.height) {
+        const rows: u32 = @intCast(@min(rows_per_upload, region.height - first));
+        const size = row_bytes * rows;
+        try vulkan.prepareUpload(self, size);
+        const staging = try hostBuffer(self, size, .{ .transfer_src = true }, .{});
+        var buried = false;
+        defer if (!buried) freeVersion(self, staging);
+        for (0..rows) |y| @memcpy(staging.mapped.?[y * row_bytes ..][0..row_bytes], bytes[(@as(usize, first) + y) * row_pitch ..][0..row_bytes]);
 
-    try vulkan.ensureRecording(self);
-    barrier(self, res.image, region.mip, 1, .shader_read_only_optimal, .transfer_dst_optimal, .{}, .{ .transfer_write = true }, .{ .fragment_shader = true, .color_attachment_output = true }, .{ .transfer = true });
-    const copy = [_]vk.gen.types.BufferImageCopy{.{
-        .buffer_offset = 0,
-        .buffer_row_length = 0,
-        .buffer_image_height = 0,
-        .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = region.mip, .base_array_layer = 0, .layer_count = 1 },
-        .image_offset = .{ .x = @intCast(region.x), .y = @intCast(region.y), .z = 0 },
-        .image_extent = .{ .width = region.width, .height = region.height, .depth = 1 },
-    }};
-    self.runtime.vkd.cmdCopyBufferToImage(self.command_buffer, staging.buffer, res.image, .transfer_dst_optimal, copy.len, &copy);
-    barrier(self, res.image, region.mip, 1, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
-    self.has_work = true;
-    // Read by the copy when the recording runs: freed once it has.
-    vulkan.bury(self, .{ .buffer = staging });
-    buried = true;
+        barrier(self, res.image, region.mip, 1, .shader_read_only_optimal, .transfer_dst_optimal, .{}, .{ .transfer_write = true }, .{ .fragment_shader = true, .color_attachment_output = true }, .{ .transfer = true });
+        const copy = [_]vk.gen.types.BufferImageCopy{.{
+            .buffer_offset = 0,
+            .buffer_row_length = 0,
+            .buffer_image_height = 0,
+            .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = region.mip, .base_array_layer = 0, .layer_count = 1 },
+            .image_offset = .{ .x = @intCast(region.x), .y = @intCast(region.y + first), .z = 0 },
+            .image_extent = .{ .width = region.width, .height = rows, .depth = 1 },
+        }};
+        self.runtime.vkd.cmdCopyBufferToImage(self.command_buffer, staging.buffer, res.image, .transfer_dst_optimal, copy.len, &copy);
+        barrier(self, res.image, region.mip, 1, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
+        self.has_work = true;
+        self.upload_bytes += size;
+        // Read by the copy when this batch runs; freed by its fence.
+        vulkan.bury(self, .{ .buffer = staging });
+        buried = true;
+        first += rows;
+    }
 }
 
 /// One level, copied into a buffer the CPU reads and handed back as RGBA,
@@ -542,7 +645,7 @@ pub fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subres
     try vulkan.waitFor(self, self.submitted);
 
     const pixels = try gpa.alloc(u8, @as(usize, size[0]) * 4 * size[1]);
-    readback_texels.convert(res.format, decode, readback.mapped, row_bytes, size[0], size[1], pixels);
+    readback_texels.convert(res.format, decode, readback.mapped.?, row_bytes, size[0], size[1], pixels);
     return pixels;
 }
 

@@ -244,6 +244,13 @@ viewport a negative height, so its clip space is Direct3D's. With
 `DeviceDesc.debug` it turns the Khronos validation layer on, when one is
 installed.
 
+**Static Vulkan geometry stays in device-local memory.** Vertex and index
+buffers with `dynamic = false` are uploaded through bounded staging batches,
+retired with the recording's fence. Dynamic buffers and uniform blocks stay
+mapped. Unified-memory devices prefer mapped device-local memory for static
+geometry as well. Partial writes preserve the rest of the buffer and any
+draws already recorded with its previous contents.
+
 **A shadow map is a depth texture, a bias, and a sampler that compares.**
 `DepthState.bias` and `slope_bias` push each depth a pipeline writes back -
 that many of the format's smallest steps, and that much times the triangle's

@@ -111,6 +111,10 @@ const ring_size = 4;
 /// program that never presents still has its work done.
 const max_lists = 64;
 
+/// Staging bytes in one recording. Uploads can happen between frames, when
+/// no present would otherwise submit them and release their CPU copies.
+pub const upload_budget = 32 * 1024 * 1024;
+
 // -------------------------------------------------------------------------
 // Format mapping
 // -------------------------------------------------------------------------
@@ -175,6 +179,8 @@ pub const Runtime = struct {
     /// limit, where it has anisotropic filtering and it was turned on, and
     /// one where it has none.
     max_anisotropy: f32 = 1,
+    /// Static geometry can be mapped on unified-memory devices.
+    unified_memory: bool = false,
 
     /// Opens a Vulkan execution context that can present: the instance asks
     /// for `VK_KHR_surface` and every `VK_KHR_*_surface` extension the
@@ -299,6 +305,7 @@ pub const Runtime = struct {
             .vki = vki,
             .vkd = vkd,
             .memory_properties = memory_properties,
+            .unified_memory = chosen.device_type != .discrete_gpu,
             .max_anisotropy = if (anisotropic) @max(1, chosen.limits.max_sampler_anisotropy) else 1,
         };
     }
@@ -396,6 +403,7 @@ pub const Vk = struct {
     /// anything at all.
     lists: u32 = 0,
     has_work: bool = false,
+    upload_bytes: usize = 0,
     pass_format: vk.gen.types.Format = .undefined,
     /// The open pass's depth attachment's format, `undefined` for none.
     pass_depth: vk.gen.types.Format = .undefined,
@@ -778,6 +786,16 @@ pub fn record(self: *Vk) types.Error!void {
     self.acquired_count = 0;
     self.lists = 0;
     self.has_work = false;
+    self.upload_bytes = 0;
+}
+
+/// Make room for another bounded upload. The existing fence ring retires
+/// each batch before its slot is reused; no device-wide idle is needed.
+pub fn prepareUpload(self: *Vk, bytes: usize) types.Error!void {
+    std.debug.assert(bytes <= upload_budget);
+    std.debug.assert(!self.in_pass);
+    if (self.recording and self.upload_bytes > upload_budget - bytes) try finish(self);
+    try ensureRecording(self);
 }
 
 /// The recording that is open, or a new one.
@@ -1286,6 +1304,36 @@ test "a texture reads back as it was made, and a box written into it changes tha
     try testing.expectEqual([4]u8{ 0, 20, 30, 255 }, back[0..4].*);
 }
 
+test "large padded uploads are batched before a present and keep every row" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    const self = cast(device.impl);
+    const width = 2048;
+    const height = upload_budget / (width * 4) + 1;
+    if (device.caps().limits.max_texture_2d < height + 2) return error.SkipZigTest;
+    const pitch = width * 4 + 16;
+    const pixels = try testing.allocator.alloc(u8, pitch * height);
+    defer testing.allocator.free(pixels);
+    @memset(pixels, 0xee);
+    for (0..height) |y| {
+        for (0..width) |x| pixels[y * pitch + x * 4 ..][0..4].* = .{ @truncate(y), @truncate(x), 73, 255 };
+    }
+    const texture = try device.createTexture(.{ .width = width + 2, .height = height + 2 });
+    try flush(self);
+    const before = self.submitted;
+    try device.writeTexture(texture, .{ .x = 1, .y = 1, .width = width, .height = height }, pixels, pitch, 0);
+    try testing.expect(self.submitted > before);
+    try testing.expect(self.upload_bytes <= upload_budget);
+    const back = try device.readTexture(texture, testing.allocator);
+    defer testing.allocator.free(back);
+    for (0..height) |y| {
+        const at = ((y + 1) * (width + 2) + 1) * 4;
+        try testing.expectEqualSlices(u8, pixels[y * pitch ..][0 .. width * 4], back[at..][0 .. width * 4]);
+    }
+    waitIdle(self);
+    try testing.expectEqual(@as(usize, 0), self.graveyard.items.len);
+}
+
 test "bgra8 and r8 read back as RGBA" {
     var device = try openTestDevice();
     defer device.deinit();
@@ -1331,21 +1379,74 @@ test "a buffer the GPU may still read is written into another copy, which keeps 
     defer device.deinit();
     const self = cast(device.impl);
 
-    const handle = try device.createBuffer(.{ .kind = .vertex, .size = 8, .data = "abcdefgh" });
+    const handle = try device.createBuffer(.{ .kind = .vertex, .dynamic = true, .size = 8, .data = "abcdefgh" });
     const res = as(BufferRes, device.buffers.get(handle).?.native);
     const first = res.current;
     // As if a submission the GPU has not done yet drew with it.
     res.current.busy = self.submitted + 1;
     try device.updateBuffer(handle, 2, "XY");
     try testing.expect(res.current.buffer != first.buffer);
-    try testing.expectEqualSlices(u8, "abcdefgh", first.mapped[0..8]);
-    try testing.expectEqualSlices(u8, "abXYefgh", res.current.mapped[0..8]);
+    try testing.expectEqualSlices(u8, "abcdefgh", first.mapped.?[0..8]);
+    try testing.expectEqualSlices(u8, "abXYefgh", res.current.mapped.?[0..8]);
 
     // One no submission uses is written where it is.
     const second = res.current.buffer;
     try device.updateBuffer(handle, 0, "Z");
     try testing.expectEqual(second, res.current.buffer);
-    try testing.expectEqualSlices(u8, "ZbXYefgh", res.current.mapped[0..8]);
+    try testing.expectEqualSlices(u8, "ZbXYefgh", res.current.mapped.?[0..8]);
+}
+
+test "static geometry uploads in bounded batches and partial writes keep already recorded draws" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    const self = cast(device.impl);
+    const shader = try device.createShader(.{ .spirv = .{ .vertex = shaded_vertex, .fragment = shaded_fragment } });
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{ .{ .location = 0, .format = .float3, .offset = 0 }, .{ .location = 1, .format = .float4, .offset = 12 } },
+        .buffers = &.{.{ .stride = 28 }},
+    });
+    const vertices = [_]f32{ -1, -1, 0, 1, 0, 0, 1, 3, -1, 0, 1, 0, 0, 1, -1, 3, 0, 1, 0, 0, 1 };
+    const vertex = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(vertices)), .data = std.mem.asBytes(&vertices) });
+    const indices = try testing.allocator.alloc(u32, upload_budget / 4 + 3);
+    defer testing.allocator.free(indices);
+    @memset(indices, 0);
+    indices[indices.len - 3 ..][0..3].* = .{ 0, 1, 2 };
+    const before = self.submitted;
+    const index = try device.createBuffer(.{ .kind = .index, .size = indices.len * 4, .data = std.mem.sliceAsBytes(indices) });
+    const res = as(BufferRes, device.buffers.get(index).?.native);
+    if (!self.runtime.unified_memory) {
+        try testing.expect(res.current.mapped == null);
+        try testing.expect(self.submitted > before);
+        try testing.expect(self.upload_bytes <= upload_budget);
+    }
+    var targets: [3]types.Texture = undefined;
+    for (&targets, 0..) |*target, round| {
+        target.* = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+        // An unaligned write changes only index one. The previous draw
+        // keeps its triangle; the next sees a degenerate one.
+        if (round == 1) try device.updateBuffer(index, upload_budget + 3, &.{ 0, 0, 0, 0 });
+        if (round == 2) {
+            try flush(self);
+            waitIdle(self);
+            const held = res.current.buffer;
+            try device.updateBuffer(index, upload_budget + 3, &.{ 0, 1, 0, 0 });
+            try testing.expectEqual(held, res.current.buffer);
+        }
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target.* }, .clear_color = .{ 0, 0, 1, 1 } } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, vertex, 0);
+        try cmd.setIndexBuffer(index, .u32);
+        try cmd.drawIndexed(.{ .index_count = 3, .first_index = upload_budget / 4 });
+        try cmd.endPass();
+        try device.submit();
+    }
+    for (targets, 0..) |target, round| {
+        const pixels = try device.readTexture(target, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqualSlices(u8, if (round == 1) &.{ 0, 0, 255, 255 } else &.{ 255, 0, 0, 255 }, pixels[0..4]);
+    }
 }
 
 test "submits go into one recording, handed over when needed, and what they used is freed once the GPU is done" {
