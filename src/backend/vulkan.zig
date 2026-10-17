@@ -120,9 +120,11 @@ pub const upload_budget = 32 * 1024 * 1024;
 // -------------------------------------------------------------------------
 
 /// The formats this backend makes textures and targets of: the uncompressed
-/// ones. Everything else is `null`, so `Device`'s caps-driven pre-validation
-/// (from `caps` below never marking another format `sampled`) is what
-/// actually keeps requests for the rest from ever reaching this backend.
+/// ones, and BC's blocks - sampled where the device was made with
+/// `textureCompressionBC`. Everything else is `null`, so `Device`'s
+/// caps-driven pre-validation (from `caps` below never marking another
+/// format `sampled`) is what keeps requests for the rest from ever reaching
+/// this backend.
 pub fn toVkFormat(format: types.Format) ?vk.gen.types.Format {
     return switch (format) {
         .rgba8_unorm => .r8g8b8a8_unorm,
@@ -141,9 +143,21 @@ pub fn toVkFormat(format: types.Format) ?vk.gen.types.Format {
         .depth24_stencil8 => .d24_unorm_s8_uint,
         .depth32_float => .d32_sfloat,
         .depth32_float_stencil8 => .d32_sfloat_s8_uint,
+        .bc1_rgba_unorm => .bc1_rgba_unorm_block,
+        .bc1_rgba_unorm_srgb => .bc1_rgba_srgb_block,
+        .bc3_rgba_unorm => .bc3_unorm_block,
+        .bc3_rgba_unorm_srgb => .bc3_srgb_block,
+        .bc4_r_unorm => .bc4_unorm_block,
+        .bc5_rg_unorm => .bc5_unorm_block,
+        .bc6h_rgb_ufloat => .bc6h_ufloat_block,
+        .bc7_rgba_unorm => .bc7_unorm_block,
+        .bc7_rgba_unorm_srgb => .bc7_srgb_block,
         else => null,
     };
 }
+
+/// The BC formats, which a device has all of or none.
+const bc_formats = [_]types.Format{ .bc1_rgba_unorm, .bc1_rgba_unorm_srgb, .bc3_rgba_unorm, .bc3_rgba_unorm_srgb, .bc4_r_unorm, .bc5_rg_unorm, .bc6h_rgb_ufloat, .bc7_rgba_unorm, .bc7_rgba_unorm_srgb };
 
 pub fn fromVkFormat(format: vk.gen.types.Format) ?types.Format {
     return switch (format) {
@@ -181,6 +195,8 @@ pub const Runtime = struct {
     max_anisotropy: f32 = 1,
     /// Static geometry can be mapped on unified-memory devices.
     unified_memory: bool = false,
+    /// Made with `textureCompressionBC`: BC's blocks are sampled.
+    compression_bc: bool = false,
 
     /// Opens a Vulkan execution context that can present: the instance asks
     /// for `VK_KHR_surface` and every `VK_KHR_*_surface` extension the
@@ -275,7 +291,12 @@ pub const Runtime = struct {
         var offered: vk.PhysicalDeviceFeatures = .{};
         vki.getPhysicalDeviceFeatures(physical_device, &offered);
         const anisotropic = offered.sampler_anisotropy != vk.gen.types.vk_false;
-        const wanted: vk.PhysicalDeviceFeatures = .{ .sampler_anisotropy = if (anisotropic) vk.gen.types.vk_true else vk.gen.types.vk_false };
+        // So are BC's compressed blocks: every desktop GPU has them.
+        const compression_bc = offered.texture_compression_bc != vk.gen.types.vk_false;
+        const wanted: vk.PhysicalDeviceFeatures = .{
+            .sampler_anisotropy = if (anisotropic) vk.gen.types.vk_true else vk.gen.types.vk_false,
+            .texture_compression_bc = if (compression_bc) vk.gen.types.vk_true else vk.gen.types.vk_false,
+        };
         device_info.enabled_features = &wanted;
         var chosen: vk.PhysicalDeviceProperties = undefined;
         vki.getPhysicalDeviceProperties(physical_device, &chosen);
@@ -306,6 +327,7 @@ pub const Runtime = struct {
             .vkd = vkd,
             .memory_properties = memory_properties,
             .unified_memory = chosen.device_type != .discrete_gpu,
+            .compression_bc = compression_bc,
             .max_anisotropy = if (anisotropic) @max(1, chosen.limits.max_sampler_anisotropy) else 1,
         };
     }
@@ -628,7 +650,9 @@ fn caps(impl: backend.Impl) types.Caps {
             .max_color_attachments = 1,
             .uniform_offset_alignment = @intCast(@max(limits.min_uniform_buffer_offset_alignment, 1)),
         },
-        .features = .{ .sampler_border = true, .sampler_lod_bias = true },
+        // An edge block of a compressed level may hang past it, as the
+        // level's own size is whatever it is.
+        .features = .{ .sampler_border = true, .sampler_lod_bias = true, .compressed_partial_blocks = true },
     };
 
     // Bit n is 2^n samples, as `FormatSupport.sample_counts` counts them.
@@ -652,6 +676,18 @@ fn caps(impl: backend.Impl) types.Caps {
             .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
         });
     }
+    // BC's blocks are only sampled: never drawn into, their levels given.
+    if (self.runtime.compression_bc) for (bc_formats) |format| {
+        var fp: vk.gen.types.FormatProperties = undefined;
+        vki.getPhysicalDeviceFormatProperties(self.runtime.physical_device, toVkFormat(format).?, &fp);
+        const feats = fp.optimal_tiling_features;
+        if (!feats.sampled_image) continue;
+        answer.formats.set(format, .{
+            .sampled = true,
+            .filterable = feats.sampled_image_filter_linear,
+            .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
+        });
+    };
     // A depth format the device draws depth into, for 3D, and reads where it
     // can: a shadow map. For a depth format, filtered means a sampler that
     // compares filters it.
@@ -1972,6 +2008,63 @@ test "a sampler reads the level its bias and its range pick" {
     };
     for (cases) |case| {
         const sampler = try device.createSampler(case[0]);
+        defer device.destroySampler(sampler);
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = out } } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, corner_buffer, 0);
+        try cmd.setTexture(0, chain, sampler);
+        try cmd.draw(.{ .vertex_count = 4 });
+        try cmd.endPass();
+        try device.submit();
+        const pixels = try device.readTexture(out, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolid(pixels, case[1]);
+    }
+}
+
+test "BC1 blocks are written level by level, an edge block hanging past its level, and sampled" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    if (!device.caps().formatSupport(.bc1_rgba_unorm).sampled) return error.SkipZigTest;
+
+    // A BC1 block of one colour: two equal RGB565 endpoints, every index nought.
+    const block = struct {
+        fn of(comptime rgb565: u16) [8]u8 {
+            const endpoint = std.mem.toBytes(std.mem.nativeToLittle(u16, rgb565));
+            return endpoint ++ endpoint ++ [4]u8{ 0, 0, 0, 0 };
+        }
+    }.of;
+    const red = block(0xF800);
+    const green = block(0x07E0);
+    const blue = block(0x001F);
+    // 8x8, 4x4 and 2x2: four blocks, one, and one hanging past its level.
+    const chain = try device.createTexture(.{ .width = 8, .height = 8, .mip_levels = 3, .format = .bc1_rgba_unorm, .data = &(red ++ red ++ red ++ red) });
+    defer device.destroyTexture(chain);
+    try device.writeTexture(chain, .{ .mip = 1 }, &green, 0, 0);
+    try device.writeTexture(chain, .{ .mip = 2 }, &blue, 0, 0);
+    // A 20 wide chain's 5x5 level: its second block column is one texel of a block.
+    const odd = try device.createTexture(.{ .width = 20, .height = 20, .mip_levels = 0, .format = .bc1_rgba_unorm });
+    defer device.destroyTexture(odd);
+    try device.writeTexture(odd, .{ .mip = 2, .x = 4, .width = 1, .height = 4 }, &red, 0, 0);
+
+    const shader = try device.createShader(.{ .spirv = .{ .vertex = picture_vertex, .fragment = picture_fragment } });
+    defer device.destroyShader(shader);
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{.{ .location = 0, .format = .float2, .offset = 0 }},
+        .buffers = &.{.{ .stride = 8 }},
+        .topology = .triangle_strip,
+    });
+    defer device.destroyPipeline(pipeline);
+    const corners = [_]f32{ -1, -1, 1, -1, -1, 1, 1, 1 };
+    const corner_buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(corners)), .data = std.mem.asBytes(&corners) });
+    defer device.destroyBuffer(corner_buffer);
+    const out = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .render_target = true } });
+    defer device.destroyTexture(out);
+    const cases = [_]struct { f32, [4]u8 }{ .{ 0, .{ 255, 0, 0, 255 } }, .{ 1, .{ 0, 255, 0, 255 } }, .{ 2, .{ 0, 0, 255, 255 } } };
+    for (cases) |case| {
+        const sampler = try device.createSampler(.{ .min_filter = .nearest, .mag_filter = .nearest, .mip_filter = .nearest, .lod_min = case[0], .lod_max = case[0] });
         defer device.destroySampler(sampler);
         const cmd = device.begin();
         try cmd.beginPass(.{ .color = .{ .target = .{ .texture = out } } });

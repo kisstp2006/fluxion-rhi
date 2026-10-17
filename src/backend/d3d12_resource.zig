@@ -86,6 +86,16 @@ pub const Format = enum(u32) {
     r24_unorm_x8_typeless = 46,
     r16_typeless = 53,
     r16_unorm = 56,
+    // BC's blocks, sampled only.
+    bc1_unorm = 71,
+    bc1_unorm_srgb = 72,
+    bc3_unorm = 77,
+    bc3_unorm_srgb = 78,
+    bc4_unorm = 80,
+    bc5_unorm = 83,
+    bc6h_uf16 = 95,
+    bc7_unorm = 98,
+    bc7_unorm_srgb = 99,
     _,
 };
 

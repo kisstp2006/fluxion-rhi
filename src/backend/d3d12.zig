@@ -797,6 +797,9 @@ const support_depth_stencil: u32 = 0x10000;
 const support_multisample_resolve: u32 = 0x40000;
 const support_multisample_render_target: u32 = 0x200000;
 
+/// BC's blocks: sampled, never drawn into, their levels given and not made.
+const compressed = [_]types.Format{ .bc1_rgba_unorm, .bc1_rgba_unorm_srgb, .bc3_rgba_unorm, .bc3_rgba_unorm_srgb, .bc4_r_unorm, .bc5_rg_unorm, .bc6h_rgb_ufloat, .bc7_rgba_unorm, .bc7_rgba_unorm_srgb };
+
 /// The formats this file makes: every uncompressed one with a DXGI format.
 const offered = [_]types.Format{
     .r8_unorm,      .rg8_unorm,        .rgba8_unorm,   .bgra8_unorm,
@@ -867,6 +870,11 @@ fn caps(impl: backend.Impl) types.Caps {
             .dimensions = flat,
         });
     }
+    for (compressed) |format| {
+        const bits = askFormat(self.device, textureFormat(format).?);
+        if (bits & support_texture2d == 0 or bits & support_shader_sample == 0) continue;
+        answer.formats.set(format, .{ .sampled = true, .filterable = true, .dimensions = flat });
+    }
     return answer;
 }
 
@@ -903,6 +911,15 @@ fn textureFormat(format: types.Format) ?rc.Format {
         .depth24_stencil8 => .d24_unorm_s8_uint,
         .depth32_float => .d32_float,
         .depth32_float_stencil8 => .d32_float_s8x24_uint,
+        .bc1_rgba_unorm => .bc1_unorm,
+        .bc1_rgba_unorm_srgb => .bc1_unorm_srgb,
+        .bc3_rgba_unorm => .bc3_unorm,
+        .bc3_rgba_unorm_srgb => .bc3_unorm_srgb,
+        .bc4_r_unorm => .bc4_unorm,
+        .bc5_rg_unorm => .bc5_unorm,
+        .bc6h_rgb_ufloat => .bc6h_uf16,
+        .bc7_rgba_unorm => .bc7_unorm,
+        .bc7_rgba_unorm_srgb => .bc7_unorm_srgb,
         else => null,
     };
 }
@@ -1307,11 +1324,14 @@ fn destroyTexture(impl: backend.Impl, native: backend.Native) void {
 
 /// Where rows of `width` texels go in a buffer a copy reads or writes: the
 /// pitch a copy wants, a multiple of `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`.
+/// A compressed format's in whole blocks: an edge block hanging past its
+/// level is a whole one in the buffer.
 fn footprintOf(res: *const TextureRes, width: u32, height: u32) rc.PlacedSubresourceFootprint {
+    const block = res.format.info();
     return .{ .offset = 0, .footprint = .{
         .format = textureFormat(res.format).?,
-        .width = width,
-        .height = height,
+        .width = std.mem.alignForward(u32, width, block.block_width),
+        .height = std.mem.alignForward(u32, height, block.block_height),
         .depth = 1,
         .row_pitch = @intCast(std.mem.alignForward(usize, res.format.rowBytes(width), 256)),
     } };
@@ -1333,8 +1353,10 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     const res = as(TextureRes, native);
     const footprint = footprintOf(res, region.width, region.height);
     const row_bytes = res.format.rowBytes(region.width);
+    // Rows of texels, or of blocks for a compressed format.
+    const rows = res.format.rowCount(region.height);
 
-    const staging = try transferBuffer(self, .upload, @as(u64, footprint.footprint.row_pitch) * region.height);
+    const staging = try transferBuffer(self, .upload, @as(u64, footprint.footprint.row_pitch) * rows);
     var buried = false;
     defer if (!buried) {
         _ = com.release(staging);
@@ -1342,7 +1364,7 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     var mapped: ?*anyopaque = null;
     staging.vtable.Map(staging, 0, &rc.Range.nothing_read, &mapped).check() catch return error.Failed;
     const dst: [*]u8 = @ptrCast(mapped.?);
-    for (0..region.height) |y| {
+    for (0..rows) |y| {
         @memcpy(dst[y * footprint.footprint.row_pitch ..][0..row_bytes], bytes[y * row_pitch ..][0..row_bytes]);
     }
     staging.vtable.Unmap(staging, 0, null);
@@ -2244,13 +2266,15 @@ test "caps: .d2 only; the driver's formats, floats too, sampled, drawn into and 
     try testing.expectEqual(@as(u32, 16), c.limits.max_anisotropy);
     try testing.expect(c.features.sampler_border);
 
-    // A depth format is drawn into and not sampled; a compressed one is
-    // never claimed.
+    // A depth format is drawn into and not sampled; a compressed one only
+    // sampled.
     try testing.expect(c.formatSupport(.depth32_float).render_target);
     // ... and read, as a shadow map, filtered by a sampler that compares.
     try testing.expect(c.formatSupport(.depth32_float).sampled);
     try testing.expect(c.formatSupport(.depth32_float).filterable);
-    try testing.expect(!c.formatSupport(.bc1_rgba_unorm).sampled);
+    try testing.expect(c.formatSupport(.bc1_rgba_unorm).sampled);
+    try testing.expect(!c.formatSupport(.bc1_rgba_unorm).render_target);
+    try testing.expect(!c.formatSupport(.bc1_rgba_unorm).generate_mips);
 }
 
 test "a buffer is created, updated, and its bytes are what was written" {
@@ -2572,8 +2596,29 @@ test "what is not here yet comes back as error.Unsupported" {
     // No cube, volume or array textures.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .cube, .width = 4, .height = 4 }));
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4 }));
-    // No compressed formats.
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 4, .height = 4, .format = .bc1_rgba_unorm }));
+    // A compressed texture's level zero is whole blocks.
+    try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 6, .height = 6, .format = .bc1_rgba_unorm }));
+}
+
+test "BC1 blocks are written level by level, an edge block hanging past its level, and read as the colour they hold" {
+    var device = try warpDevice();
+    defer device.deinit();
+    if (!device.caps().formatSupport(.bc1_rgba_unorm).sampled) return error.SkipZigTest;
+    const block = struct {
+        fn of(comptime rgb565: u16) [8]u8 {
+            const endpoint = std.mem.toBytes(std.mem.nativeToLittle(u16, rgb565));
+            return endpoint ++ endpoint ++ [4]u8{ 0, 0, 0, 0 };
+        }
+    }.of;
+    const red = block(0xF800);
+    const texture = try device.createTexture(.{ .width = 8, .height = 8, .mip_levels = 3, .format = .bc1_rgba_unorm, .data = &(red ++ red ++ red ++ red) });
+    defer device.destroyTexture(texture);
+    try device.writeTexture(texture, .{ .mip = 1 }, &red, 0, 0);
+    try device.writeTexture(texture, .{ .mip = 2 }, &red, 0, 0);
+    const odd = try device.createTexture(.{ .width = 20, .height = 20, .mip_levels = 0, .format = .bc1_rgba_unorm });
+    defer device.destroyTexture(odd);
+    try device.writeTexture(odd, .{ .mip = 2, .x = 4, .width = 1, .height = 4 }, &red, 0, 0);
+    try device.submit();
 }
 
 test "a depth texture drawn into is read by a sampler that compares, and a bias pushes what is drawn back" {

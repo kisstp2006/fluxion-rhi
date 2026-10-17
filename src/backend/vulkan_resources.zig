@@ -361,6 +361,8 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
             .{ .depth_stencil_attachment = true, .sampled = desc.usage.sampled }
         else if (samples > 1)
             .{ .color_attachment = true }
+        else if (desc.format.isCompressed())
+            .{ .transfer_src = true, .transfer_dst = true, .sampled = true }
         else
             .{ .transfer_src = true, .transfer_dst = true, .sampled = true, .color_attachment = desc.usage.render_target },
         .sharing_mode = .exclusive,
@@ -572,11 +574,16 @@ pub fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Te
 /// tightly, copied onto the texture; that level is left sampled-from, as
 /// every level is between commands.
 fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []const u8, row_pitch: usize) types.Error!void {
+    // In rows of texels, or of blocks for a compressed format: a block row
+    // is `block_height` texels tall, the last one perhaps hanging past the
+    // level's edge.
+    const block_height = res.format.info().block_height;
     const row_bytes = res.format.rowBytes(region.width);
+    const all_rows = res.format.rowCount(region.height);
     const rows_per_upload = @max(1, vulkan.upload_budget / row_bytes);
     var first: u32 = 0;
-    while (first < region.height) {
-        const rows: u32 = @intCast(@min(rows_per_upload, region.height - first));
+    while (first < all_rows) {
+        const rows: u32 = @intCast(@min(rows_per_upload, all_rows - first));
         const size = row_bytes * rows;
         try vulkan.prepareUpload(self, size);
         const staging = try hostBuffer(self, size, .{ .transfer_src = true }, .{});
@@ -584,14 +591,15 @@ fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []cons
         defer if (!buried) freeVersion(self, staging);
         for (0..rows) |y| @memcpy(staging.mapped.?[y * row_bytes ..][0..row_bytes], bytes[(@as(usize, first) + y) * row_pitch ..][0..row_bytes]);
 
+        const top = first * block_height;
         barrier(self, res.image, region.mip, 1, .shader_read_only_optimal, .transfer_dst_optimal, .{}, .{ .transfer_write = true }, .{ .fragment_shader = true, .color_attachment_output = true }, .{ .transfer = true });
         const copy = [_]vk.gen.types.BufferImageCopy{.{
             .buffer_offset = 0,
             .buffer_row_length = 0,
             .buffer_image_height = 0,
             .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = region.mip, .base_array_layer = 0, .layer_count = 1 },
-            .image_offset = .{ .x = @intCast(region.x), .y = @intCast(region.y + first), .z = 0 },
-            .image_extent = .{ .width = region.width, .height = rows, .depth = 1 },
+            .image_offset = .{ .x = @intCast(region.x), .y = @intCast(region.y + top), .z = 0 },
+            .image_extent = .{ .width = region.width, .height = @min(rows * block_height, region.height - top), .depth = 1 },
         }};
         self.runtime.vkd.cmdCopyBufferToImage(self.command_buffer, staging.buffer, res.image, .transfer_dst_optimal, copy.len, &copy);
         barrier(self, res.image, region.mip, 1, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });

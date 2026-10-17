@@ -123,10 +123,10 @@ const wire = struct {
     /// attachment and nothing else.
     const draw_buffers = false;
     /// `compressedTexImage2D`, `compressedTexSubImage2D`.
-    const compressed_upload = false;
-    /// `getExtension`, `getSupportedExtensions`. A compressed format is only
-    /// there once its extension has been switched on, and nothing here can.
-    const extension_query = false;
+    const compressed_upload = true;
+    /// `getExtension`. A compressed format is only there once its extension
+    /// has been switched on, which asking for it does.
+    const extension_query = true;
     /// `samplerParameterf`. Sampler state goes over as integers, so a level
     /// range is whole levels.
     const fractional_lod = false;
@@ -135,8 +135,8 @@ const wire = struct {
 /// Whether the context has switched a WebGL extension on. Only `false` can be
 /// said while `wire.extension_query` is: see there.
 fn extensionEnabled(name: []const u8) bool {
-    _ = name;
-    return wire.extension_query;
+    if (!wire.extension_query) return false;
+    return raw.getExtension(name.ptr, @intCast(name.len)) != 0;
 }
 
 /// One integer of context state, or zero where the context does not know the
@@ -946,6 +946,32 @@ fn upload(
 
     var staged: ?[]u8 = null;
     defer if (staged) |bytes| self.gpa.free(bytes);
+
+    // Blocks go over as they are, tightly packed: a level allocated with
+    // none is given zeros, as compressedTexImage2D takes no null.
+    if (res.format.isCompressed()) {
+        const tight = res.format.rowBytes(box.width);
+        const rows = res.format.rowCount(box.height);
+        if (data) |bytes| {
+            if (row_pitch == 0 or row_pitch == tight) {
+                image.pixels = bytes[0 .. tight * rows];
+            } else {
+                staged = try self.gpa.alloc(u8, tight * rows);
+                for (0..rows) |y| @memcpy(staged.?[y * tight ..][0..tight], bytes[y * row_pitch ..][0..tight]);
+                image.pixels = staged;
+            }
+        } else {
+            staged = try self.gpa.alloc(u8, tight * rows);
+            @memset(staged.?, 0);
+            image.pixels = staged;
+        }
+        switch (how) {
+            .allocate => gl.compressedTexImage2D(image),
+            .replace => gl.compressedTexSubImage2D(@intCast(box.x), @intCast(box.y), image),
+        }
+        return;
+    }
+
     var row_length: u32 = 0;
     if (data) |bytes| {
         const texel = res.format.bytesPerPixel();
@@ -2315,7 +2341,6 @@ test "what the binding lacks is what the caps leave out, until the binding grows
         .{ "compressedTexImage2D", wire.compressed_upload },
         .{ "compressedTexSubImage2D", wire.compressed_upload },
         .{ "getExtension", wire.extension_query },
-        .{ "getSupportedExtensions", wire.extension_query },
         .{ "samplerParameterf", wire.fractional_lod },
     };
     inline for (needs) |row| try testing.expectEqual(row[1], @hasDecl(raw, row[0]));
@@ -3002,4 +3027,24 @@ test "a shader destroyed before its pipeline is kept until the pipeline goes" {
     try testing.expectEqual(1, stub.state.live_objects);
     device.destroyShader(again);
     try testing.expectEqual(0, stub.state.live_objects);
+}
+
+test "with its extension on, BC1 is sampled, and its levels go over as blocks, a level made without any given zeros" {
+    stub.reset();
+    defer stub.reset();
+    stub.state.extensions = &.{"WEBGL_compressed_texture_s3tc"};
+    var device = try Device.init(testing.allocator, .{ .backend = .webgl });
+    defer device.deinit();
+    try testing.expect(device.caps().formatSupport(.bc1_rgba_unorm).sampled);
+    try testing.expect(!device.caps().formatSupport(.bc1_rgba_unorm).render_target);
+    try testing.expect(!device.caps().formatSupport(.bc7_rgba_unorm).sampled);
+
+    const blocks = [_]u8{ 0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0 } ** 4;
+    const texture = try device.createTexture(.{ .width = 8, .height = 8, .mip_levels = 2, .format = .bc1_rgba_unorm, .data = &blocks });
+    defer device.destroyTexture(texture);
+    // The last upload is level one's eight bytes of zeros.
+    try testing.expectEqual(@as(u32, 8), stub.state.last_image.len);
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, stub.state.last_image.first);
+    try device.writeTexture(texture, .{ .mip = 1 }, blocks[0..8], 0, 0);
+    try testing.expectEqual([4]u8{ 0x00, 0xF8, 0x00, 0xF8 }, stub.state.last_image.first);
 }
