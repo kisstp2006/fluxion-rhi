@@ -8,12 +8,12 @@
     .dependencies = .{
         // The three backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#60d8ce3d22cc387195aa61a311d51a1badd6454a",
-            .hash = "fluxion_gl-0.1.0-F9AI4gBqBQAfUaLWitMOOvvS5WHxYILOMnLMa0Kwt5LT",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#e0306318927fe3a01da076c35feee3114b2df431",
+            .hash = "fluxion_gl-0.1.0-F9AI4gBqBQAT4U-RIbTAoMEOWFf3ue0U-i1ov5lQhc80",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#161140d820bbec900735dff877dda80133f4e295",
-            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQB4FZp7I3O4DAQibxpepr8RtGa2ntS9wmen",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#c23780c7631155959f02c7a90151aa06ede818c7",
+            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQBXIwpGjiKPgUvn2CNbuSK7znQRtX_rIanO",
         },
         // The Vulkan loader and generated ABI. The RHI opens it at run time,
         // just as the Direct3D backend opens its system DLLs. Pinned to the
@@ -28,20 +28,20 @@
         // dependencies of its own to fetch. Pinned to a commit that has the
         // calls the backend binds by slot with, and that names its glue.
         .fluxion_webgl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-webgl#c936e4c2163120b742abb6d51c2aeba3a62d1518",
-            .hash = "fluxion_webgl-0.1.0-8yvbdRt_AwAidAIQ43VhOga8SMj6ze3uPXmozuRRHtzG",
+            .url = "git+https://github.com/kisstp2006/fluxion-webgl#96e2dbd476d5c885305ce5f9ecdc5c7f5c40da77",
+            .hash = "fluxion_webgl-0.1.0-8yvbdRt_AwAiIjGJGYHGq2unm_WrevHDQ6nEfEeUP09e",
         },
         // `Clip`: which clip space a device wants, so a projection is built
         // for the backend that was actually opened.
         .fluxion_math = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-math#92afdbddbf930369265d24136402c7eb5dd8f70e",
-            .hash = "fluxion_math-0.1.0-dfpZBeNUBAAwUMriLKaOTRBWGFmfY53_jyYuMUxkPYek",
+            .url = "git+https://github.com/kisstp2006/fluxion-math#1868bdb33577c9653d355f59ddd7ea1177b0cfaa",
+            .hash = "fluxion_math-0.1.0-dfpZBX_OGQDOAYcHTfGTFzjg8z8S6olSgZrJvIXVeW2f",
         },
         // Generational handles: what a program holds instead of a pointer
         // into a backend.
         .fluxion_id = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-id#a52c29dfe5ac0a49a5d5469cdc1a4fb96b799ccc",
-            .hash = "fluxion_id-0.1.0--9Hv-nGFAQAW36SvJvMB6L1nUNErZzh7JC0-nRPlrotw",
+            .url = "git+https://github.com/kisstp2006/fluxion-id#e3edea27d6f400116a95c0a80c08db9e4d134f12",
+            .hash = "fluxion_id-0.1.0--9Hv-iARBQBEDRul1NUEj0YIkC26XNewehht9xldmQsK",
         },
 
         // What the examples draw into and save with. Lazy: fetched only when
@@ -49,13 +49,13 @@
         // `-Dexamples` is given. The library never opens a window and never
         // writes a file.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#7f6990aef6d5c2a3f56bfb76582e6e55563da7c5",
-            .hash = "fluxion_platform-0.1.0-WsOjUZdGGQBbA31UoS_op4pisjc8pza_GUuOx3xKy8y0",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#34bf721edc2920c7dcee82fa3f0d832ea2408f08",
+            .hash = "fluxion_platform-0.1.0-WsOjUU_5GgBCl8D_Rx1doGGZ2oSla-aC0Y21jX9Q7pTs",
             .lazy = true,
         },
         .fluxion_image = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-image#79463ef201f11e15ada014467c0ad1d58b2a882d",
-            .hash = "fluxion_image-0.1.0-fyJkdS7vAAB1p43VSutvpxQB32hIcvJb3fGSZbo_qeha",
+            .url = "git+https://github.com/kisstp2006/fluxion-image#9d017f7f82556b6f587121f3255f7ff0a5ec3e55",
+            .hash = "fluxion_image-0.1.0-fyJkdX63AgASTcyVbd034C0ZTGGM-0kDT_IGQuBilnF0",
             .lazy = true,
         },
         // What the sprite example writes its shader in - once, rather than
@@ -64,8 +64,8 @@
         // text came from.
         //
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#ae10e60674941a1a6cc1798f3259789a69ac4746",
-            .hash = "fluxion_shader-0.1.0-FqFMEmBUBwAgRXrR34cXH0CUDdTUDtZ-EMPuSKS9ZfIF",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#7ca72477aaf61fe075e8c8ec487fdc1a07c83754",
+            .hash = "fluxion_shader-0.1.0-FqFMEv6YCAAkCt9CuC5fnmNVHpr25rvSIVf7EX__Ha3s",
             .lazy = true,
         },
     },
