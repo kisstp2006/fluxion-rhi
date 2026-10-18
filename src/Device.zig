@@ -117,9 +117,11 @@ pub fn available() []const types.Backend {
     return if (is_wasm)
         &.{ .webgl, .none }
     else if (builtin.os.tag == .windows)
-        &.{ .d3d11, .d3d12, .vulkan, .gl, .none }
+        &.{ .d3d11, .d3d12, .vulkan, .gl, .gles, .none }
+    else if (builtin.abi.isAndroid())
+        &.{ .vulkan, .gl, .none }
     else
-        &.{ .vulkan, .gl, .none };
+        &.{ .vulkan, .gl, .gles, .none };
 }
 
 /// Whether this machine has a Vulkan loader that Fluxion can open right now.
@@ -154,7 +156,9 @@ pub fn vulkanInstanceHandles(self: *Device) ?backend.VulkanInstanceHandles {
 pub fn opener(which: types.Backend) ?backend.Opener {
     return switch (which) {
         .none => .{ .name = "none", .tag = .none, .clip = which.clip(), .open = none_backend.open },
-        .gl => if (!is_wasm) .{ .name = "gl", .tag = .gl, .clip = which.clip(), .open = gl_backend.open } else null,
+        .gl => if (!is_wasm) .{ .name = "gl", .tag = .gl, .clip = which.clip(), .open = gl_backend.OnTarget.open } else null,
+        // On Android `gl` is OpenGL ES already.
+        .gles => if (!is_wasm and !builtin.abi.isAndroid()) .{ .name = "gles", .tag = .gles, .clip = which.clip(), .open = gl_backend.Es.open } else null,
         .d3d11 => if (builtin.os.tag == .windows) .{ .name = "d3d11", .tag = .d3d11, .clip = which.clip(), .open = d3d11_backend.open } else null,
         .d3d12 => if (builtin.os.tag == .windows) .{ .name = "d3d12", .tag = .d3d12, .clip = which.clip(), .open = d3d12_backend.open } else null,
         .webgl => if (is_wasm or builtin.is_test) .{ .name = "webgl", .tag = .webgl, .clip = which.clip(), .open = webgl_backend.open } else null,
@@ -184,6 +188,7 @@ pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
     const chosen: types.Backend = switch (desc.backend) {
         .none => .none,
         .gl => .gl,
+        .gles => .gles,
         .d3d11 => .d3d11,
         .d3d12 => .d3d12,
         .webgl => .webgl,

@@ -35,8 +35,14 @@ pub const Backend = enum {
     /// Accepts everything, draws nothing. For tests, servers and a program
     /// that wants to know its render code compiles.
     none,
-    /// OpenGL 3.3 core, on a context somebody else made.
+    /// OpenGL 3.3 core, on a context somebody else made - and on Android,
+    /// where the driver has nothing else, OpenGL ES 3.0.
     gl,
+    /// OpenGL ES 3.0, on a context somebody else made: on the desktop a
+    /// driver's ES profile - through GLX, WGL or EGL - beside its OpenGL;
+    /// the same backend as `gl` with OpenGL ES's commands and shaders. What
+    /// a game made for a phone draws with on the machine it is made on.
+    gles,
     /// Direct3D 11, feature level 11.0. Windows only.
     d3d11,
     /// Direct3D 12, feature level 11.0. Windows only.
@@ -58,6 +64,7 @@ pub const Backend = enum {
         return switch (self) {
             .none => .gl,
             .gl => .gl,
+            .gles => .gl,
             .d3d11 => .d3d,
             .d3d12 => .d3d,
             // OpenGL ES's, which is OpenGL's: depth from -1 to 1.
@@ -81,6 +88,7 @@ pub const Select = enum {
     auto,
     none,
     gl,
+    gles,
     d3d11,
     d3d12,
     webgl,

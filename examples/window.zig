@@ -61,6 +61,16 @@ pub const Window = struct {
         visible: bool = true,
     };
 
+    /// The context a window for `backend` is made with: OpenGL 3.3 core,
+    /// OpenGL ES 3.0, or none.
+    fn contextFor(backend: rhi.Backend) ?platform.gl.Config {
+        return switch (backend) {
+            .gl => .{ .major = 3, .minor = 3, .profile = .core },
+            .gles => .{ .api = .opengl_es, .major = 3, .minor = 0 },
+            else => null,
+        };
+    }
+
     pub fn open(options: Options) Error!Window {
         const gpa = std.heap.smp_allocator;
 
@@ -74,11 +84,11 @@ pub const Window = struct {
             .width = options.width,
             .height = options.height,
             .visible = options.visible,
-            .gl = if (options.backend == .gl) .{ .major = 3, .minor = 3, .profile = .core } else null,
+            .gl = contextFor(options.backend),
         });
         errdefer inner.win.destroy();
 
-        if (options.backend == .gl) {
+        if (contextFor(options.backend) != null) {
             try inner.win.makeContextCurrent();
             inner.win.setSwapInterval(.vsync) catch {};
         }
@@ -141,6 +151,7 @@ pub const Window = struct {
         return rhi.Device.init(gpa, .{
             .backend = switch (self.backend) {
                 .gl => .gl,
+                .gles => .gles,
                 .d3d11 => .d3d11,
                 .d3d12 => .d3d12,
                 .none => .none,
@@ -151,7 +162,7 @@ pub const Window = struct {
                 // Made by `Device.initWith`, and this glue knows no such backend.
                 .other => return error.Unsupported,
             },
-            .gl = if (self.backend == .gl) self.hooks() else null,
+            .gl = if (contextFor(self.backend) != null) self.hooks() else null,
             .debug = options.debug,
             .software = options.software,
         });
@@ -223,11 +234,11 @@ pub const Window = struct {
             .width = options.width,
             .height = options.height,
             .visible = options.visible,
-            .gl = if (options.backend == .gl) .{ .major = 3, .minor = 3, .profile = .core } else null,
-            .share_gl_with = if (options.backend == .gl) self.inner.win else null,
+            .gl = contextFor(options.backend),
+            .share_gl_with = if (contextFor(options.backend) != null) self.inner.win else null,
         });
         // The device's context is the one current, whatever making another did.
-        if (options.backend == .gl) self.inner.win.makeContextCurrent() catch {};
+        if (contextFor(options.backend) != null) self.inner.win.makeContextCurrent() catch {};
         return .{ .win = win };
     }
 };
@@ -306,8 +317,8 @@ pub const TestDevice = struct {
 
     pub fn open(backend: rhi.Backend) !TestDevice {
         switch (backend) {
-            .gl => {
-                var window = try openForTest(.gl);
+            .gl, .gles => {
+                var window = try openForTest(backend);
                 errdefer window.close();
                 const device = window.openDevice(std.testing.allocator, .{ .debug = true }) catch |err| switch (err) {
                     error.NoDevice, error.Unsupported => return error.SkipZigTest,
@@ -355,6 +366,8 @@ const testing = std.testing;
 
 const flat_vs = @embedFile("shaders/flat.vert.glsl");
 const flat_fs = @embedFile("shaders/flat.frag.glsl");
+const flat_es_vs = @embedFile("shaders/flat_es.vert.glsl");
+const flat_es_fs = @embedFile("shaders/flat_es.frag.glsl");
 
 const Vertex = extern struct { position: [2]f32, colour: [4]f32 };
 
@@ -415,6 +428,56 @@ test "a triangle through the OpenGL backend lands top-left up" {
     try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(pixels, 64, 2, 2));
     try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(pixels, 64, 61, 61));
     try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(pixels, 64, 2, 61));
+}
+
+test "a triangle through OpenGL ES on the desktop lands where it does on OpenGL" {
+    // A driver with no ES profile - or no display - is a skip.
+    var fixture = TestDevice.open(.gles) catch |err| switch (err) {
+        error.Unavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fixture.close();
+    var device = &fixture.device;
+    try testing.expectEqual(rhi.Backend.gles, device.info().backend);
+
+    const target = try device.createTexture(.{ .width = 64, .height = 64, .usage = .{ .render_target = true } });
+    const shader = device.createShader(.{ .glsl_es = .{ .vertex = flat_es_vs, .fragment = flat_es_fs } }) catch |err| {
+        std.debug.print("{s}\n", .{device.diagnostics()});
+        return err;
+    };
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{
+            .{ .location = 0, .format = .float2, .offset = 0 },
+            .{ .location = 1, .format = .float4, .offset = 8 },
+        },
+        .buffers = &.{.{ .stride = @sizeOf(Vertex) }},
+        .uniform_blocks = &.{"Frame"},
+    });
+    const vertices = [_]Vertex{
+        .{ .position = .{ -0.6, -0.6 }, .colour = .{ 1, 0, 0, 1 } },
+        .{ .position = .{ 0.0, 0.6 }, .colour = .{ 1, 0, 0, 1 } },
+        .{ .position = .{ 0.6, -0.6 }, .colour = .{ 1, 0, 0, 1 } },
+    };
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(vertices)), .data = std.mem.asBytes(&vertices) });
+    const tint = try device.createBuffer(.{ .kind = .uniform, .size = 16 });
+    try device.updateBuffer(tint, 0, std.mem.asBytes(&[4]f32{ 1, 1, 1, 1 }));
+
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 0, 0, 1, 1 } } });
+    try cmd.setPipeline(pipeline);
+    try cmd.setVertexBuffer(0, buffer, 0);
+    try cmd.setUniformBuffer(0, tint);
+    try cmd.draw(.{ .vertex_count = 3 });
+    try cmd.endPass();
+    try device.submit();
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, at(pixels, 64, 32, 20));
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, at(pixels, 64, 32, 40));
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(pixels, 64, 2, 2));
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, at(pixels, 64, 61, 61));
 }
 
 test "two draws read two parts of one uniform buffer on OpenGL" {
