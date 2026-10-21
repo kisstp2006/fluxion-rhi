@@ -34,14 +34,14 @@
         // `Clip`: which clip space a device wants, so a projection is built
         // for the backend that was actually opened.
         .fluxion_math = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-math#8d9f67e4b03f996f2f05020075f9211663bfb45e",
-            .hash = "fluxion_math-0.2.1-dfpZBcsoGgC_vlBvxsP_nGWUFvzr5H62IJxFqveow68r",
+            .url = "git+https://github.com/kisstp2006/fluxion-math#255d0cfd94cdae5e78f4d03cf00deb3b289ebdbc",
+            .hash = "fluxion_math-0.2.2-dfpZBcQoGgBIb9SFA2TxBPVmu97XeNzxaT_38DGVbzLD",
         },
         // Generational handles: what a program holds instead of a pointer
         // into a backend.
         .fluxion_id = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-id#a27e34c981598dfcc926f0153f44c346977816cd",
-            .hash = "fluxion_id-0.2.0--9Hv-sEUBQAuwuwAJ7vgqTjBuRug9HFtXyWTypJIsxQ_",
+            .url = "git+https://github.com/kisstp2006/fluxion-id#5a45bef918dbc0149e2f4e7759eb2a5cdf335264",
+            .hash = "fluxion_id-0.2.1--9Hv-rMUBQBd1AAinOPMg9zvCuy4edjE0JzrzEthmJMG",
         },
     },
     .paths = .{
