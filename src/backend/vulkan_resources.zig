@@ -105,7 +105,7 @@ pub const Version = struct {
 /// See the module doc of `vulkan.zig`.
 pub const BufferRes = struct {
     current: Version,
-    spare: std.ArrayListUnmanaged(Version) = .empty,
+    spare: std.ArrayList(Version) = .empty,
     shadow: []u8,
     /// How far anything was ever written: a new version copies no further.
     written: usize,

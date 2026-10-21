@@ -64,7 +64,7 @@ const readback = @import("readback.zig");
 const Error = backend.Error;
 
 comptime {
-    if (builtin.os.tag != .windows) @compileError("fluxion-rhi: the Direct3D 11 backend is Windows only");
+    if (builtin.target.os.tag != .windows) @compileError("fluxion-rhi: the Direct3D 11 backend is Windows only");
 }
 
 // -------------------------------------------------------------------------
@@ -790,7 +790,7 @@ const Raw = struct {
     /// an honest "nothing".
     fn checkFormatSupport(self: Raw, format: Format) d3d11.FormatSupport {
         var bits: d3d11.FormatSupport = .{};
-        self.device.vtable.CheckFormatSupport(self.device, @intFromEnum(format), &bits).check() catch return .{};
+        self.device.vtable.CheckFormatSupport(self.device, @backingInt(format), &bits).check() catch return .{};
         return bits;
     }
 
@@ -1321,7 +1321,7 @@ const native_rows = [_]NativeRow{
 
 const native_table: std.EnumArray(types.Format, ?Native) = blk: {
     var table: std.EnumArray(types.Format, ?Native) = .initUndefined();
-    var seen: std.EnumSet(types.Format) = .initEmpty();
+    var seen: std.EnumSet(types.Format) = .empty;
     for (native_rows) |row| {
         if (seen.contains(row.format)) @compileError("native_table: two rows for " ++ @tagName(row.format));
         seen.insert(row.format);
@@ -1726,8 +1726,8 @@ const mip_filter_bits = std.EnumArray(types.MipFilter, u32).init(.{ .none = 0, .
 fn samplerFilter(desc: types.SamplerDesc) FilterMode {
     const comparison_bit: u32 = if (desc.compare != null) filter_bits.comparison else 0;
     const linear = desc.min_filter == .linear and desc.mag_filter == .linear;
-    if (desc.max_anisotropy > 1 and linear) return @enumFromInt(@intFromEnum(FilterMode.anisotropic) | comparison_bit);
-    return @enumFromInt(min_filter_bits.get(desc.min_filter) | mag_filter_bits.get(desc.mag_filter) | mip_filter_bits.get(desc.mip_filter) | comparison_bit);
+    if (desc.max_anisotropy > 1 and linear) return @fromBackingInt(@backingInt(FilterMode.anisotropic) | comparison_bit);
+    return @fromBackingInt(min_filter_bits.get(desc.min_filter) | mag_filter_bits.get(desc.mag_filter) | mip_filter_bits.get(desc.mip_filter) | comparison_bit);
 }
 
 const address_modes = std.EnumArray(types.Wrap, AddressMode).init(.{
@@ -2521,7 +2521,7 @@ test "a shader that does not compile says why" {
     try testing.expect(device.diagnostics().len > 10);
     // And a shader in the wrong language is refused with a reason, not a crash.
     try testing.expectError(error.ShaderFailed, device.createShader(.{ .glsl = .{ .vertex = "", .fragment = "" } }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "hlsl") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "hlsl") != null);
 }
 
 // -------------------------------------------------------------------------
@@ -2579,7 +2579,7 @@ test "the DXGI numbers are the header's" {
         .{ .bc7_unorm, 98 },
         .{ .bc7_unorm_srgb, 99 },
     };
-    for (known) |entry| try testing.expectEqual(entry[1], @intFromEnum(entry[0]));
+    for (known) |entry| try testing.expectEqual(entry[1], @backingInt(entry[0]));
 }
 
 test "the texture and view descriptions are shaped the way the runtime reads them" {
@@ -2593,19 +2593,19 @@ test "the texture and view descriptions are shaped the way the runtime reads the
     try testing.expectEqual(@as(u32, 0x2), @as(u32, @bitCast(TextureMisc{ .shared = true })));
     try testing.expectEqual(@as(u32, 0x4), @as(u32, @bitCast(TextureMisc{ .texture_cube = true })));
     // The view dimensions that are the header's.
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(SrvDimension.texture2d));
-    try testing.expectEqual(@as(u32, 5), @intFromEnum(SrvDimension.texture2d_array));
-    try testing.expectEqual(@as(u32, 6), @intFromEnum(SrvDimension.texture2d_ms));
-    try testing.expectEqual(@as(u32, 8), @intFromEnum(SrvDimension.texture3d));
-    try testing.expectEqual(@as(u32, 9), @intFromEnum(SrvDimension.texture_cube));
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(RtvDimension.texture2d));
-    try testing.expectEqual(@as(u32, 5), @intFromEnum(RtvDimension.texture2d_array));
-    try testing.expectEqual(@as(u32, 6), @intFromEnum(RtvDimension.texture2d_ms));
-    try testing.expectEqual(@as(u32, 8), @intFromEnum(RtvDimension.texture3d));
-    try testing.expectEqual(@as(u32, 3), @intFromEnum(DsvDimension.texture2d));
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(DsvDimension.texture2d_array));
-    try testing.expectEqual(@as(u32, 5), @intFromEnum(DsvDimension.texture2d_ms));
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(AddressMode.border));
+    try testing.expectEqual(@as(u32, 4), @backingInt(SrvDimension.texture2d));
+    try testing.expectEqual(@as(u32, 5), @backingInt(SrvDimension.texture2d_array));
+    try testing.expectEqual(@as(u32, 6), @backingInt(SrvDimension.texture2d_ms));
+    try testing.expectEqual(@as(u32, 8), @backingInt(SrvDimension.texture3d));
+    try testing.expectEqual(@as(u32, 9), @backingInt(SrvDimension.texture_cube));
+    try testing.expectEqual(@as(u32, 4), @backingInt(RtvDimension.texture2d));
+    try testing.expectEqual(@as(u32, 5), @backingInt(RtvDimension.texture2d_array));
+    try testing.expectEqual(@as(u32, 6), @backingInt(RtvDimension.texture2d_ms));
+    try testing.expectEqual(@as(u32, 8), @backingInt(RtvDimension.texture3d));
+    try testing.expectEqual(@as(u32, 3), @backingInt(DsvDimension.texture2d));
+    try testing.expectEqual(@as(u32, 4), @backingInt(DsvDimension.texture2d_array));
+    try testing.expectEqual(@as(u32, 5), @backingInt(DsvDimension.texture2d_ms));
+    try testing.expectEqual(@as(u32, 4), @backingInt(AddressMode.border));
 }
 
 test "a filter is what D3D11_ENCODE_BASIC_FILTER says it is" {
@@ -2630,7 +2630,7 @@ test "a filter is what D3D11_ENCODE_BASIC_FILTER says it is" {
         .{ .{ .min_filter = .linear, .mag_filter = .linear, .mip_filter = .nearest, .compare = .less_equal }, 0x94 },
         .{ .{ .max_anisotropy = 4, .compare = .greater }, 0xd5 },
     };
-    for (cases) |case| try testing.expectEqual(case[1], @intFromEnum(samplerFilter(case[0])));
+    for (cases) |case| try testing.expectEqual(case[1], @backingInt(samplerFilter(case[0])));
 }
 
 test "every format has a native row or a null, and the rows agree with the format" {

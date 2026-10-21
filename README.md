@@ -1,6 +1,6 @@
 # Fluxion RHI
 
-One way to draw, on whichever API the machine has. For Zig 0.16.
+One way to draw, on whichever API the machine has. For Zig 0.17.
 
 | Module | What it is |
 | --- | --- |

@@ -83,6 +83,7 @@
 //! question, asked of a real browser.
 
 const std = @import("std");
+const fx_meta = @import("../fx_meta.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -291,13 +292,13 @@ const natives: std.EnumArray(types.Format, ?Native) = blk: {
     var table: std.EnumArray(types.Format, ?Native) = .initUndefined();
     var seen: [types.Format.count]bool = @splat(false);
     for (native_rows) |row| {
-        const at = @intFromEnum(row[0]);
+        const at = @backingInt(row[0]);
         if (seen[at]) @compileError("natives: two rows for " ++ @tagName(row[0]));
         seen[at] = true;
         table.set(row[0], row[1]);
     }
     for (seen, 0..) |has_row, at| {
-        if (!has_row) @compileError("natives: no row for " ++ @tagName(@as(types.Format, @enumFromInt(at))));
+        if (!has_row) @compileError("natives: no row for " ++ @tagName(@as(types.Format, @fromBackingInt(at))));
     }
     break :blk table;
 };
@@ -514,7 +515,7 @@ const TextureRes = struct {
     /// The images a pass has drawn into. GL stores a drawn image bottom row
     /// first, and an uploaded one as it was given, so a readback turns over
     /// exactly the first kind to give both top row first. See `isDrawn`.
-    drawn: std.bit_set.IntegerBitSet(max_tracked_images) = .initEmpty(),
+    drawn: std.bit_set.Integer(max_tracked_images) = .empty,
     /// Whether a linear filter reads it, from the device's caps: a sampler
     /// that asks for one is given a nearest twin otherwise. See `samplerFor`.
     filterable: bool,
@@ -1909,7 +1910,7 @@ test "a shader needs GLSL ES, and says so" {
     try testing.expectError(error.ShaderFailed, device.createShader(.{
         .glsl = .{ .vertex = "#version 330 core\n", .fragment = "#version 330 core\n" },
     }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "glsl_es") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "glsl_es") != null);
 }
 
 test "a shader that does not compile is the driver's words, and leaves nothing" {
@@ -1919,7 +1920,7 @@ test "a shader that does not compile is the driver's words, and leaves nothing" 
     stub.state.fail_compile = true;
     try testing.expectError(error.ShaderFailed, device.createShader(shader_desc));
     try testing.expect(std.mem.startsWith(u8, device.diagnostics(), "ERROR:"));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "(in the vertex shader)") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "(in the vertex shader)") != null);
     try testing.expectEqual(0, stub.state.live_objects);
 }
 
@@ -2236,15 +2237,15 @@ test "every format has a row, and the row agrees with what the format says of it
 
 test "the table has a row for every format and a name for every extension" {
     // The compile-time check is the real one; this is what it is checking.
-    inline for (std.meta.fields(types.Format)) |field| {
-        const format: types.Format = @enumFromInt(field.value);
+    inline for (fx_meta.fields(types.Format)) |field| {
+        const format: types.Format = @fromBackingInt(field.value);
         var found = false;
         for (native_rows) |row| found = found or row[0] == format;
         try testing.expect(found);
     }
     for (std.enums.values(types.Format)) |format| {
         if (natives.get(format)) |native| {
-            if (native.extension) |name| try testing.expect(std.mem.indexOf(u8, name, "compress") != null);
+            if (native.extension) |name| try testing.expect(std.mem.find(u8, name, "compress") != null);
         }
     }
 }
@@ -2252,7 +2253,7 @@ test "the table has a row for every format and a name for every extension" {
 /// What every format is made as, with no `texImage3D` in the binding: plain
 /// images and cubes.
 const flat_dimensions: std.EnumSet(types.Dimension) = blk: {
-    var set: std.EnumSet(types.Dimension) = .initFull();
+    var set: std.EnumSet(types.Dimension) = .full;
     set.remove(.d3);
     set.remove(.d2_array);
     break :blk set;
@@ -2353,7 +2354,7 @@ test "a compressed format is written and read back if the device has one" {
 
         var device = try openDevice();
         defer device.deinit();
-        const block = [_]u8{0x5a} ** 16;
+        const block = @as([16]u8, @splat(0x5a));
         const texture = try device.createTexture(.{ .width = 4, .height = 4, .format = format, .data = block[0..format.info().block_bytes] });
         try device.writeTexture(texture, .{}, block[0..format.info().block_bytes], 0, 0);
         return;
@@ -2561,9 +2562,9 @@ test "what the binding cannot do is refused before it is tried, and the reason i
 
     // No `texImage3D`: no volume, no array.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4 }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "shape") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "shape") != null);
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d2_array, .width = 4, .height = 4, .depth_or_layers = 2 }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "shape") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "shape") != null);
 
     // No compressed upload.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 8, .height = 8, .format = .bc1_rgba_unorm }));
@@ -2576,7 +2577,7 @@ test "what the binding cannot do is refused before it is tried, and the reason i
     try cmd.beginPass(.{ .color = .{ .target = .{ .texture = a } }, .extra_colors = &.{.{ .target = .{ .texture = b } }} });
     try cmd.endPass();
     try testing.expectError(error.InvalidArgument, device.submit());
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "max_color_attachments") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "max_color_attachments") != null);
 
     // ES 3.0 has no border and no bias.
     try testing.expectError(error.Unsupported, device.createSampler(.{ .wrap_v = .border }));
@@ -2883,7 +2884,7 @@ test "a pipeline for what the device cannot draw is refused, and says why" {
     const shader = try device.createShader(shader_desc);
     // Eight samples: the stub reports targets up to four.
     try testing.expectError(error.PipelineFailed, device.createPipeline(.{ .shader = shader, .attributes = &.{}, .buffers = &.{}, .samples = 8 }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "8 samples") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "8 samples") != null);
     // Two colours: there is one attachment.
     try testing.expectError(error.PipelineFailed, device.createPipeline(.{
         .shader = shader,
@@ -2891,7 +2892,7 @@ test "a pipeline for what the device cannot draw is refused, and says why" {
         .buffers = &.{},
         .extra_color_formats = &.{.rgba8_unorm},
     }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "colour attachments") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "colour attachments") != null);
     // And nothing was left behind by either.
     try testing.expect(stub.state.live_objects <= 2);
 }
@@ -2974,7 +2975,7 @@ test "an image a pass drew into is turned over on the way out, and one that was 
     var deep: TextureRes = undefined;
     deep.faces = 6;
     deep.levels = 17;
-    deep.drawn = .initEmpty();
+    deep.drawn = .empty;
     try testing.expectEqual(@as(?usize, 5 * 17 + 4), imageIndex(&deep, 5, 4));
     try testing.expectEqual(@as(?usize, null), imageIndex(&deep, 5, 16));
     try testing.expect(isDrawn(&deep, 5, 16));
@@ -3039,7 +3040,7 @@ test "with its extension on, BC1 is sampled, and its levels go over as blocks, a
     try testing.expect(!device.caps().formatSupport(.bc1_rgba_unorm).render_target);
     try testing.expect(!device.caps().formatSupport(.bc7_rgba_unorm).sampled);
 
-    const blocks = [_]u8{ 0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0 } ** 4;
+    const blocks = @as([32]u8, @bitCast(@as([4][8]u8, @splat(.{ 0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0 }))));
     const texture = try device.createTexture(.{ .width = 8, .height = 8, .mip_levels = 2, .format = .bc1_rgba_unorm, .data = &blocks });
     defer device.destroyTexture(texture);
     // The last upload is level one's eight bytes of zeros.

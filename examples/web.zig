@@ -695,7 +695,7 @@ fn record(s: *State, ok: bool, what: []const u8, detail: []const u8) void {
 /// A texel of `got` that should be `want`.
 fn expectTexel(s: *State, what: []const u8, got: [4]u8, want: [4]u8) void {
     var detail: [96]u8 = undefined;
-    const text = std.fmt.bufPrint(&detail, "wanted {any}, got {any}", .{ want, got }) catch "";
+    const text = std.mem.print(&detail, "wanted {any}, got {any}", .{ want, got }) catch "";
     record(s, near(got, want), what, text);
 }
 
@@ -706,7 +706,7 @@ fn skip(s: *State, what: []const u8, why: []const u8) void {
 }
 
 fn label(buffer: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
-    return std.fmt.bufPrint(buffer, fmt, args) catch fmt;
+    return std.mem.print(buffer, fmt, args) catch fmt;
 }
 
 fn texelAt(pixels: []const u8, width: usize, x: usize, y: usize) [4]u8 {
@@ -808,9 +808,9 @@ fn checkUploads(s: *State) !void {
     // pitch the row length can say.
     {
         var bytes: [32 + 16]u8 = @splat(0);
-        bytes[0..16].* = [_]u8{ 255, 0, 0, 255 } ** 4;
-        bytes[16..32].* = [_]u8{ 0, 255, 0, 255 } ** 4;
-        bytes[32..48].* = [_]u8{ 0, 0, 255, 255 } ** 4;
+        bytes[0..16].* = @as([16]u8, @bitCast(@as([4][4]u8, @splat(.{ 255, 0, 0, 255 }))));
+        bytes[16..32].* = @as([16]u8, @bitCast(@as([4][4]u8, @splat(.{ 0, 255, 0, 255 }))));
+        bytes[32..48].* = @as([16]u8, @bitCast(@as([4][4]u8, @splat(.{ 0, 0, 255, 255 }))));
         const texture = try s.device.createTexture(.{ .width = 4, .height = 2, .usage = usage, .data = &bytes, .row_pitch = 32 });
         defer s.device.destroyTexture(texture);
         const pixels = try readImage(s, texture, .{});
@@ -823,9 +823,9 @@ fn checkUploads(s: *State) !void {
     // row length cannot say it and the rows are gathered first.
     {
         var bytes: [10 + 8]u8 = @splat(0);
-        bytes[0..8].* = [_]u8{ 255, 0, 0, 255 } ** 2;
+        bytes[0..8].* = @as([8]u8, @bitCast(@as([2][4]u8, @splat(.{ 255, 0, 0, 255 }))));
         bytes[8..10].* = .{ 9, 9 };
-        bytes[10..18].* = [_]u8{ 0, 0, 255, 255 } ** 2;
+        bytes[10..18].* = @as([8]u8, @bitCast(@as([2][4]u8, @splat(.{ 0, 0, 255, 255 }))));
         const texture = try s.device.createTexture(.{ .width = 2, .height = 2, .usage = usage, .data = &bytes, .row_pitch = 10 });
         defer s.device.destroyTexture(texture);
         const pixels = try readImage(s, texture, .{});
@@ -837,8 +837,8 @@ fn checkUploads(s: *State) !void {
     // BGRA and padded at once: swapped, and from the right places.
     {
         var bytes: [16 + 8]u8 = @splat(0);
-        bytes[0..8].* = [_]u8{ 0, 128, 255, 255 } ** 2;
-        bytes[16..24].* = [_]u8{ 255, 0, 0, 255 } ** 2;
+        bytes[0..8].* = @as([8]u8, @bitCast(@as([2][4]u8, @splat(.{ 0, 128, 255, 255 }))));
+        bytes[16..24].* = @as([8]u8, @bitCast(@as([2][4]u8, @splat(.{ 255, 0, 0, 255 }))));
         const texture = try s.device.createTexture(.{ .width = 2, .height = 2, .format = .bgra8_unorm, .usage = usage, .data = &bytes, .row_pitch = 16 });
         defer s.device.destroyTexture(texture);
         const pixels = try readImage(s, texture, .{});
@@ -1208,7 +1208,7 @@ fn checkCompressed(s: *State) void {
     const what = "a compressed format";
     for (std.enums.values(rhi.Format)) |format| {
         if (!format.isCompressed() or !s.device.caps().formatSupport(format).sampled) continue;
-        const block = [_]u8{0} ** 16;
+        const block = @as([16]u8, @splat(0));
         const bytes = block[0..format.info().block_bytes];
         const texture = s.device.createTexture(.{ .width = 4, .height = 4, .format = format, .data = bytes }) catch |err| {
             var detail: [96]u8 = undefined;

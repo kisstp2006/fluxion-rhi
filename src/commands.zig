@@ -88,7 +88,7 @@ pub const Command = union(enum) {
 
 pub const CommandList = struct {
     gpa: Allocator,
-    items: std.ArrayListUnmanaged(Command) = .empty,
+    items: std.ArrayList(Command) = .empty,
 
     pub fn init(gpa: Allocator) CommandList {
         return .{ .gpa = gpa };

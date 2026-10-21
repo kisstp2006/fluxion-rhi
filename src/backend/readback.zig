@@ -74,7 +74,7 @@ fn pick(lane: Lane, values: [4]u8) u8 {
     return switch (lane) {
         .zero => 0,
         .one => 255,
-        .c0, .c1, .c2, .c3 => values[@intFromEnum(lane)],
+        .c0, .c1, .c2, .c3 => values[@backingInt(lane)],
     };
 }
 

@@ -669,7 +669,7 @@ pub fn copyDescriptorsSimple(device: *ID3D12Device, count: u32, dest: CpuDescrip
 /// already has a real signature in `fluxion-d3d`, so no `slot()` cast is
 /// needed here.
 pub fn descriptorHandleIncrementSize(device: *ID3D12Device, kind: DescriptorHeapType) u32 {
-    return device.vtable.GetDescriptorHandleIncrementSize(device, @intFromEnum(kind));
+    return device.vtable.GetDescriptorHandleIncrementSize(device, @backingInt(kind));
 }
 
 /// The staging layout, row count and pitch `CopyTextureRegion` needs to

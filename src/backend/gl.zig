@@ -71,6 +71,7 @@
 //! says so, and a renderer that samples what it drew flips the coordinate.
 
 const std = @import("std");
+const fx_meta = @import("../fx_meta.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -375,7 +376,7 @@ pub fn For(comptime is_gles: bool) type {
             var table: std.EnumArray(types.Format, ?Native) = .initUndefined();
             var seen: [types.Format.count]bool = @splat(false);
             for (format_rows) |row| {
-                const at = @intFromEnum(row.format);
+                const at = @backingInt(row.format);
                 if (seen[at]) @compileError("gl natives: two rows for " ++ @tagName(row.format));
                 seen[at] = true;
                 table.set(row.format, row.native);
@@ -384,13 +385,13 @@ pub fn For(comptime is_gles: bool) type {
                 }
             }
             for (seen, 0..) |has_row, at| {
-                if (!has_row) @compileError("gl natives: no row for " ++ @tagName(@as(types.Format, @enumFromInt(at))));
+                if (!has_row) @compileError("gl natives: no row for " ++ @tagName(@as(types.Format, @fromBackingInt(at))));
             }
             break :blk table;
         };
 
         fn nativeOf(format: types.Format) ?*const Native {
-            if (natives.values[@intFromEnum(format)]) |*row| return row;
+            if (natives.values[@backingInt(format)]) |*row| return row;
             return null;
         }
 
@@ -423,7 +424,7 @@ pub fn For(comptime is_gles: bool) type {
             sample_counts: u8 = 0,
             /// The shapes of texture it was really made as. Full until a probe says
             /// otherwise, so that a test of the rules has not to say it.
-            dimensions: std.EnumSet(types.Dimension) = .initFull(),
+            dimensions: std.EnumSet(types.Dimension) = .full,
         };
 
         /// What `caps` says about one format: what the API needs from the row, what
@@ -431,7 +432,7 @@ pub fn For(comptime is_gles: bool) type {
         /// both APIs' rules are checked whichever one is compiled in.
         fn formatSupport(format: types.Format, native: ?Native, kind: ApiKind, ctx: Context, probe: Probe) types.FormatSupport {
             // What is not there comes in no shape at all, which is not what a default says.
-            const nothing: types.FormatSupport = .{ .dimensions = .initEmpty() };
+            const nothing: types.FormatSupport = .{ .dimensions = .empty };
             const row = native orelse return nothing;
             if (!ctx.satisfies(row.need.on(kind)) or !probe.accepted) return nothing;
 
@@ -552,7 +553,7 @@ pub fn For(comptime is_gles: bool) type {
                 api.texImage2D(c.texture_2d, 0, @intCast(native.internal), probe_size, probe_size, 0, native.format, native.kind, null);
             }
             probe.accepted = api.checkError() == null;
-            probe.dimensions = .initEmpty();
+            probe.dimensions = .empty;
             if (probe.accepted) probe.dimensions.insert(.d2);
 
             if (probe.accepted and !format.isCompressed()) {
@@ -823,7 +824,7 @@ pub fn For(comptime is_gles: bool) type {
             /// for each: see `imageIndex`. OpenGL keeps a drawn image bottom row first
             /// and a written one as it was given, so this says which a readback has to
             /// turn over.
-            drawn: std.bit_set.DynamicBitSetUnmanaged,
+            drawn: std.bit_set.Dynamic,
 
             fn slices(self: TextureRes, mip: u32) u32 {
                 return slicesAt(self.dimension, self.depth_or_layers, mip);
@@ -1264,7 +1265,7 @@ pub fn For(comptime is_gles: bool) type {
 
         fn info(impl: backend.Impl) types.Info {
             const self = cast(impl);
-            return .{ .backend = if (is_gles and !builtin.abi.isAndroid()) .gles else .gl, .renderer = self.renderer[0..self.renderer_len] };
+            return .{ .backend = if (is_gles and !builtin.target.abi.isAndroid()) .gles else .gl, .renderer = self.renderer[0..self.renderer_len] };
         }
 
         // -------------------------------------------------------------------------
@@ -2620,7 +2621,7 @@ pub fn For(comptime is_gles: bool) type {
         test "a format comes in the shapes the driver made it in, and a compressed one is never a volume" {
             const desktop = try context("4.6.0 Fluxion", &.{"GL_EXT_texture_compression_s3tc"});
             const es = try context("OpenGL ES 3.0 Fluxion", &.{});
-            var flat: std.EnumSet(types.Dimension) = .initEmpty();
+            var flat: std.EnumSet(types.Dimension) = .empty;
             flat.insert(.d2);
             flat.insert(.cube);
 
@@ -2829,7 +2830,7 @@ pub fn For(comptime is_gles: bool) type {
             fn get(context_: *anyopaque, name: [*:0]const u8) ?types.GlProc {
                 _ = context_;
                 const wanted = std.mem.span(name);
-                inline for (@typeInfo(Fake).@"struct".decls) |decl| {
+                inline for (fx_meta.declarations(@typeInfo(Fake).@"struct")) |decl| {
                     if (std.mem.eql(u8, decl.name, wanted)) return @ptrCast(&@field(Fake, decl.name));
                 }
                 return @ptrCast(&stub);
@@ -2946,7 +2947,7 @@ pub fn For(comptime is_gles: bool) type {
 
 /// What `Backend.gl` opens: OpenGL on the desktop, OpenGL ES on Android,
 /// where the driver has nothing else.
-pub const OnTarget = For(builtin.abi.isAndroid());
+pub const OnTarget = For(builtin.target.abi.isAndroid());
 
 /// What `Backend.gles` opens: OpenGL ES, on a desktop driver's ES profile.
 pub const Es = For(true);

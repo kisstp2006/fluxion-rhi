@@ -151,5 +151,5 @@ test {
     _ = @import("backend/gl.zig");
     // Against `fluxion-webgl`'s stub, on whatever machine the tests run on.
     _ = @import("backend/webgl.zig");
-    if (@import("builtin").os.tag == .windows) _ = @import("backend/d3d11.zig");
+    if (@import("builtin").target.os.tag == .windows) _ = @import("backend/d3d11.zig");
 }

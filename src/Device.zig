@@ -59,8 +59,8 @@ const none_backend = @import("backend/none.zig");
 /// Everywhere but the web, where there is no OpenGL to load - only WebGL,
 /// which is imported rather than found.
 const gl_backend = if (!is_wasm) @import("backend/gl.zig") else void;
-const d3d11_backend = if (builtin.os.tag == .windows) @import("backend/d3d11.zig") else void;
-const d3d12_backend = if (builtin.os.tag == .windows) @import("backend/d3d12.zig") else void;
+const d3d11_backend = if (builtin.target.os.tag == .windows) @import("backend/d3d11.zig") else void;
+const d3d12_backend = if (builtin.target.os.tag == .windows) @import("backend/d3d12.zig") else void;
 /// Vulkan, wherever a loader can be; a machine without one answers
 /// `error.NoDevice` when it is opened.
 const vulkan_backend = if (!is_wasm) @import("backend/vulkan.zig") else void;
@@ -116,9 +116,9 @@ log_len: usize = 0,
 pub fn available() []const types.Backend {
     return if (is_wasm)
         &.{ .webgl, .none }
-    else if (builtin.os.tag == .windows)
+    else if (builtin.target.os.tag == .windows)
         &.{ .d3d11, .d3d12, .vulkan, .gl, .gles, .none }
-    else if (builtin.abi.isAndroid())
+    else if (builtin.target.abi.isAndroid())
         &.{ .vulkan, .gl, .none }
     else
         &.{ .vulkan, .gl, .gles, .none };
@@ -158,9 +158,9 @@ pub fn opener(which: types.Backend) ?backend.Opener {
         .none => .{ .name = "none", .tag = .none, .clip = which.clip(), .open = none_backend.open },
         .gl => if (!is_wasm) .{ .name = "gl", .tag = .gl, .clip = which.clip(), .open = gl_backend.OnTarget.open } else null,
         // On Android `gl` is OpenGL ES already.
-        .gles => if (!is_wasm and !builtin.abi.isAndroid()) .{ .name = "gles", .tag = .gles, .clip = which.clip(), .open = gl_backend.Es.open } else null,
-        .d3d11 => if (builtin.os.tag == .windows) .{ .name = "d3d11", .tag = .d3d11, .clip = which.clip(), .open = d3d11_backend.open } else null,
-        .d3d12 => if (builtin.os.tag == .windows) .{ .name = "d3d12", .tag = .d3d12, .clip = which.clip(), .open = d3d12_backend.open } else null,
+        .gles => if (!is_wasm and !builtin.target.abi.isAndroid()) .{ .name = "gles", .tag = .gles, .clip = which.clip(), .open = gl_backend.Es.open } else null,
+        .d3d11 => if (builtin.target.os.tag == .windows) .{ .name = "d3d11", .tag = .d3d11, .clip = which.clip(), .open = d3d11_backend.open } else null,
+        .d3d12 => if (builtin.target.os.tag == .windows) .{ .name = "d3d12", .tag = .d3d12, .clip = which.clip(), .open = d3d12_backend.open } else null,
         .webgl => if (is_wasm or builtin.is_test) .{ .name = "webgl", .tag = .webgl, .clip = which.clip(), .open = webgl_backend.open } else null,
         .vulkan => if (!is_wasm) .{ .name = "vulkan", .tag = .vulkan, .clip = which.clip(), .open = vulkan_backend.open } else null,
         .other => null,
@@ -195,7 +195,7 @@ pub fn init(gpa: Allocator, desc: types.DeviceDesc) Error!Device {
         .vulkan => .vulkan,
         .auto => if (desc.gl != null)
             .gl
-        else if (builtin.os.tag == .windows)
+        else if (builtin.target.os.tag == .windows)
             .d3d11
         else if (is_wasm)
             .webgl
@@ -899,7 +899,7 @@ test "creation refuses what no backend could do" {
     try testing.expectError(error.InvalidArgument, device.createBuffer(.{ .kind = .vertex, .size = 0 }));
     try testing.expectError(error.InvalidArgument, device.createTexture(.{ .width = 0, .height = 1 }));
     try testing.expectError(error.InvalidArgument, device.createTexture(.{ .width = 2, .height = 2, .data = "short" }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "fewer bytes") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "fewer bytes") != null);
 
     const shader = try device.createShader(.{});
     try testing.expectError(error.InvalidArgument, device.createPipeline(.{
@@ -957,7 +957,7 @@ test "a part of a uniform buffer is bound from an aligned offset, inside the buf
         try cmd.endPass();
         if (case.wrong) |why| {
             try testing.expectError(error.InvalidArgument, device.submit());
-            try testing.expect(std.mem.indexOf(u8, device.diagnostics(), why) != null);
+            try testing.expect(std.mem.find(u8, device.diagnostics(), why) != null);
         } else try device.submit();
     }
 }
@@ -1002,8 +1002,8 @@ test "a frame that makes sense goes through, and one that does not is named" {
         try cmd.draw(.{ .vertex_count = 4 });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "command 2") != null);
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "vertex buffer slot") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "command 2") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "vertex buffer slot") != null);
     }
 
     // Draw outside a pass.
@@ -1023,8 +1023,8 @@ test "a frame that makes sense goes through, and one that does not is named" {
         try cmd.setTexture(types.max_texture_slots, picture, sampler);
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "command 2") != null);
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "last slot") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "command 2") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "last slot") != null);
     }
 
     // A pass into a texture that cannot be drawn into.
@@ -1033,7 +1033,7 @@ test "a frame that makes sense goes through, and one that does not is named" {
         try cmd.beginPass(.{ .color = .{ .target = .{ .texture = plain } } });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "render_target") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "render_target") != null);
     }
 
     // A pass never ended.
@@ -1092,7 +1092,7 @@ test "a multi-attachment pass validates every extra colour attachment too" {
         });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "render_target") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "render_target") != null);
     }
 
     // A multi-attachment pass cannot target the surface, primary or extra.
@@ -1104,7 +1104,7 @@ test "a multi-attachment pass validates every extra colour attachment too" {
         });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "surface") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "surface") != null);
     }
     {
         const cmd = device.begin();
@@ -1186,7 +1186,7 @@ test "a shape a format does not come in is Unsupported before any size is looked
         .format = .depth32_float,
         .usage = .{ .render_target = true },
     }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "shape") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "shape") != null);
     // The colour volume is not refused for its shape, but it is past this device's zero limit.
     try testing.expectError(error.InvalidArgument, device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4 }));
     _ = try device.createTexture(.{ .width = 4, .height = 4, .format = .depth32_float, .usage = .{ .render_target = true } });
@@ -1204,7 +1204,7 @@ test "a device that wants whole blocks refuses a compressed texture that is not"
 
     // 10 by 10 is two and a half BC1 blocks each way.
     try testing.expectError(error.Unsupported, whole.createTexture(.{ .width = 10, .height = 10, .format = .bc1_rgba_unorm }));
-    try testing.expect(std.mem.indexOf(u8, whole.diagnostics(), "whole blocks") != null);
+    try testing.expect(std.mem.find(u8, whole.diagnostics(), "whole blocks") != null);
     _ = try whole.createTexture(.{ .width = 12, .height = 8, .format = .bc1_rgba_unorm });
     // The levels below the first may end in a partial block on any device: 12 by 8 goes 6 by 4, 3 by 2, 1 by 1.
     _ = try whole.createTexture(.{ .width = 12, .height = 8, .format = .bc1_rgba_unorm, .mip_levels = 0 });
@@ -1231,7 +1231,7 @@ test "resolving into a surface needs the surface to be the same size" {
         try cmd.beginPass(.{ .color = .{ .target = .{ .texture = msaa }, .resolve = .{ .surface = wrong } } });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "another size") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "another size") != null);
     }
 }
 
@@ -1279,13 +1279,13 @@ test "a texture that does not add up is refused, with the reason" {
     };
     for (cases) |case| {
         try testing.expectError(error.InvalidArgument, device.createTexture(case[0]));
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), case[1]) != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), case[1]) != null);
     }
 
     // Data for a cube is six faces, and a short one is named.
-    const face = [_]u8{0} ** (8 * 8 * 4);
+    const face = @as([8 * 8 * 4]u8, @splat(0));
     try testing.expectError(error.InvalidArgument, device.createTexture(.{ .dimension = .cube, .width = 8, .height = 8, .data = &face }));
-    const faces = [_]u8{0} ** (8 * 8 * 4 * 6);
+    const faces = @as([8 * 8 * 4 * 6]u8, @splat(0));
     _ = try device.createTexture(.{ .dimension = .cube, .width = 8, .height = 8, .data = &faces });
 }
 
@@ -1299,7 +1299,7 @@ test "what the device cannot do is Unsupported, and its caps said so first" {
     try testing.expect(!device.caps().formatSupport(.rgba8_unorm).supportsSamples(8));
 
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 8, .height = 8, .format = .bc7_rgba_unorm }));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "cannot sample") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "cannot sample") != null);
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 8, .height = 8, .samples = 8, .usage = .{ .sampled = false, .render_target = true } }));
     _ = try device.createTexture(.{ .width = 8, .height = 8, .samples = 4, .usage = .{ .sampled = false, .render_target = true } });
 
@@ -1319,32 +1319,32 @@ test "a region is checked against the level it names" {
     defer device.deinit();
 
     const texture = try device.createTexture(.{ .width = 8, .height = 8, .mip_levels = 0 });
-    const level1 = [_]u8{0} ** (4 * 4 * 4);
+    const level1 = @as([4 * 4 * 4]u8, @splat(0));
     // Level one is four by four: the whole of it, and a corner of it.
     try device.writeTexture(texture, .{ .mip = 1 }, &level1, 0, 0);
     try device.writeTexture(texture, .{ .mip = 1, .x = 2, .y = 2, .width = 2, .height = 2 }, level1[0 .. 2 * 2 * 4], 0, 0);
     // And what does not fit is named.
     try testing.expectError(error.InvalidArgument, device.writeTexture(texture, .{ .mip = 9 }, &level1, 0, 0));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "mip level") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "mip level") != null);
     try testing.expectError(error.InvalidArgument, device.writeTexture(texture, .{ .mip = 1, .x = 3, .width = 2 }, &level1, 0, 0));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "past the level") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "past the level") != null);
     try testing.expectError(error.InvalidArgument, device.writeTexture(texture, .{ .mip = 1 }, level1[0..8], 0, 0));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "fewer bytes") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "fewer bytes") != null);
     try testing.expectError(error.InvalidArgument, device.writeTexture(texture, .{ .mip = 1 }, &level1, 8, 0));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "narrower") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "narrower") != null);
 
     // A padded row is fine, and needs the padding in the bytes.
-    const padded = [_]u8{0} ** (32 * 3 + 16);
+    const padded = @as([32 * 3 + 16]u8, @splat(0));
     try device.writeTexture(texture, .{ .mip = 1 }, &padded, 32, 0);
 
     // A cube is written a face at a time, or all six.
     const cube = try device.createTexture(.{ .dimension = .cube, .width = 4, .height = 4 });
-    const face = [_]u8{0} ** (4 * 4 * 4);
+    const face = @as([4 * 4 * 4]u8, @splat(0));
     try device.writeTexture(cube, .{ .z = 3, .depth = 1 }, &face, 0, 0);
     try testing.expectError(error.InvalidArgument, device.writeTexture(cube, .{ .z = 6 }, &face, 0, 0));
     try testing.expectError(error.InvalidArgument, device.writeTexture(cube, .{ .z = 5, .depth = 2 }, &face, 0, 0));
     try testing.expectError(error.InvalidArgument, device.writeTexture(cube, .{}, &face, 0, 0)); // six faces need six faces of bytes
-    const all = [_]u8{0} ** (4 * 4 * 4 * 6);
+    const all = @as([4 * 4 * 4 * 6]u8, @splat(0));
     try device.writeTexture(cube, .{}, &all, 0, 0);
 
     // A depth texture, and a multisampled one, take nothing from memory.
@@ -1358,12 +1358,12 @@ test "a compressed texture is written in whole blocks" {
 
     // 8 by 8 of BC1 is four blocks of eight bytes.
     const texture = try device.createTexture(.{ .width = 8, .height = 8, .format = .bc1_rgba_unorm, .mip_levels = 0 });
-    const blocks = [_]u8{0} ** 32;
+    const blocks = @as([32]u8, @splat(0));
     try device.writeTexture(texture, .{}, &blocks, 0, 0);
     // A block at a time is fine; half a block is not.
     try device.writeTexture(texture, .{ .x = 4, .y = 4, .width = 4, .height = 4 }, blocks[0..8], 0, 0);
     try testing.expectError(error.InvalidArgument, device.writeTexture(texture, .{ .x = 2, .width = 4, .height = 4 }, blocks[0..8], 0, 0));
-    try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "whole blocks") != null);
+    try testing.expect(std.mem.find(u8, device.diagnostics(), "whole blocks") != null);
     // The last level is one texel, and is still one block.
     try device.writeTexture(texture, .{ .mip = 3 }, blocks[0..8], 0, 0);
     // Compressed pixels are not something to read back as colour.
@@ -1432,7 +1432,7 @@ test "a pass can draw depth alone, into a level, a face, or a multisampled targe
         try cmd.beginPass(.{});
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "nothing to draw into") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "nothing to draw into") != null);
     }
     {
         const cmd = device.begin();
@@ -1447,7 +1447,7 @@ test "a pass can draw depth alone, into a level, a face, or a multisampled targe
         try cmd.beginPass(.{ .color = .{ .target = .{ .texture = atlas }, .mip_level = 5 } });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "mip level") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "mip level") != null);
     }
     {
         const cmd = device.begin();
@@ -1462,7 +1462,7 @@ test "a pass can draw depth alone, into a level, a face, or a multisampled targe
         try cmd.beginPass(.{ .color = .{ .target = .{ .texture = atlas }, .mip_level = 1 }, .depth = .{ .texture = shadow_map } });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "different sizes") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "different sizes") != null);
     }
     {
         // ...and the right one goes through: level one of a 16 texture is 8.
@@ -1509,7 +1509,7 @@ test "a multisampled pass resolves, and a pipeline has to agree about the sample
         try cmd.draw(.{ .vertex_count = 3 });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "samples") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "samples") != null);
     }
     // Resolving what is not multisampled, or into what does not match.
     const bad = [_]types.ColorAttachment{
@@ -1545,7 +1545,7 @@ test "generateMips is a command, outside a pass, on a texture with something to 
         const cmd = device.begin();
         try cmd.generateMips(flat);
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "nothing below it") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "nothing below it") != null);
     }
     {
         const cmd = device.begin();
@@ -1558,7 +1558,7 @@ test "generateMips is a command, outside a pass, on a texture with something to 
         try cmd.generateMips(chain);
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "inside a pass") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "inside a pass") != null);
     }
     {
         const cmd = device.begin();
@@ -1589,7 +1589,7 @@ test "a device with fewer colour attachments refuses a pass with more" {
         });
         try cmd.endPass();
         try testing.expectError(error.InvalidArgument, device.submit());
-        try testing.expect(std.mem.indexOf(u8, device.diagnostics(), "max_color_attachments") != null);
+        try testing.expect(std.mem.find(u8, device.diagnostics(), "max_color_attachments") != null);
     }
 }
 
@@ -1609,7 +1609,7 @@ test "every backend this build brings has an opener with its own name" {
     // says something if either is ever pulled back out of it. `other` is
     // whatever a caller makes - never built in.
     try testing.expect(opener(.vulkan) != null);
-    if (builtin.os.tag == .windows) try testing.expect(opener(.d3d12) != null);
+    if (builtin.target.os.tag == .windows) try testing.expect(opener(.d3d12) != null);
     try testing.expect(opener(.other) == null);
 }
 

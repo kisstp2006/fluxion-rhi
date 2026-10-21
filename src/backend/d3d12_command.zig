@@ -312,7 +312,7 @@ test "the descriptions the runtime reads are shaped as it expects" {
     try testing.expectEqual(@as(usize, 24), @sizeOf(ResourceTransitionBarrier));
     try testing.expectEqual(@as(usize, 32), @sizeOf(ResourceBarrier));
     try testing.expectEqual(@as(usize, 48), @sizeOf(TextureCopyLocation));
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(PrimitiveTopology.triangle_list));
+    try testing.expectEqual(@as(u32, 4), @backingInt(PrimitiveTopology.triangle_list));
 }
 
 const D3d12 = d3d.D3d12;

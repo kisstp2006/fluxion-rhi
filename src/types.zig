@@ -19,6 +19,7 @@
 //! built for the backend that was actually opened.
 
 const std = @import("std");
+const fx_meta = @import("fx_meta.zig");
 const math = @import("fluxion_math");
 
 const resources = @import("resources.zig");
@@ -181,11 +182,11 @@ pub const Format = enum {
     astc_8x8_unorm,
     astc_8x8_unorm_srgb,
 
-    pub const count = @typeInfo(Format).@"enum".fields.len;
+    pub const count = fx_meta.enumFields(@typeInfo(Format).@"enum").len;
 
     /// The row of `format_table` this format is.
     pub fn info(self: Format) *const FormatInfo {
-        return &format_table[@intFromEnum(self)];
+        return &format_table[@backingInt(self)];
     }
 
     /// Bytes in one texel. Only an uncompressed format has one: a compressed
@@ -302,13 +303,13 @@ const format_table: [Format.count]FormatInfo = blk: {
     var table: [Format.count]FormatInfo = undefined;
     var seen: [Format.count]bool = @splat(false);
     for (format_rows) |row| {
-        const at = @intFromEnum(row.format);
+        const at = @backingInt(row.format);
         if (seen[at]) @compileError("format_table: two rows for " ++ @tagName(row.format));
         seen[at] = true;
         table[at] = row.info;
     }
     for (seen, 0..) |present, at| {
-        if (!present) @compileError("format_table: no row for " ++ @tagName(@as(Format, @enumFromInt(at))));
+        if (!present) @compileError("format_table: no row for " ++ @tagName(@as(Format, @fromBackingInt(at))));
     }
     break :blk table;
 };
@@ -1013,7 +1014,7 @@ pub const FormatSupport = struct {
     /// device says otherwise: Direct3D 11 has no volume of a depth format,
     /// and a compressed volume is nobody's; a WebGL 2 context that lacks the
     /// binding for volumes and arrays has neither, of any format.
-    dimensions: std.EnumSet(Dimension) = .initFull(),
+    dimensions: std.EnumSet(Dimension) = .full,
 
     pub fn supportsSamples(self: FormatSupport, samples: u32) bool {
         if (samples == 0 or !std.math.isPowerOfTwo(samples)) return false;

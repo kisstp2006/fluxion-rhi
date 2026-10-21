@@ -83,7 +83,7 @@ const Device = @import("../Device.zig");
 const Error = backend.Error;
 
 comptime {
-    if (builtin.os.tag != .windows) @compileError("fluxion-rhi: the Direct3D 12 backend is Windows only");
+    if (builtin.target.os.tag != .windows) @compileError("fluxion-rhi: the Direct3D 12 backend is Windows only");
 }
 
 // -------------------------------------------------------------------------
@@ -273,10 +273,10 @@ const D3d = struct {
     /// to have reached.
     fence_value: u64 = 0,
     completed: u64 = 0,
-    graveyard: std.ArrayListUnmanaged(Grave) = .empty,
+    graveyard: std.ArrayList(Grave) = .empty,
     /// The buffers the submit being recorded binds: used again after a list
     /// that runs out of ring is executed and recording goes on.
-    used_buffers: std.ArrayListUnmanaged(*BufferRes) = .empty,
+    used_buffers: std.ArrayList(*BufferRes) = .empty,
     /// How many submits the open list holds.
     lists: u32 = 0,
 
@@ -290,21 +290,21 @@ const D3d = struct {
     /// creation, never shader-visible, never moved.
     srv_heap: *rc.ID3D12DescriptorHeap,
     srv_next: u32 = 0,
-    srv_free: std.ArrayListUnmanaged(u32) = .empty,
+    srv_free: std.ArrayList(u32) = .empty,
     sampler_heap: *rc.ID3D12DescriptorHeap,
     sampler_next: u32 = 0,
-    sampler_free: std.ArrayListUnmanaged(u32) = .empty,
+    sampler_free: std.ArrayList(u32) = .empty,
 
     /// A texture's render target view, for the textures a pass draws into:
     /// made when the texture is, kept with it.
     rtv_heap: *rc.ID3D12DescriptorHeap,
     rtv_next: u32 = 0,
-    rtv_free: std.ArrayListUnmanaged(u32) = .empty,
+    rtv_free: std.ArrayList(u32) = .empty,
     /// The same for a depth texture's depth-stencil view.
     dsv_heap: *rc.ID3D12DescriptorHeap,
     dsv_increment: u32,
     dsv_next: u32 = 0,
-    dsv_free: std.ArrayListUnmanaged(u32) = .empty,
+    dsv_free: std.ArrayList(u32) = .empty,
     /// What an empty slot of a table reads: a null SRV and a plain sampler,
     /// in the permanent heaps.
     null_srv: rc.CpuDescriptorHandle,
@@ -420,7 +420,7 @@ const Version = struct {
 /// it off, and its bytes on the CPU, which a new version starts as.
 const BufferRes = struct {
     current: Version,
-    spare: std.ArrayListUnmanaged(Version) = .empty,
+    spare: std.ArrayList(Version) = .empty,
     shadow: []u8,
     /// How far anything was ever written: a new version copies no further.
     written: usize,
@@ -840,7 +840,7 @@ fn caps(impl: backend.Impl) types.Caps {
         },
         .features = .{ .sampler_border = true, .sampler_lod_bias = true },
     };
-    var flat = std.EnumSet(types.Dimension).initEmpty();
+    var flat = std.EnumSet(types.Dimension).empty;
     flat.insert(.d2);
     for (offered) |format| {
         const native = textureFormat(format).?;
@@ -930,7 +930,7 @@ fn textureFormat(format: types.Format) ?rc.Format {
 // destroyed one is reused rather than leaking the slot forever.
 // -------------------------------------------------------------------------
 
-fn takeFree(list: *std.ArrayListUnmanaged(u32)) ?u32 {
+fn takeFree(list: *std.ArrayList(u32)) ?u32 {
     if (list.items.len == 0) return null;
     const v = list.items[list.items.len - 1];
     list.items.len -= 1;
@@ -1437,14 +1437,14 @@ fn samplerFilter(desc: types.SamplerDesc) rc.Filter {
     // whose two filters are linear.
     const compares: u32 = if (desc.compare != null) 0x80 else 0;
     if (desc.max_anisotropy > 1 and desc.min_filter == .linear and desc.mag_filter == .linear) {
-        return @enumFromInt(@intFromEnum(rc.Filter.anisotropic) | compares);
+        return @fromBackingInt(@backingInt(rc.Filter.anisotropic) | compares);
     }
     var bits: u32 = 0;
     if (desc.min_filter == .linear) bits |= 0x10;
     if (desc.mag_filter == .linear) bits |= 0x04;
     if (desc.mip_filter == .linear) bits |= 0x01;
     if (desc.compare != null) bits |= 0x80;
-    return @enumFromInt(bits);
+    return @fromBackingInt(bits);
 }
 
 fn comparison(compare: ?types.CompareFn) rc.ComparisonFunc {
@@ -2354,7 +2354,7 @@ test "a texture reads back as it was made, and a box written into it changes tha
     }
 
     // Two by two, one texel in from the top left.
-    const green = [_]u8{ 0, 255, 0, 255 } ** 4;
+    const green = @as([16]u8, @bitCast(@as([4][4]u8, @splat(.{ 0, 255, 0, 255 }))));
     try device.writeTexture(texture, .{ .x = 1, .y = 1, .width = 2, .height = 2 }, &green, 8, 0);
     const back = try device.readTexture(texture, testing.allocator);
     defer testing.allocator.free(back);
@@ -3135,7 +3135,7 @@ test "anisotropy is asked for by a number, and given to a sampler whose filters 
         .{ .{ .max_anisotropy = 4, .compare = .greater }, 0xd5 },
         .{ .{ .mip_filter = .linear }, 0x15 },
     };
-    for (cases) |case| try testing.expectEqual(case[1], @intFromEnum(samplerFilter(case[0])));
+    for (cases) |case| try testing.expectEqual(case[1], @backingInt(samplerFilter(case[0])));
 
     var device = try warpDevice();
     defer device.deinit();

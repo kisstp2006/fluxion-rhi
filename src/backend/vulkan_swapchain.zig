@@ -75,7 +75,7 @@ pub fn createSurface(impl: backend.Impl, desc: types.SurfaceDesc) types.Error!ba
         window.make_vulkan_surface(window.context, @intFromPtr(self.runtime.instance), @ptrCast(self.runtime.loader.getInstanceProcAddr)) orelse return error.Unsupported
     else
         return error.InvalidArgument;
-    const surface: vk.gen.types.SurfaceKHR = @enumFromInt(made);
+    const surface: vk.gen.types.SurfaceKHR = @fromBackingInt(made);
     errdefer if (self.runtime.vki.destroySurfaceKHR) |destroy| destroy(self.runtime.instance, surface, null);
 
     const res = try self.gpa.create(SurfaceRes);
@@ -246,7 +246,7 @@ fn buildSwapchain(self: *Vk, res: *SurfaceRes, want_width: u32, want_height: u32
             if (getModes(phys, res.surface, &mode_count, &mode_buf).check()) |_| {
                 const modes = mode_buf[0..mode_count];
                 for (wishes) |wish| {
-                    if (std.mem.indexOfScalar(vk.gen.types.PresentModeKHR, modes, wish) != null) {
+                    if (std.mem.findScalar(vk.gen.types.PresentModeKHR, modes, wish) != null) {
                         present_mode = wish;
                         break;
                     }

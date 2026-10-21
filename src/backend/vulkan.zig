@@ -364,7 +364,7 @@ pub const Slot = struct {
     fence: vk.gen.types.Fence = .none,
     /// The serial of the submission recorded here last; nought for none.
     serial: u64 = 0,
-    descriptor_pools: std.ArrayListUnmanaged(vk.gen.types.DescriptorPool) = .empty,
+    descriptor_pools: std.ArrayList(vk.gen.types.DescriptorPool) = .empty,
     /// The pool the recording takes sets from now.
     pool_index: usize = 0,
     acquires: [max_surfaces_per_submit]vk.gen.types.Semaphore = @splat(.none),
@@ -397,7 +397,7 @@ pub const Vk = struct {
     /// GPU is known to have done.
     submitted: u64 = 0,
     completed: u64 = 0,
-    graveyard: std.ArrayListUnmanaged(Grave) = .empty,
+    graveyard: std.ArrayList(Grave) = .empty,
 
     pipeline_layout: vk.gen.types.PipelineLayout,
     set_layout_uniforms: vk.gen.types.DescriptorSetLayout,
@@ -1331,7 +1331,7 @@ test "a texture reads back as it was made, and a box written into it changes tha
         try testing.expectEqualSlices(u8, &pixels, back);
     }
 
-    const green = [_]u8{ 0, 255, 0, 255 } ** 4;
+    const green = @as([16]u8, @bitCast(@as([4][4]u8, @splat(.{ 0, 255, 0, 255 }))));
     try device.writeTexture(texture, .{ .x = 1, .y = 1, .width = 2, .height = 2 }, &green, 8, 0);
     const back = try device.readTexture(texture, testing.allocator);
     defer testing.allocator.free(back);
