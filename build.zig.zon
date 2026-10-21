@@ -43,31 +43,6 @@
             .url = "git+https://github.com/kisstp2006/fluxion-id#e3edea27d6f400116a95c0a80c08db9e4d134f12",
             .hash = "fluxion_id-0.1.0--9Hv-iARBQBEDRul1NUEj0YIkC26XNewehht9xldmQsK",
         },
-
-        // What the examples draw into and save with. Lazy: fetched only when
-        // the examples are built, which is when this is the root package or
-        // `-Dexamples` is given. The library never opens a window and never
-        // writes a file.
-        .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#34bf721edc2920c7dcee82fa3f0d832ea2408f08",
-            .hash = "fluxion_platform-0.1.0-WsOjUU_5GgBCl8D_Rx1doGGZ2oSla-aC0Y21jX9Q7pTs",
-            .lazy = true,
-        },
-        .fluxion_image = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-image#9d017f7f82556b6f587121f3255f7ff0a5ec3e55",
-            .hash = "fluxion_image-0.1.0-fyJkdX63AgASTcyVbd034C0ZTGGM-0kDT_IGQuBilnF0",
-            .lazy = true,
-        },
-        // What the sprite example writes its shader in - once, rather than
-        // once per backend. Lazy for the same reason as the rest: this
-        // library takes shader source as text and does not care where the
-        // text came from.
-        //
-        .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#7ca72477aaf61fe075e8c8ec487fdc1a07c83754",
-            .hash = "fluxion_shader-0.1.0-FqFMEv6YCAAkCt9CuC5fnmNVHpr25rvSIVf7EX__Ha3s",
-            .lazy = true,
-        },
     },
     .paths = .{
         "build.zig",

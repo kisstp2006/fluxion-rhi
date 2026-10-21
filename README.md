@@ -148,14 +148,14 @@ browser build never sees a driver to load. Fluxion WebGL is the exception
 that proves it: off wasm it is a stub, and the WebGL backend's tests run
 against that stub on any machine.
 
-Three more are named in `build.zig.zon` and are *not* fetched for you:
-[Fluxion Platform](https://github.com/kisstp2006/fluxion-platform) opens the
-window the examples draw into,
-[Fluxion Image](https://github.com/kisstp2006/fluxion-image) saves a frame as
-a PNG, and [Fluxion Shader](https://github.com/kisstp2006/fluxion-shader) is
-what the sprite example writes its shader in. All three are `lazy`, asked for
-only when this is the package being built. Pass `-Dexamples=false` to skip
-them in a checkout of this repository too.
+Nothing else. The desktop examples draw into a window of
+[Fluxion Platform](https://github.com/kisstp2006/fluxion-platform), save a
+frame as a PNG with [Fluxion Image](https://github.com/kisstp2006/fluxion-image)
+and write their shaders in
+[Fluxion Shader](https://github.com/kisstp2006/fluxion-shader): all three are
+above this package, so those examples, and the tests that open a window, are in
+[Fluxion Examples](https://github.com/kisstp2006/fluxion-examples) and this
+package does not name them.
 
 ## The shader contract
 
@@ -227,7 +227,7 @@ build could open.
 **Direct3D 12 and Vulkan are experimental.** Both draw everything a 2D
 renderer asks - textures drawn into and sampled after, written in part and
 read back, `rgba8`, `bgra8` and `r8`, blending, instancing, scissors - and draw
-the picture Direct3D 11 does, which the sprites example's tests check. Both
+the picture Direct3D 11 does, which the sprites example's tests (in Fluxion Examples) check. Both
 are narrower than it: 2D textures only. Both filter anisotropically, and take a chain of
 levels, written and read a level at a time, drawn into a level at a time,
 and filled by `generateMips` - Vulkan blits each level down from the one
@@ -300,10 +300,14 @@ exists. A backend that lives here also gets a case in `Device.opener`.
 
 ## Examples
 
+The first two are in [Fluxion Examples](https://github.com/kisstp2006/fluxion-examples)
+and run from there; the web one is built here, because it needs nothing
+above this package.
+
 | Example | What it shows |
 | --- | --- |
-| `zig build example` | Which backends this build has; a frame validated against `none`; a triangle through Direct3D's software rasteriser with no window anywhere, printed as text. |
-| `zig build example-sprites` | 2D: two dozen textured sprites bouncing in a window, in one instanced draw, with alpha blending and a top-left orthographic matrix, from one shader source compiled into every language and an atlas read off the disk. `-- --backend gl`, `d3d11`, `d3d12` or `vulkan`; `-- --capture out.png` draws one frame to a file instead. |
+| `zig build example-rhi` | Which backends this build has; a frame validated against `none`; a triangle through Direct3D's software rasteriser with no window anywhere, printed as text. |
+| `zig build example-rhi-sprites` | 2D: two dozen textured sprites bouncing in a window, in one instanced draw, with alpha blending and a top-left orthographic matrix, from one shader source compiled into every language and an atlas read off the disk. `-- --backend gl`, `d3d11`, `d3d12` or `vulkan`; `-- --capture out.png` draws one frame to a file instead. |
 | `zig build example-web` | The WebGL backend in a browser, built into `zig-out/web` with a page and Fluxion WebGL's glue. It checks its own work before drawing anything - a pattern drawn into a texture and read back - and puts the verdict on the page. Serve the directory and open it; see below. |
 
 The web example's check is the test a stub cannot be. Before the first frame
@@ -319,19 +323,19 @@ four times the size, and sprites crossing the rest of it, every frame. The
 suite builds it for `wasm32-freestanding`, which is what compiles the backend
 for the target it exists for.
 
-The sprite example loads `examples/atlas.png` at run time, which is why it
-wants to be run from the root of this repository; `-- --atlas PATH` says
-otherwise. The file in this repository was written by the example itself, and
-`-- --write-atlas examples/atlas.png` writes it again - so the one binary
-here is not one nobody can account for.
+The sprite example loads `examples/rhi/atlas.png` at run time, which is why it
+wants to be run from the root of Fluxion Examples; `-- --atlas PATH` says
+otherwise. The file there was written by the example itself, and
+`-- --write-atlas examples/rhi/atlas.png` writes it again - so the one binary
+is not one nobody can account for.
 
-`examples/window.zig` is the window and the device on it, through Fluxion
+`examples/rhi/window.zig` is the window and the device on it, through Fluxion
 Platform: the `GlHooks` for one backend and the `HWND` for the other, and the
 `TestDevice` every test that needs a real GPU opens - OpenGL on a hidden
 window, Direct3D on WARP.
 
 The tests draw. The library's own suite draws a triangle through Direct3D on
-WARP and reads it back; the window's suite draws the same triangle through
+WARP and reads it back; the window's suite (in Fluxion Examples) draws the same triangle through
 OpenGL, checks that the point is at the top and that a scissor rectangle
 counts from the top left; the sprite example renders its frame on both
 backends and checks that the two pictures agree to within a rasteriser's
@@ -342,12 +346,17 @@ than fails, and the `none` backend carries the validation tests everywhere.
 
 ```bash
 zig build test                  # run the test suite
-zig build example               # the tour, no window
-zig build example-sprites       # sprites in a window, default backend
-zig build example-sprites -- --backend gl
-zig build examples              # every example in turn, frames to zig-out/
 zig build example-web           # the WebGL backend, into zig-out/web
 zig build docs                  # generate API docs into zig-out/docs
+```
+
+and, in Fluxion Examples:
+
+```bash
+zig build example-rhi           # the tour, no window
+zig build example-rhi-sprites   # sprites in a window, default backend
+zig build example-rhi-sprites -- --backend gl
+zig build examples              # every example of every library, frames to zig-out/
 ```
 
 A page cannot load a module from `file://`, so the web example wants a
