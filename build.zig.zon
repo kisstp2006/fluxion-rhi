@@ -8,40 +8,40 @@
     .dependencies = .{
         // The three backends, and what they are written against.
         .fluxion_gl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-gl#e0306318927fe3a01da076c35feee3114b2df431",
-            .hash = "fluxion_gl-0.1.0-F9AI4gBqBQAT4U-RIbTAoMEOWFf3ue0U-i1ov5lQhc80",
+            .url = "git+https://github.com/kisstp2006/fluxion-gl#2852c4abf1c94ddfad6b7308fbca1d38962c6cbb",
+            .hash = "fluxion_gl-0.2.0-F9AI4u8EAwADJqV9rhyj-u7RcDjgrZRKUbfY4wGE8ZsY",
         },
         .fluxion_d3d = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-d3d#c23780c7631155959f02c7a90151aa06ede818c7",
-            .hash = "fluxion_d3d-0.1.0-ufazEIAiBQBXIwpGjiKPgUvn2CNbuSK7znQRtX_rIanO",
+            .url = "git+https://github.com/kisstp2006/fluxion-d3d#6b295a592e88caba6839ae5975392185264f05d0",
+            .hash = "fluxion_d3d-0.2.0-ufazEKI9AwAFxv52MeMVlFrVNI_Jr1QJjyZ88MAHPqQ2",
         },
         // The Vulkan loader and generated ABI. The RHI opens it at run time,
         // just as the Direct3D backend opens its system DLLs. Pinned to the
         // commit with `src/gen/` (every generated struct/command past the
         // loader's own door) pushed.
         .fluxion_vulkan = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-vulkan#7bec633080135d3891a15a53f3467058bd1b2b7e",
-            .hash = "fluxion_vulkan-0.1.0-8VC-cTC0EwBjdBAPtcHQiPoCbsJSPmfWRKr24UFq4U9Y",
+            .url = "git+https://github.com/kisstp2006/fluxion-vulkan#6e127af4a91d96047c09f5160b1f07a21d3a931d",
+            .hash = "fluxion_vulkan-0.2.0-8VC-cScNFADr__doQK9L4B0XqnaqMnK0lUiH7AFYU3yN",
         },
         // Not lazy, though only a browser draws with it: off wasm it is the
         // stub the WebGL backend's tests run against, and it has no
         // dependencies of its own to fetch. Pinned to a commit that has the
         // calls the backend binds by slot with, and that names its glue.
         .fluxion_webgl = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-webgl#96e2dbd476d5c885305ce5f9ecdc5c7f5c40da77",
-            .hash = "fluxion_webgl-0.1.0-8yvbdRt_AwAiIjGJGYHGq2unm_WrevHDQ6nEfEeUP09e",
+            .url = "git+https://github.com/kisstp2006/fluxion-webgl#185d581638e778924dbd87dbcebc397293ee200b",
+            .hash = "fluxion_webgl-0.2.1-8yvbdSIMAwBn5ao8EmOkTErpxV483UvxaXFHoCfYsKTw",
         },
         // `Clip`: which clip space a device wants, so a projection is built
         // for the backend that was actually opened.
         .fluxion_math = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-math#1868bdb33577c9653d355f59ddd7ea1177b0cfaa",
-            .hash = "fluxion_math-0.1.0-dfpZBX_OGQDOAYcHTfGTFzjg8z8S6olSgZrJvIXVeW2f",
+            .url = "git+https://github.com/kisstp2006/fluxion-math#8d9f67e4b03f996f2f05020075f9211663bfb45e",
+            .hash = "fluxion_math-0.2.1-dfpZBcsoGgC_vlBvxsP_nGWUFvzr5H62IJxFqveow68r",
         },
         // Generational handles: what a program holds instead of a pointer
         // into a backend.
         .fluxion_id = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-id#e3edea27d6f400116a95c0a80c08db9e4d134f12",
-            .hash = "fluxion_id-0.1.0--9Hv-iARBQBEDRul1NUEj0YIkC26XNewehht9xldmQsK",
+            .url = "git+https://github.com/kisstp2006/fluxion-id#a27e34c981598dfcc926f0153f44c346977816cd",
+            .hash = "fluxion_id-0.2.0--9Hv-sEUBQAuwuwAJ7vgqTjBuRug9HFtXyWTypJIsxQ_",
         },
     },
     .paths = .{
