@@ -176,7 +176,7 @@ pub fn For(comptime is_gles: bool) type {
             ) callconv(.c) void = null,
             samplerParameterfv: ?*const fn (sampler: gt.Uint, pname: gt.Enum, params: [*]const gt.Float) callconv(.c) void = null,
 
-            const options: opengl.loader.Options = .{ .prefix = "gl" };
+            pub const options: opengl.loader.Options = .{ .prefix = "gl" };
         };
 
         /// A command of this API's table, whether that table declares it optional
