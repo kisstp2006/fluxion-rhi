@@ -2,7 +2,7 @@
 
 .{
     .name = .fluxion_rhi,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0x4163e3da0ff09bfa,
     .dependencies = .{
