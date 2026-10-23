@@ -197,6 +197,17 @@ and copies it into a buffer of the slot's own on a runtime older than that;
 Direct3D 12 binds its address; Vulkan writes it into the descriptor; OpenGL
 and WebGL call `bindBufferRange`. A part is at most 65536 bytes.
 
+**HLSL compiled once.** Direct3D 11 and 12 compile HLSL at run time with
+`d3dcompiler_47.dll`, which is slow: a large pixel shader takes seconds. Give
+`DeviceDesc.shader_cache` a `ShaderCache` - a `load` and a `store` the program
+writes, over files or anything else - and each stage's bytecode is kept under
+a SHA-256 of its source and target, and taken from there the next time,
+without loading the compiler at all. Both backends compile the same way, so
+they read each other's. A store hands back what it was given or nothing; the
+device takes only what reads as DXBC, and compiles and keeps again what does
+not. The other backends never ask: SPIR-V comes compiled, and a GL driver
+keeps its own.
+
 ## The backends
 
 | Backend | Where | Needs | How it presents |
