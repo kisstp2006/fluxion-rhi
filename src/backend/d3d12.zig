@@ -79,6 +79,7 @@ const types = @import("../types.zig");
 const backend = @import("../backend.zig");
 const commands = @import("../commands.zig");
 const Device = @import("../Device.zig");
+const hlsl_cache = @import("hlsl_cache.zig");
 
 const Error = backend.Error;
 
@@ -260,7 +261,10 @@ const D3d = struct {
     library: d3d.D3d12,
     dxgi_library: d3d.Dxgi,
     factory: *dxgi.IDXGIFactory1,
+    /// Loaded the first time a stage is compiled: never, where every one is
+    /// in the shader cache.
     compiler: ?d3d.Compiler = null,
+    shader_cache: ?types.ShaderCache,
 
     device: *d3d12.ID3D12Device,
     queue: *d3d12.ID3D12CommandQueue,
@@ -640,6 +644,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .library = library,
         .dxgi_library = dxgi_library,
         .factory = factory,
+        .shader_cache = desc.shader_cache,
         .device = device,
         .queue = queue,
         .slots = slots,
@@ -1529,27 +1534,35 @@ fn compileStage(compiler: d3d.Compiler, source: []const u8, target: [:0]const u8
     return code;
 }
 
+/// A stage's bytecode, owned by `self.gpa`: as the shader cache keeps it,
+/// or compiled now and kept there for the next time - the same bytecode
+/// Direct3D 11 keeps, compiled the same way.
+fn stageCode(self: *D3d, source: []const u8, target: [:0]const u8, log: *Io.Writer) Error![]u8 {
+    const key = hlsl_cache.keyOf(source, target);
+    if (hlsl_cache.load(self.gpa, self.shader_cache, key)) |code| return code;
+    const blob = try compileStage(try compilerOf(self, log), source, target, log);
+    defer _ = com.release(blob);
+    const code = try self.gpa.dupe(u8, blob.bytes());
+    hlsl_cache.store(self.shader_cache, key, code);
+    return code;
+}
+
 fn createShader(impl: backend.Impl, desc: types.ShaderDesc, log: *Io.Writer) Error!backend.Native {
     const self = cast(impl);
     const sources = desc.hlsl orelse {
         log.writeAll("fluxion-rhi: the Direct3D 12 backend needs `ShaderDesc.hlsl`, and none was given") catch {};
         return error.ShaderFailed;
     };
-    const compiler = try compilerOf(self, log);
 
     // `vs_5_0`/`ps_5_0`: shader model 5.0, what `fluxion-shader`'s HLSL
     // emitter targets and what feature level 11.0 guarantees.
-    const vs_blob = try compileStage(compiler, sources.vertex, "vs_5_0", log);
-    defer _ = com.release(vs_blob);
-    const ps_blob = try compileStage(compiler, sources.fragment, "ps_5_0", log);
-    defer _ = com.release(ps_blob);
+    const vertex = try stageCode(self, sources.vertex, "vs_5_0", log);
+    errdefer self.gpa.free(vertex);
+    const pixel = try stageCode(self, sources.fragment, "ps_5_0", log);
+    errdefer self.gpa.free(pixel);
 
     const res = try self.gpa.create(ShaderRes);
     errdefer self.gpa.destroy(res);
-    const vertex = try self.gpa.dupe(u8, vs_blob.bytes());
-    errdefer self.gpa.free(vertex);
-    const pixel = try self.gpa.dupe(u8, ps_blob.bytes());
-    errdefer self.gpa.free(pixel);
 
     res.* = .{ .vertex = vertex, .pixel = pixel };
     return res;
@@ -2242,6 +2255,35 @@ test "opening on WARP, and what it reports" {
     const information = device.info();
     try testing.expectEqual(types.Backend.d3d12, information.backend);
     try testing.expect(information.renderer.len > 0);
+}
+
+test "what Direct3D 11 kept in the shader cache, Direct3D 12 takes without its compiler" {
+    const vs =
+        \\struct Out { float4 position : SV_POSITION; };
+        \\Out main(uint id : SV_VertexID) { Out o; o.position = float4(float(id), 0, 0, 1); return o; }
+    ;
+    const ps = "float4 main() : SV_TARGET { return float4(1, 0, 0, 1); }";
+    var memory: hlsl_cache.MemoryCache = .{};
+    defer memory.deinit();
+    {
+        var eleven = Device.init(testing.allocator, .{ .backend = .d3d11, .software = true, .shader_cache = memory.cache() }) catch |err| switch (err) {
+            error.NoDevice, error.Unsupported => return error.SkipZigTest,
+            else => return err,
+        };
+        defer eleven.deinit();
+        eleven.destroyShader(try eleven.createShader(.{ .hlsl = .{ .vertex = vs, .fragment = ps } }));
+    }
+    try testing.expectEqual(@as(usize, 2), memory.stores);
+
+    var device = Device.init(testing.allocator, .{ .backend = .d3d12, .software = true, .shader_cache = memory.cache() }) catch |err| switch (err) {
+        error.NoDevice, error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer device.deinit();
+    device.destroyShader(try device.createShader(.{ .hlsl = .{ .vertex = vs, .fragment = ps } }));
+    try testing.expectEqual(@as(usize, 2), memory.hits);
+    try testing.expectEqual(@as(usize, 2), memory.stores);
+    try testing.expect(cast(device.impl).compiler == null);
 }
 
 test "caps: .d2 only; the driver's formats, floats too, sampled, drawn into and multisampled" {

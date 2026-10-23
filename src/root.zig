@@ -134,6 +134,7 @@ pub const GlHooks = types.GlHooks;
 pub const WindowHooks = types.WindowHooks;
 pub const GlProc = types.GlProc;
 pub const DeviceDesc = types.DeviceDesc;
+pub const ShaderCache = types.ShaderCache;
 pub const SurfaceDesc = types.SurfaceDesc;
 pub const PresentMode = types.PresentMode;
 
@@ -148,6 +149,7 @@ test {
     _ = Device;
     _ = @import("backend/none.zig");
     _ = @import("backend/readback.zig");
+    _ = @import("backend/hlsl_cache.zig");
     _ = @import("backend/gl.zig");
     // Against `fluxion-webgl`'s stub, on whatever machine the tests run on.
     _ = @import("backend/webgl.zig");

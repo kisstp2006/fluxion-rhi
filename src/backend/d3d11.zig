@@ -60,6 +60,7 @@ const backend = @import("../backend.zig");
 const commands = @import("../commands.zig");
 const Device = @import("../Device.zig");
 const readback = @import("readback.zig");
+const hlsl_cache = @import("hlsl_cache.zig");
 
 const Error = backend.Error;
 
@@ -855,7 +856,10 @@ const D3d = struct {
     library: d3d.D3d11,
     dxgi_library: d3d.Dxgi,
     factory: *dxgi.IDXGIFactory1,
+    /// Loaded the first time a stage is compiled: never, where every one is
+    /// in the shader cache.
     compiler: ?d3d.Compiler = null,
+    shader_cache: ?types.ShaderCache,
     device: d3d11.Device,
     raw: Raw,
     context: *IDeviceContext,
@@ -1023,6 +1027,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .library = library,
         .dxgi_library = dxgi_library,
         .factory = factory,
+        .shader_cache = desc.shader_cache,
         .device = device,
         .raw = raw,
         .context = @ptrCast(device.context),
@@ -1801,6 +1806,18 @@ fn compileStage(compiler: d3d.Compiler, source: []const u8, target: [:0]const u8
     return code;
 }
 
+/// A stage's bytecode, owned by `self.gpa`: as the shader cache keeps it,
+/// or compiled now and kept there for the next time.
+fn stageCode(self: *D3d, source: []const u8, target: [:0]const u8, label: []const u8, log: *Io.Writer) Error![]u8 {
+    const key = hlsl_cache.keyOf(source, target);
+    if (hlsl_cache.load(self.gpa, self.shader_cache, key)) |code| return code;
+    const blob = try compileStage(try compilerOf(self, log), source, target, label, log);
+    defer _ = com.release(blob);
+    const code = try self.gpa.dupe(u8, blob.bytes());
+    hlsl_cache.store(self.shader_cache, key, code);
+    return code;
+}
+
 fn createShader(impl: backend.Impl, desc: types.ShaderDesc, log: *Io.Writer) Error!backend.Native {
     const self = cast(impl);
 
@@ -1808,21 +1825,18 @@ fn createShader(impl: backend.Impl, desc: types.ShaderDesc, log: *Io.Writer) Err
         log.writeAll("fluxion-rhi: the Direct3D 11 backend needs `ShaderDesc.hlsl`, and none was given") catch {};
         return error.ShaderFailed;
     };
-    const compiler = try compilerOf(self, log);
 
-    const vs_blob = try compileStage(compiler, sources.vertex, "vs_5_0", desc.label, log);
-    defer _ = com.release(vs_blob);
-    const ps_blob = try compileStage(compiler, sources.fragment, "ps_5_0", desc.label, log);
-    defer _ = com.release(ps_blob);
+    const vertex_code = try stageCode(self, sources.vertex, "vs_5_0", desc.label, log);
+    errdefer self.gpa.free(vertex_code);
+    const pixel_code = try stageCode(self, sources.fragment, "ps_5_0", desc.label, log);
+    defer self.gpa.free(pixel_code);
 
     const res = try self.gpa.create(ShaderRes);
     errdefer self.gpa.destroy(res);
-    const vertex_code = try self.gpa.dupe(u8, vs_blob.bytes());
-    errdefer self.gpa.free(vertex_code);
 
     const vertex = self.raw.createVertexShader(vertex_code) catch return error.ShaderFailed;
     errdefer _ = com.release(vertex);
-    const pixel = self.raw.createPixelShader(ps_blob.bytes()) catch return error.ShaderFailed;
+    const pixel = self.raw.createPixelShader(pixel_code) catch return error.ShaderFailed;
 
     res.* = .{ .vertex = vertex, .pixel = pixel, .vertex_code = vertex_code };
     return res;
@@ -2522,6 +2536,54 @@ test "a shader that does not compile says why" {
     // And a shader in the wrong language is refused with a reason, not a crash.
     try testing.expectError(error.ShaderFailed, device.createShader(.{ .glsl = .{ .vertex = "", .fragment = "" } }));
     try testing.expect(std.mem.find(u8, device.diagnostics(), "hlsl") != null);
+}
+
+/// A flat shader made on a WARP device with `cache`, and a pipeline of it:
+/// what the device kept or took is usable. Whether it loaded the compiler
+/// for it is the answer.
+fn flatShaderLoadedCompiler(cache: types.ShaderCache) !bool {
+    var device = Device.init(testing.allocator, .{ .backend = .d3d11, .software = true, .shader_cache = cache }) catch |err| switch (err) {
+        error.NoDevice, error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer device.deinit();
+    const shader = try device.createShader(.{ .hlsl = .{ .vertex = flat_vs, .fragment = flat_ps } });
+    const pipeline = try device.createPipeline(.{
+        .shader = shader,
+        .attributes = &.{
+            .{ .location = 0, .format = .float2, .offset = 0 },
+            .{ .location = 1, .format = .float4, .offset = 8 },
+        },
+        .buffers = &.{.{ .stride = @sizeOf(Vertex) }},
+    });
+    device.destroyPipeline(pipeline);
+    device.destroyShader(shader);
+    return cast(device.impl).compiler != null;
+}
+
+test "a shader is compiled once: kept in the shader cache, and taken from it by the next device without the compiler" {
+    var memory: hlsl_cache.MemoryCache = .{};
+    defer memory.deinit();
+
+    try testing.expect(try flatShaderLoadedCompiler(memory.cache()));
+    try testing.expectEqual(@as(usize, 2), memory.misses);
+    try testing.expectEqual(@as(usize, 2), memory.stores);
+    for ([_][]const u8{ flat_vs, flat_ps }, [_][]const u8{ "vs_5_0", "ps_5_0" }) |source, target| {
+        try testing.expect(hlsl_cache.isDxbc(memory.kept.get(hlsl_cache.keyOf(source, target)).?));
+    }
+
+    try testing.expect(!try flatShaderLoadedCompiler(memory.cache()));
+    try testing.expectEqual(@as(usize, 2), memory.hits);
+    try testing.expectEqual(@as(usize, 2), memory.stores);
+
+    // What does not read as bytecode is compiled again, and kept in its
+    // place.
+    var held = memory.kept.valueIterator();
+    while (held.next()) |bytes| @memcpy(bytes.*[0..4], "XXXX");
+    try testing.expect(try flatShaderLoadedCompiler(memory.cache()));
+    try testing.expectEqual(@as(usize, 4), memory.stores);
+    var again = memory.kept.valueIterator();
+    while (again.next()) |bytes| try testing.expect(hlsl_cache.isDxbc(bytes.*));
 }
 
 // -------------------------------------------------------------------------

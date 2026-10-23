@@ -923,6 +923,34 @@ pub const DeviceDesc = struct {
     /// Prefer a software rasteriser: WARP on Direct3D. The same answers on
     /// every machine, which is what a test wants.
     software: bool = false,
+    /// Where what a backend compiles from source is kept between runs. Null
+    /// compiles every shader every time it is made.
+    shader_cache: ?ShaderCache = null,
+};
+
+/// Where a backend keeps what it compiles from source while the program
+/// runs, to find it again the next time: Direct3D 11 and 12, which compile
+/// HLSL with d3dcompiler - slowly, and to the same bytecode every time from
+/// the same source. The other backends never ask: SPIR-V comes compiled, and
+/// a GL driver keeps its own.
+///
+/// A key is a hash of everything that decides what a compilation makes, so
+/// what is kept under it never goes stale. `load` hands back what `store`
+/// was given, or nothing: a store that may be damaged - a file cut short -
+/// checks that itself. The device checks only that it is bytecode at all,
+/// and compiles and keeps again what is not. It calls both from the thread
+/// that makes the shader.
+pub const ShaderCache = struct {
+    context: *anyopaque,
+    /// What is kept under `key`, in memory from `gpa` that the caller frees,
+    /// or null where nothing is.
+    load: *const fn (context: *anyopaque, gpa: std.mem.Allocator, key: Key) ?[]u8,
+    /// Keep `bytes` under `key`. What cannot be kept is passed over: the
+    /// next run compiles it again.
+    store: *const fn (context: *anyopaque, key: Key, bytes: []const u8) void,
+
+    /// SHA-256 of what decides a compilation.
+    pub const Key = [32]u8;
 };
 
 pub const SurfaceDesc = struct {
