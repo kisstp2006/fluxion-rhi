@@ -673,7 +673,9 @@ fn caps(impl: backend.Impl) types.Caps {
             // a linear filter, which the format must allow both ways.
             .generate_mips = feats.blit_src and feats.blit_dst and feats.sampled_image_filter_linear,
             .sample_counts = if (feats.color_attachment) color_counts | 1 else 0b1,
-            .dimensions = std.EnumSet(types.Dimension).initOne(.d2),
+            // A picture, or a volume: a 3D image, drawn into a slice at a
+            // time through a 2D view of it.
+            .dimensions = std.EnumSet(types.Dimension).initMany(&.{ .d2, .d3 }),
         });
     }
     // BC's blocks are only sampled: never drawn into, their levels given.
@@ -1047,9 +1049,11 @@ fn beginPass(self: *Vk, device: *Device, pass: types.RenderPassDesc) types.Error
             } else {
                 // The level the pass names, through its own view: the
                 // others keep their layout, and their texels.
-                const level = texture.target(color.mip_level) orelse return error.Unsupported;
+                const level = texture.target(color.mip_level, color.layer) orelse return error.Unsupported;
                 if (color.resolve != null) return error.Unsupported;
-                const initial: vk.gen.types.ImageLayout = if (load == .load) .shader_read_only_optimal else .undefined;
+                // A volume's slice is part of one image whose other slices
+                // are kept: never taken from an undefined layout.
+                const initial: vk.gen.types.ImageLayout = if (load == .load or texture.volume) .shader_read_only_optimal else .undefined;
                 render_pass = try swapchain.getRenderPass(self, texture.vk_format, load, initial, .shader_read_only_optimal, depth, 1, null);
                 framebuffer = level.framebuffer;
                 color_view = level.view;
@@ -2101,6 +2105,45 @@ test "a pass draws into one level of a chain, and the others keep theirs" {
         defer testing.allocator.free(pixels);
         try testing.expectEqual(@as(usize, types.mipExtent(8, @intCast(mip)) * types.mipExtent(4, @intCast(mip)) * 4), pixels.len);
         try expectSolid(pixels, if (mip == 2) palette[2] else palette[0]);
+    }
+}
+
+test "a volume is slices: written and read a slice at a time, and a pass into one slice leaves the others be" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    try testing.expect(device.caps().formatSupport(.rgba8_unorm).dimensions.contains(.d3));
+
+    var initial: [4 * 4 * 4 * 4]u8 = undefined;
+    for (0..4) |z| _ = solidLevel(initial[z * 64 ..][0..64], palette[z]);
+    const volume = try device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4, .mip_levels = 2, .data = &initial, .usage = .{ .render_target = true } });
+    defer device.destroyTexture(volume);
+    for (0..4) |z| {
+        const pixels = try device.readSubresource(volume, .{ .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolid(pixels, palette[z]);
+    }
+
+    // Level one, two slices of 2x2, in one write.
+    var level: [2 * 2 * 2 * 4]u8 = undefined;
+    _ = solidLevel(level[0..16], palette[3]);
+    _ = solidLevel(level[16..32], palette[0]);
+    try device.writeTexture(volume, .{ .mip = 1 }, &level, 0, 0);
+    for (0..2) |z| {
+        const pixels = try device.readSubresource(volume, .{ .mip = 1, .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqual(@as(usize, 2 * 2 * 4), pixels.len);
+        try expectSolid(pixels, palette[3 * (1 - z)]);
+    }
+
+    // Slice one cleared blue by a pass; the rest as they were.
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = volume }, .layer = 1, .clear_color = .{ 0, 0, 1, 1 } } });
+    try cmd.endPass();
+    try device.submit();
+    for (0..4) |z| {
+        const pixels = try device.readSubresource(volume, .{ .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolid(pixels, if (z == 1) palette[2] else palette[z]);
     }
 }
 

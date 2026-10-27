@@ -234,7 +234,19 @@ pub const ResourceDesc = extern struct {
         return .{ .dimension = .buffer, .width = size, .layout = .row_major };
     }
 
-    /// A plain 2D texture, one sample - the shape every texture this backend
+    /// A volume of `depth` slices, one sample.
+    pub fn texture3d(width: u32, height: u32, depth: u16, format: Format, flags: ResourceFlags) ResourceDesc {
+        return .{
+            .dimension = .texture3d,
+            .width = width,
+            .height = height,
+            .depth_or_array_size = depth,
+            .format = format,
+            .flags = flags,
+        };
+    }
+
+    /// A plain 2D texture, one sample - the shape every picture this backend
     /// makes is.
     pub fn texture2d(width: u32, height: u32, format: Format, flags: ResourceFlags) ResourceDesc {
         return .{
@@ -372,6 +384,13 @@ pub const Tex2dArraySrv = extern struct {
     resource_min_lod_clamp: f32 = 0,
 };
 
+/// `D3D12_TEX3D_SRV`: a volume's levels.
+pub const Tex3dSrv = extern struct {
+    most_detailed_mip: u32 = 0,
+    mip_levels: u32 = 1,
+    resource_min_lod_clamp: f32 = 0,
+};
+
 /// `D3D12_SHADER_RESOURCE_VIEW_DESC`. A real `extern union` of every branch
 /// that affects layout - not just `Texture2D`, the one this backend ever
 /// populates - so Zig computes the union's true size and alignment. See
@@ -384,6 +403,7 @@ pub const ShaderResourceViewDesc = extern struct {
         buffer: BufferSrv,
         texture2d: Tex2dSrv,
         texture2d_array: Tex2dArraySrv,
+        texture3d: Tex3dSrv,
     } = .{ .texture2d = .{} },
 };
 
@@ -417,12 +437,20 @@ pub const BufferRtv = extern struct {
 
 /// `D3D12_RENDER_TARGET_VIEW_DESC`. A real `extern union` of the branches
 /// that affect layout, for the same reason as `ShaderResourceViewDesc`'s.
+/// `D3D12_TEX3D_RTV`: slices of one level of a volume.
+pub const Tex3dRtv = extern struct {
+    mip_slice: u32 = 0,
+    first_w_slice: u32 = 0,
+    w_size: u32 = 1,
+};
+
 pub const RenderTargetViewDesc = extern struct {
     format: Format,
     dimension: RtvDimension,
     u: extern union {
         buffer: BufferRtv,
         texture2d: Tex2dRtv,
+        texture3d: Tex3dRtv,
     } = .{ .texture2d = .{} },
 };
 
