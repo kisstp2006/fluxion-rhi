@@ -322,10 +322,13 @@ pub fn For(comptime is_gles: bool) type {
         const float_filter: ApiNeed = .{ .es = .extension(&.{"OES_texture_float_linear"}) };
         /// ...and blended into the same way.
         const float_blend: ApiNeed = .{ .es = .extension(&.{"EXT_float_blend"}) };
-        /// A depth texture is filtered without a comparison on the desktop; on ES it
-        /// is incomplete unless the sampler compares or the filter is nearest, so
-        /// "filterable" is not something to promise there.
-        const depth_filter: ApiNeed = .{ .es = .never };
+        /// A depth format's "filterable" says whether a sampler that compares
+        /// filters it (`FormatSupport.filterable`): everywhere. ES 3.0 makes a
+        /// depth texture read with a linear filter incomplete only where the
+        /// sampler does not compare, and with one that does, it filters
+        /// the comparisons through four texels - every format, the float one too -
+        /// as WebGL 2, which is ES 3.0, says already.
+        const depth_filter: ApiNeed = .{};
 
         /// One row per `Format`, in any order. A format without a row does not
         /// compile, and neither does one with two; a `null` is a format this API
@@ -2568,9 +2571,10 @@ pub fn For(comptime is_gles: bool) type {
             s = formatSupport(.rgba32_float, rgba32, .gl, desktop, accepted);
             try testing.expect(s.filterable and s.blendable and s.generate_mips);
 
-            // A depth format is not blended, has no levels made for it, and on ES is not filtered.
+            // A depth format is not blended and has no levels made for it; a
+            // sampler that compares filters it on ES as on the desktop.
             s = formatSupport(.depth32_float, depth, .es, plain, accepted);
-            try testing.expect(s.render_target and !s.filterable and !s.blendable and !s.generate_mips);
+            try testing.expect(s.render_target and s.filterable and !s.blendable and !s.generate_mips);
             s = formatSupport(.depth32_float, depth, .gl, desktop, accepted);
             try testing.expect(s.render_target and s.filterable and !s.blendable and !s.generate_mips);
         }
