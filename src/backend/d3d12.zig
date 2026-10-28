@@ -16,12 +16,20 @@
 //! from the one above with a linear filter (see `generateMips`). What the narrowness buys is simplicity in the parts a real
 //! Direct3D 12 renderer usually spends the most code on:
 //!
-//! **Buffers are always upload-heap.** CPU-writable, mapped once at creation
-//! and kept mapped for the buffer's life - `updateBuffer` is a `memcpy` into
-//! memory the GPU already sees. One the GPU may still be reading is written
-//! into another copy - a version - that starts as the buffer's bytes kept
-//! on the CPU, the way a Direct3D 11 driver renames a buffer written with
-//! discard (see below). No device-local buffer, no copy queue.
+//! **A mesh lives on the card, what is written every frame in upload heap.**
+//! A buffer that is not `dynamic` - a mesh's vertices and indices - is
+//! copied into a default-heap buffer, the card's own memory, from a staging
+//! one recorded into the open list, as a texture is: read from system
+//! memory over the bus, a frame of millions of triangles drawn three times
+//! (depth, shadows, colour) cost several times what it does from the card.
+//! One written again gets the new bytes the same way, in list order; one
+//! written over and over is moved where the CPU writes it (`restless`).
+//! The rest are upload-heap: CPU-writable, mapped once at creation and kept
+//! mapped for the buffer's life - `updateBuffer` is a `memcpy` into memory
+//! the GPU already sees. One the GPU may still be reading is written into
+//! another copy - a version - that starts as the buffer's bytes kept on the
+//! CPU, the way a Direct3D 11 driver renames a buffer written with discard
+//! (see below). No copy queue.
 //!
 //! **One root signature for every pipeline.** Four root CBVs (`b0`-`b3`),
 //! one CBV_SRV_UAV descriptor table (`t0`-`t3`) and one sampler table
@@ -429,7 +437,21 @@ const BufferRes = struct {
     /// How far anything was ever written: a new version copies no further.
     written: usize,
     size: u32,
+    /// The copy in the card's own memory draws read instead of `current`,
+    /// for a buffer that is not dynamic; null for one that is, or that was
+    /// written too often to stay there.
+    local: ?*rc.ID3D12Resource = null,
+    /// The state `local` is read in: as vertices or as indices. A draw of the
+    /// open list puts it there on its own; otherwise it is common.
+    reading: rc.ResourceStates = .{},
+    /// How many times `local` was written after it was made.
+    rewrites: u32 = 0,
 };
+
+/// How many writes after its making a buffer that is not dynamic takes
+/// before it moves to upload heap: a buffer written every frame though not
+/// said to be would otherwise pay a staging buffer and a copy each time.
+const restless = 8;
 
 const TextureRes = struct {
     resource: *rc.ID3D12Resource,
@@ -444,9 +466,14 @@ const TextureRes = struct {
     /// Its depth-stencil view, for one of a depth format.
     dsv_index: ?u32 = null,
     dsv_cpu: rc.CpuDescriptorHandle = .{},
-    /// Where it is now, as the recording that is open has left it: `sampled`
+    /// Where it is now, as the recording that is open has left it: `rest`
     /// between submits.
     state: rc.ResourceStates = sampled,
+    /// Where it waits between passes: `sampled`, but for a multisampled
+    /// target, which is only drawn into and resolved and so stays a render
+    /// target - moving it to a shader resource and back costs the card a
+    /// decompression of all its samples each pass, for nothing.
+    rest: rc.ResourceStates = sampled,
     /// Samples a pixel: more than one for a target a pass resolves.
     samples: u32 = 1,
     /// A depth texture that is sampled as well: back to `sampled` when the
@@ -1152,6 +1179,7 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
     const self = cast(impl);
     const res = try self.gpa.create(BufferRes);
     errdefer self.gpa.destroy(res);
+    if (!desc.dynamic and desc.kind != .uniform) return createLocal(self, res, desc);
 
     // A whole number of 256-byte blocks: a block bound from an offset is read
     // by the shader as far as it declares, and that stays in the buffer.
@@ -1169,6 +1197,70 @@ fn createBuffer(impl: backend.Impl, desc: types.BufferDesc) Error!backend.Native
         @memcpy(shadow[0..data.len], data);
     }
     return res;
+}
+
+/// A buffer in the card's memory: zeroed as a committed resource is made,
+/// its data copied in by the open list.
+fn createLocal(self: *D3d, res: *BufferRes, desc: types.BufferDesc) Error!backend.Native {
+    const size: u32 = @intCast(desc.size);
+    const shadow = try self.gpa.alloc(u8, @max(size, 1));
+    errdefer self.gpa.free(shadow);
+    @memset(shadow, 0);
+    const reading: rc.ResourceStates = if (desc.kind == .index) .{ .index_buffer = true } else .{ .vertex_and_constant_buffer = true };
+    // A buffer is made in the common state whatever is asked, and falls back
+    // to it each time a list it was used in is done.
+    const local = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, .buffer(@max(size, 1)), .common, null) catch return error.Failed;
+    errdefer _ = com.release(local);
+    // Never read where it is not local: an empty placeholder, as nothing
+    // maps or binds it.
+    res.* = .{ .current = .{ .resource = local, .mapped = shadow.ptr }, .shadow = shadow, .written = size, .size = size, .local = local, .reading = reading };
+    if (desc.data) |data| {
+        @memcpy(shadow[0..data.len], data);
+        try copyLocal(self, res, 0, data);
+    }
+    return res;
+}
+
+/// `bytes` at `offset` of a local buffer, through a staging buffer the
+/// open list copies from: what the GPU reads before it in the queue is the
+/// old, after it the new.
+fn copyLocal(self: *D3d, res: *BufferRes, offset: usize, bytes: []const u8) Error!void {
+    if (bytes.len == 0) return;
+    const local = res.local.?;
+    const staging = try transferBuffer(self, .upload, bytes.len);
+    var buried = false;
+    defer if (!buried) {
+        _ = com.release(staging);
+    };
+    var mapped: ?*anyopaque = null;
+    staging.vtable.Map(staging, 0, &rc.Range.nothing_read, &mapped).check() catch return error.Failed;
+    @memcpy(@as([*]u8, @ptrCast(mapped.?))[0..bytes.len], bytes);
+    staging.vtable.Unmap(staging, 0, null);
+
+    if (!self.recording) try beginRecording(self);
+    errdefer abandonRecording(self);
+    // Used by the open list - drawn with, or copied into - it is in the
+    // state it is read in; otherwise it went back to common when its last
+    // list was done.
+    const now: rc.ResourceStates = if (res.current.busy == self.fence_value + 1) res.reading else .common;
+    const to_copy = cmdmod.ResourceBarrier.transition(local, now, .{ .copy_dest = true });
+    self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{to_copy});
+    self.list.vtable.CopyBufferRegion(self.list, local, offset, staging, 0, bytes.len);
+    const back = cmdmod.ResourceBarrier.transition(local, .{ .copy_dest = true }, res.reading);
+    self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{back});
+    res.current.busy = self.fence_value + 1;
+    bury(self, .{ .resource = staging });
+    buried = true;
+}
+
+/// A local buffer written too often moved to upload heap, as if it had
+/// been made dynamic: its bytes so far are the new version's.
+fn unsettle(self: *D3d, res: *BufferRes) Error!void {
+    const version = try uploadVersion(self, res.size);
+    @memcpy(version.mapped[0..res.size], res.shadow[0..res.size]);
+    bury(self, .{ .resource = res.local.? });
+    res.local = null;
+    res.current = version;
 }
 
 /// An upload-heap buffer's memory, mapped for its life.
@@ -1190,6 +1282,7 @@ fn uploadVersion(self: *D3d, size: u32) Error!Version {
 fn destroyBuffer(impl: backend.Impl, native: backend.Native) void {
     const self = cast(impl);
     const res = as(BufferRes, native);
+    // A local buffer's `current` is `local` itself.
     bury(self, .{ .resource = res.current.resource });
     for (res.spare.items) |version| bury(self, .{ .resource = version.resource });
     res.spare.deinit(self.gpa);
@@ -1203,6 +1296,14 @@ fn updateBuffer(impl: backend.Impl, native: backend.Native, offset: usize, bytes
     const self = cast(impl);
     const res = as(BufferRes, native);
     const end = offset + bytes.len;
+    if (res.local != null) {
+        res.rewrites += 1;
+        if (res.rewrites < restless) {
+            @memcpy(res.shadow[offset..end], bytes);
+            return copyLocal(self, res, offset, bytes);
+        }
+        try unsettle(self, res);
+    }
     if (res.current.busy > self.completed) self.completed = self.fence.vtable.GetCompletedValue(self.fence);
     if (res.current.busy > self.completed) {
         res.spare.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
@@ -1299,7 +1400,8 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     rdesc.sample = .{ .count = desc.samples };
     rdesc.mip_levels = @intCast(levels);
     const clear: rc.ClearValue = .{ .format = format, .color = desc.clear_color };
-    const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, sampled, if (drawn) &clear else null) catch return error.Failed;
+    const rest: rc.ResourceStates = if (desc.samples > 1) .{ .render_target = true } else sampled;
+    const obj = rc.createCommittedResource(self.device, .of(.default), rc.heap_flags_none, rdesc, rest, if (drawn) &clear else null) catch return error.Failed;
     errdefer _ = com.release(obj);
 
     // A multisampled texture is drawn into and resolved, never sampled: its
@@ -1319,7 +1421,7 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
         .u = .{ .texture2d = .{ .mip_levels = levels } },
     }, cpu);
 
-    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu, .samples = desc.samples, .mip_levels = levels, .depth = if (volume) desc.depth_or_layers else 1, .volume = volume };
+    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu, .state = rest, .rest = rest, .samples = desc.samples, .mip_levels = levels, .depth = if (volume) desc.depth_or_layers else 1, .volume = volume };
     if (target) {
         const rtv = try allocRtv(self);
         res.rtv_index = rtv;
@@ -1412,7 +1514,7 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     const dst_loc = cmdmod.TextureCopyLocation.subresource(res.resource, region.mip);
     const src_loc = cmdmod.TextureCopyLocation.placed(staging, footprint);
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, region.x, region.y, if (res.volume) region.z else 0, &src_loc, null);
-    transition(self, res, sampled);
+    transition(self, res, res.rest);
     // Read by the copy when the list runs: released once it has.
     bury(self, .{ .resource = staging });
     buried = true;
@@ -1440,7 +1542,7 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     // A volume's slice: one deep of the level.
     const slice: cmdmod.Box = .{ .left = 0, .right = level[0], .bottom = level[1], .front = sub.layer, .back = sub.layer + 1 };
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, 0, 0, 0, &src_loc, if (res.volume) &slice else null);
-    transition(self, res, sampled);
+    transition(self, res, res.rest);
     try closeAndExecute(self);
     // The one wait a readback has: the bytes are wanted now.
     try waitFor(self, self.fence_value);
@@ -2169,7 +2271,7 @@ fn endTarget(self: *D3d) void {
     if (target.resolve) |into| resolve(self, target.texture.?, into);
     if (target.depth) |res| if (res.readable) transition(self, res, sampled);
     if (target.texture) |res| {
-        transition(self, res, sampled);
+        transition(self, res, res.rest);
     } else if (target.resource) |back_buffer| {
         const to_present = cmdmod.ResourceBarrier.transition(back_buffer, .{ .render_target = true }, .{});
         self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{to_present});
@@ -2378,8 +2480,9 @@ test "a buffer the GPU may still read is written into another copy, which keeps 
     defer device.deinit();
     const self = cast(device.impl);
 
-    const handle = try device.createBuffer(.{ .kind = .vertex, .size = 8, .data = "abcdefgh" });
+    const handle = try device.createBuffer(.{ .kind = .vertex, .size = 8, .dynamic = true, .data = "abcdefgh" });
     const res = as(BufferRes, device.buffers.get(handle).?.native);
+    try testing.expectEqual(null, res.local);
     const first = res.current;
     // As if a list the GPU has not done yet drew with it.
     res.current.busy = self.fence_value + 1;
@@ -2393,6 +2496,46 @@ test "a buffer the GPU may still read is written into another copy, which keeps 
     try device.updateBuffer(handle, 0, "Z");
     try testing.expectEqual(second, res.current.resource);
     try testing.expectEqualSlices(u8, "ZbXYefgh", res.current.mapped[0..8]);
+}
+
+test "a mesh's buffer lives on the card, a write reaches draws after it and not before, and one written over and over moves to upload heap" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const quad = try Quad.init(&device);
+    const res = as(BufferRes, device.buffers.get(quad.corners).?.native);
+    try testing.expect(res.local != null);
+
+    const red = try device.createTexture(.{ .width = 1, .height = 1, .data = &.{ 255, 0, 0, 255 } });
+    const sampler = try device.createSampler(.nearest);
+    const whole = [_][2]f32{ .{ -1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 } };
+    const left = [_][2]f32{ .{ -1, -1 }, .{ -1, 1 }, .{ 0, -1 }, .{ 0, 1 } };
+    const targets = [_]types.Texture{
+        try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } }),
+        try device.createTexture(.{ .width = 8, .height = 8, .usage = .{ .render_target = true } }),
+    };
+    for (0..restless + 1) |round| {
+        // Two submits in one list, the corners written between them.
+        for (targets, 0..) |target, i| {
+            if (i == 1) try device.updateBuffer(quad.corners, 0, std.mem.asBytes(&left));
+            const cmd = device.begin();
+            try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target }, .clear_color = .{ 0, 0, 1, 1 } } });
+            try cmd.setPipeline(quad.pipeline);
+            try cmd.setVertexBuffer(0, quad.corners, 0);
+            try cmd.setTexture(0, red, sampler);
+            try cmd.draw(.{ .vertex_count = 4 });
+            try cmd.endPass();
+            try device.submit();
+        }
+        const all = try device.readTexture(targets[0], testing.allocator);
+        defer testing.allocator.free(all);
+        const half = try device.readTexture(targets[1], testing.allocator);
+        defer testing.allocator.free(half);
+        try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, texelAt(all, 8, 6, 4));
+        try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, texelAt(half, 8, 1, 4));
+        try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, texelAt(half, 8, 6, 4));
+        try device.updateBuffer(quad.corners, 0, std.mem.asBytes(&whole));
+        try testing.expectEqual(2 * (round + 1) >= restless, res.local == null);
+    }
 }
 
 test "submits go into one list, executed when needed, and what they used is released once the GPU is done" {
