@@ -7,12 +7,12 @@ One way to draw, on whichever API the machine has. For Zig 0.17.
 | `Device` | One backend, the resources made on it, and the frame being recorded. Handles in, validated command lists out. |
 | `types` | Everything a program says to a device - formats, descriptions, states, passes - as plain values that know no backend. |
 | `commands` | A frame written down before it is drawn: a `CommandList` the backend walks once at `submit`. |
-| `backend` | What a backend has to answer to: a vtable of twenty calls. The seam a new one is written against. |
-| `backend/gl` | OpenGL 3.3 core, on a context somebody else made, through [Fluxion GL](https://github.com/kisstp2006/fluxion-gl). |
+| `backend` | What a backend has to answer to: one vtable. The seam a new one is written against. |
+| `backend/gl` | OpenGL 3.3 core or OpenGL ES 3.0, on a context somebody else made, through [Fluxion GL](https://github.com/kisstp2006/fluxion-gl). |
 | `backend/d3d11` | Direct3D 11 at feature level 11.0, through [Fluxion D3D](https://github.com/kisstp2006/fluxion-d3d). Windows only. |
-| `backend/d3d12` | Direct3D 12 at feature level 11.0, through Fluxion D3D. Windows only. Experimental: 2D textures, one level. |
-| `backend/vulkan` | Vulkan 1.0 with `VK_KHR_maintenance1`, through [Fluxion Vulkan](https://github.com/kisstp2006/fluxion-vulkan). Experimental: 2D textures, one level. |
-| `backend/webgl` | WebGL 2 in a browser, through [Fluxion WebGL](https://github.com/kisstp2006/fluxion-webgl). A `wasm32` build only. |
+| `backend/d3d12` | Direct3D 12 at feature level 11.0, through Fluxion D3D. Windows only. Pictures and volumes; no cubes or arrays yet. |
+| `backend/vulkan` | Vulkan 1.0 with `VK_KHR_maintenance1`, through [Fluxion Vulkan](https://github.com/kisstp2006/fluxion-vulkan). Pictures and volumes; no cubes or arrays yet. |
+| `backend/webgl` | WebGL 2 in a browser, through [Fluxion WebGL](https://github.com/kisstp2006/fluxion-webgl): pictures, cubes, volumes and arrays. A `wasm32` build only. |
 | `backend/none` | Accepts everything, draws nothing. For build servers, headless programs and tests. |
 
 ```zig
@@ -55,13 +55,15 @@ try device.present(surface);
 
 Five decisions run through it:
 
-**2D first, but not 2D only.** What is here today is what sprites, text, UI
-and tilemaps need: instanced quads, textures and samplers, alpha blending,
-scissor rectangles, an orthographic matrix. The shape is not 2D, though. Depth
-states, depth attachments, cull modes and clip-space conventions are all in
-the API now, so a 3D renderer is more of the same calls rather than a
-different library - and `Device.clip` already answers which clip space a
-projection is for.
+**2D and 3D, the same calls.** Sprites, text, UI and tilemaps want instanced
+quads, textures and samplers, alpha blending and scissor rectangles; a 3D
+renderer wants depth passes, shadow maps sampled through a comparing
+sampler, multisampled targets resolved at the end of a pass, float targets,
+chains of levels drawn into a level at a time, cube maps, volumes drawn into
+a slice at a time, and the card's own clock to see where a frame goes. All of
+it is here, on every backend that can do it, and Fluxion's 3D renderer is
+built on nothing else. `Device.clip` answers which clip space a projection
+is for, and `caps` what this device can do, before anything is tried.
 
 **Handles, not pointers.** Every `create` returns eight bytes with a
 generation in them, from [Fluxion Id](https://github.com/kisstp2006/fluxion-id).
@@ -176,8 +178,9 @@ them, whether a compiler wrote them or a person did:
 | Fragment colour | `out vec4` | `SV_TARGET` |
 
 Every backend has sixteen texture slots, `0` to `15` - `max_texture_slots`,
-the most OpenGL 3.3 and WebGL 2 promise a fragment shader - and eight uniform
-buffer slots, `0` to `7`. A texture slot past the last is refused when the
+the most OpenGL 3.3 and WebGL 2 promise a fragment shader - and at least
+eight uniform buffer slots, `0` to `7`: twelve on Vulkan and Direct3D 12,
+fourteen on Direct3D 11. A texture slot past the last is refused when the
 list is submitted.
 
 `uniform_blocks` and `textures` exist because neither GLSL has
@@ -235,11 +238,12 @@ Direct3D 11 on Windows otherwise and WebGL on the web; it never chooses
 `none`, Direct3D 12 or Vulkan on its own. `Device.available()` lists what this
 build could open.
 
-**Direct3D 12 and Vulkan are experimental.** Both draw everything a 2D
-renderer asks - textures drawn into and sampled after, written in part and
-read back, `rgba8`, `bgra8` and `r8`, blending, instancing, scissors - and draw
-the picture Direct3D 11 does, which the sprites example's tests (in Fluxion Examples) check. Both
-are narrower than it: 2D textures only. Both filter anisotropically, and take a chain of
+**Direct3D 12 and Vulkan** draw the picture Direct3D 11 and OpenGL do - a
+3D frame of a few hundred draws, with shadows, multisampling, float targets
+and fog volumes, on all of them alike - and the sprites example's tests (in
+Fluxion Examples) check the same for 2D. Both are narrower than Direct3D 11
+in two ways: one colour attachment a pass, and pictures and volumes but no
+cubes or arrays yet. Both filter anisotropically, and take a chain of
 levels, written and read a level at a time, drawn into a level at a time,
 and filled by `generateMips` - Vulkan blits each level down from the one
 above with a linear filter, and Direct3D 12, which has no call for it, draws
@@ -255,12 +259,33 @@ viewport a negative height, so its clip space is Direct3D's. With
 `DeviceDesc.debug` it turns the Khronos validation layer on, when one is
 installed.
 
-**Static Vulkan geometry stays in device-local memory.** Vertex and index
-buffers with `dynamic = false` are uploaded through bounded staging batches,
-retired with the recording's fence. Dynamic buffers and uniform blocks stay
-mapped. Unified-memory devices prefer mapped device-local memory for static
-geometry as well. Partial writes preserve the rest of the buffer and any
-draws already recorded with its previous contents.
+**Static geometry stays on the card.** Vertex and index buffers with
+`dynamic = false` are copied into the card's own memory - on Vulkan through
+bounded staging batches, retired with the recording's fence; on Direct3D 12
+through a staging buffer the open command list copies from, in list order,
+so a draw recorded before a write reads the old bytes and one after it the
+new. Dynamic buffers and uniform blocks stay mapped. Unified-memory devices
+prefer mapped device-local memory for static geometry as well. A buffer said
+to be static but written over and over is moved where the CPU writes it, on
+Direct3D 12, rather than paying a copy each time. Partial writes preserve the
+rest of the buffer and any draws already recorded with its previous contents.
+
+**A multisampled target stays a render target.** Nothing samples one; it is
+drawn into and resolved. Direct3D 12 keeps it in the render-target state
+between passes rather than moving it to a shader resource and back, which
+would make the card decompress all its samples each time.
+
+**The card's clock.** `CommandList.timestamp(mark)` keeps the time the GPU
+gets there - everything before it in the queue done - as one of the frame's
+`max_timestamps` marks, and `Device.timings()` gives back the marks of the
+newest frame the card has finished, in nanoseconds, without waiting: a frame
+being whatever was recorded between two calls of it, a ring of four of them
+on their way. What a part of a frame cost the card is the time between two
+marks around it. Vulkan writes timestamp queries, Direct3D 12 resolves a
+query heap into a readback buffer, Direct3D 11 times inside a disjoint query
+and drops a frame whose clock changed speed, OpenGL uses its 3.3 query
+counter and OpenGL ES `GL_EXT_disjoint_timer_query`; WebGL has none, and
+`Features.timestamps` says which.
 
 **A shadow map is a depth texture, a bias, and a sampler that compares.**
 `DepthState.bias` and `slope_bias` push each depth a pipeline writes back -
@@ -283,7 +308,9 @@ vertex at all, so an indexed draw with one moves the per-vertex attribute
 pointers that many vertices on instead - they are written at the draw anyway,
 and unlike on OpenGL 3.3 it combines with instancing. It takes no BGRA upload,
 so a `bgra8_unorm` texture is stored as RGBA with red and blue swapped on the
-way in. It has no debug callback, so `DeviceDesc.debug` drains the error queue
+way in. A volume or an array is made a level at a time with `texImage3D`,
+written a slice at a time and drawn into a slice through
+`framebufferTextureLayer`. It has no debug callback, so `DeviceDesc.debug` drains the error queue
 after every submit instead. And it wants `ShaderDesc.glsl_es`: GLSL ES 3.00,
 which is what Fluxion Shader writes beside its GLSL.
 
