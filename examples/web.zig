@@ -310,7 +310,13 @@ fn start() !void {
 
     // A picture needs a GPU to be right or wrong, and the stub the host
     // tests run against has none.
-    if (webgl.is_wasm) try selfCheck(&state);
+    if (webgl.is_wasm) selfCheck(&state) catch |err| {
+        // A check that stops at an error is one that came out wrong, and the
+        // ones after it are not run; the device is `state`'s now, not the one
+        // `errdefer` above would close.
+        state.failures += 1;
+        std.log.err("wrong: the checks stopped at {s}", .{@errorName(err)});
+    };
 }
 
 /// What the device says it can do, to the console: the limits, and a line per
@@ -1290,10 +1296,10 @@ test "the 3D checks run, on what the stub says it can do, and leave nothing behi
     // pass into a level, six faces and the last level of each, four of a
     // depth pass and its sampling and two of a shadow sampler, three
     // samplers, ten formats cleared and read and eight written in their own
-    // bytes - and three more the stub's caps rule out: a volume, an array,
-    // and a compressed format.
-    try testing.expectEqual(64, state.checks);
-    try testing.expectEqual(3, state.skipped);
+    // bytes, six slices of a volume and four layers of an array - and one
+    // more the stub's caps rule out: a compressed format.
+    try testing.expectEqual(74, state.checks);
+    try testing.expectEqual(1, state.skipped);
 
     deinit();
     try testing.expectEqual(0, webgl.stub.state.live_objects);

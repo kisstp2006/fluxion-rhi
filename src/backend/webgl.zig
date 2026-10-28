@@ -118,7 +118,7 @@ const wire = struct {
     /// both made and written with. Without them `texture_3d` and
     /// `texture_2d_array` cannot be allocated, filled, or - having no
     /// `framebufferTextureLayer` either - drawn into.
-    const layered = false;
+    const layered = true;
     const multisample = true;
     /// `drawBuffers`: without it a framebuffer writes its first colour
     /// attachment and nothing else.
@@ -503,13 +503,15 @@ const max_tracked_images = 96;
 const TextureRes = struct {
     texture: webgl.Texture = .none,
     renderbuffer: webgl.Renderbuffer = .none,
-    /// What it is bound to: `texture_2d`, or `texture_cube_map`.
+    /// What it is bound to: `texture_2d`, `texture_cube_map`, `texture_3d`
+    /// or `texture_2d_array`.
     target: Enum,
     native: Native,
     format: types.Format,
     width: u32,
     height: u32,
-    /// Faces, and levels in each: what `drawn` is indexed by.
+    /// Faces - a volume's slices, an array's layers - and levels in each:
+    /// what `drawn` is indexed by.
     faces: u32,
     levels: u32,
     /// The images a pass has drawn into. GL stores a drawn image bottom row
@@ -741,6 +743,12 @@ fn levelExtent(res: *const TextureRes, mip: u32) [2]u32 {
     return .{ types.mipExtent(res.width, mip), types.mipExtent(res.height, mip) };
 }
 
+/// Whether a texture of `target` is a volume or an array: made, written and
+/// drawn into a slice at a time by the calls that take a third coordinate.
+fn isLayered(target: Enum) bool {
+    return target == c.texture_3d or target == c.texture_2d_array;
+}
+
 /// The target that names one face of a texture: the texture's own, unless it
 /// is a cube, whose faces are six targets on one texture.
 fn faceTarget(target: Enum, face: u32) Enum {
@@ -830,7 +838,7 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
         .format = desc.format,
         .width = desc.width,
         .height = desc.height,
-        .faces = desc.layers(),
+        .faces = if (isLayered(target)) desc.depth_or_layers else desc.layers(),
         .levels = desc.mip_levels,
         // Read linearly as it is - for a depth texture, only by a sampler
         // that compares.
@@ -856,7 +864,26 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     const pitch = desc.effectiveRowPitch();
     // A face after a face, each `pitch` a row and as many rows as it has.
     const face_bytes = pitch * desc.format.rowCount(desc.height);
-    for (0..@as(usize, desc.layers()) * levels) |i| {
+    if (isLayered(target)) {
+        // Each level made empty, all its slices at once - a volume's fewer
+        // at each level, an array's the same - and level zero's filled a
+        // slice at a time from what was given.
+        for (0..levels) |level| {
+            const deep = if (target == c.texture_3d) types.mipExtent(desc.depth_or_layers, @intCast(level)) else desc.depth_or_layers;
+            gl.texImage3D(.{
+                .target = target,
+                .level = @intCast(level),
+                .internal_format = native.internal,
+                .width = @intCast(types.mipExtent(desc.width, @intCast(level))),
+                .height = @intCast(types.mipExtent(desc.height, @intCast(level))),
+                .format = native.format,
+                .kind = native.kind,
+            }, @intCast(deep));
+        }
+        if (desc.data) |data| for (0..desc.depth_or_layers) |slice| {
+            try upload(self, res, .{ .face = @intCast(slice), .level = 0, .width = desc.width, .height = desc.height }, data[slice * face_bytes ..], pitch, .replace);
+        };
+    } else for (0..@as(usize, desc.layers()) * levels) |i| {
         const image = imageAt(desc.width, desc.height, levels, @intCast(i));
         // What was given is level zero; the levels below are for
         // `generateMips` or for writes.
@@ -990,7 +1017,11 @@ fn upload(
     defer if (row_length != 0) gl.pixelStorei(c.unpack_row_length, 0);
     switch (how) {
         .allocate => gl.texImage2D(image),
-        .replace => gl.texSubImage2D(@intCast(box.x), @intCast(box.y), image),
+        // A volume's or an array's face is its slice.
+        .replace => if (isLayered(res.target))
+            gl.texSubImage3D(@intCast(box.x), @intCast(box.y), @intCast(box.face), 1, image)
+        else
+            gl.texSubImage2D(@intCast(box.x), @intCast(box.y), image),
     }
 }
 
@@ -1030,6 +1061,8 @@ fn attach(self: *WebGl, res: *const TextureRes, layer: u32, mip: u32) void {
 fn attachTo(gl: webgl.Context, target: Enum, res: *const TextureRes, layer: u32, mip: u32) void {
     if (res.renderbuffer != .none) {
         gl.framebufferRenderbuffer(target, attachmentPoint(res.format), c.renderbuffer, res.renderbuffer);
+    } else if (isLayered(res.target)) {
+        gl.framebufferTextureLayer(target, attachmentPoint(res.format), res.texture, @intCast(mip), @intCast(layer));
     } else {
         gl.framebufferTexture2D(target, attachmentPoint(res.format), faceTarget(res.target, layer), res.texture, @intCast(mip));
     }
@@ -2252,14 +2285,9 @@ test "the table has a row for every format and a name for every extension" {
     }
 }
 
-/// What every format is made as, with no `texImage3D` in the binding: plain
-/// images and cubes.
-const flat_dimensions: std.EnumSet(types.Dimension) = blk: {
-    var set: std.EnumSet(types.Dimension) = .full;
-    set.remove(.d3);
-    set.remove(.d2_array);
-    break :blk set;
-};
+/// What every format is made as, with `texImage3D` in the binding: plain
+/// images, cubes, volumes and arrays.
+const every_dimension: std.EnumSet(types.Dimension) = .full;
 
 test "the caps never claim a format the table cannot do, or a flag its rules do not allow" {
     const answer = openedCaps();
@@ -2287,9 +2315,10 @@ test "the stub's caps are what the context reports and what the binding lacks" {
     // The context's own sizes: the stub says 2048.
     try testing.expectEqual(@as(u32, 2048), answer.limits.max_texture_2d);
     try testing.expectEqual(@as(u32, 2048), answer.limits.max_texture_cube);
-    // No `texImage3D`, no `drawBuffers`, and the anisotropy extension is not on.
-    try testing.expectEqual(@as(u32, 0), answer.limits.max_texture_3d);
-    try testing.expectEqual(@as(u32, 0), answer.limits.max_texture_layers);
+    // Volumes and arrays as big as WebGL 2's floor; no `drawBuffers`, and
+    // the anisotropy extension is not on.
+    try testing.expectEqual(@as(u32, 256), answer.limits.max_texture_3d);
+    try testing.expectEqual(@as(u32, 256), answer.limits.max_texture_layers);
     try testing.expectEqual(@as(u32, 1), answer.limits.max_color_attachments);
     try testing.expectEqual(@as(u32, 1), answer.limits.max_anisotropy);
     // ES 3.0 has neither a border colour nor a sampler bias.
@@ -2299,11 +2328,11 @@ test "the stub's caps are what the context reports and what the binding lacks" {
     // The stub calls every framebuffer complete, so everything that can be
     // allocated can be drawn into.
     const rgba8 = answer.formatSupport(.rgba8_unorm);
-    try testing.expectEqual(types.FormatSupport{ .sampled = true, .filterable = true, .render_target = true, .blendable = true, .generate_mips = true, .sample_counts = 0b111, .dimensions = flat_dimensions }, rgba8);
+    try testing.expectEqual(types.FormatSupport{ .sampled = true, .filterable = true, .render_target = true, .blendable = true, .generate_mips = true, .sample_counts = 0b111, .dimensions = every_dimension }, rgba8);
     try testing.expectEqual(rgba8, answer.formatSupport(.bgra8_unorm_srgb));
     // 32-bit float reads and draws, is not filtered or blended, and so has no chain.
     try testing.expectEqual(
-        types.FormatSupport{ .sampled = true, .filterable = false, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 0b111, .dimensions = flat_dimensions },
+        types.FormatSupport{ .sampled = true, .filterable = false, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 0b111, .dimensions = every_dimension },
         answer.formatSupport(.rgba32_float),
     );
     // Half float filters and blends.
@@ -2311,7 +2340,7 @@ test "the stub's caps are what the context reports and what the binding lacks" {
     // Depth is drawn into and sampled, and filtered by a sampler that
     // compares.
     try testing.expectEqual(
-        types.FormatSupport{ .sampled = true, .filterable = true, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 0b111, .dimensions = flat_dimensions },
+        types.FormatSupport{ .sampled = true, .filterable = true, .render_target = true, .blendable = false, .generate_mips = false, .sample_counts = 0b111, .dimensions = every_dimension },
         answer.formatSupport(.depth32_float),
     );
 }
@@ -2561,12 +2590,6 @@ test "generating mips is a bind and a call, on the texture's own target" {
 test "what the binding cannot do is refused before it is tried, and the reason is named" {
     var device = try openDevice();
     defer device.deinit();
-
-    // No `texImage3D`: no volume, no array.
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d3, .width = 4, .height = 4, .depth_or_layers = 4 }));
-    try testing.expect(std.mem.find(u8, device.diagnostics(), "shape") != null);
-    try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d2_array, .width = 4, .height = 4, .depth_or_layers = 2 }));
-    try testing.expect(std.mem.find(u8, device.diagnostics(), "shape") != null);
 
     // No compressed upload.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 8, .height = 8, .format = .bc1_rgba_unorm }));
@@ -3050,4 +3073,23 @@ test "with its extension on, BC1 is sampled, and its levels go over as blocks, a
     try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, stub.state.last_image.first);
     try device.writeTexture(texture, .{ .mip = 1 }, blocks[0..8], 0, 0);
     try testing.expectEqual([4]u8{ 0x00, 0xF8, 0x00, 0xF8 }, stub.state.last_image.first);
+}
+
+test "a volume and an array are made with what was given, written a slice at a time, and a pass draws into one slice" {
+    var device = try openDevice();
+    defer device.deinit();
+    const slices: [32]u8 = @splat(1);
+    const volume = try device.createTexture(.{ .dimension = .d3, .width = 2, .height = 1, .depth_or_layers = 4, .data = &slices, .usage = .{ .render_target = true } });
+    // What was given went over a slice at a time: the last, slice three.
+    try testing.expectEqual(@as(u8, 1), stub.state.last_image.first[0]);
+    const nines: [8]u8 = @splat(9);
+    try device.writeTexture(volume, .{ .z = 2, .width = 2, .height = 1, .depth = 1 }, &nines, 0, 0);
+    try testing.expectEqual(@as(u8, 9), stub.state.last_image.first[0]);
+    const array = try device.createTexture(.{ .dimension = .d2_array, .width = 2, .height = 2, .depth_or_layers = 3 });
+    device.destroyTexture(array);
+
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = volume }, .layer = 3, .clear_color = .{ 1, 0, 0, 1 } } });
+    try cmd.endPass();
+    try device.submit();
 }
