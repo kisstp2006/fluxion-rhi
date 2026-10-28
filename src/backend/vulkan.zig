@@ -68,6 +68,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const vk = @import("fluxion_vulkan");
+const timing = @import("timing.zig");
 const types = @import("../types.zig");
 const commands = @import("../commands.zig");
 const backend = @import("../backend.zig");
@@ -411,6 +412,12 @@ pub const Vk = struct {
 
     render_passes: [max_render_passes]?swapchain.RenderPassEntry = @splat(null),
 
+    /// The GPU's clock at each mark, a ring of frames of them: `.none`
+    /// where the queue keeps no time. See `timing.zig`.
+    query_pool: vk.gen.types.QueryPool = .none,
+    ns_per_tick: f64 = 0,
+    timing: timing.Ring = .{},
+
     renderer: [256]u8 = undefined,
     renderer_len: usize = 0,
 
@@ -544,6 +551,18 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
     @memcpy(self.renderer[0..n], name[0..n]);
     self.renderer_len = n;
 
+    if (props.limits.timestamp_compute_and_graphics != 0 and props.limits.timestamp_period > 0) {
+        var pool: vk.gen.types.QueryPool = .none;
+        const made = vkd.createQueryPool(self.runtime.device, &.{
+            .query_type = .timestamp,
+            .query_count = timing.sets * types.max_timestamps,
+        }, null, &pool);
+        if (made == .success) {
+            self.query_pool = pool;
+            self.ns_per_tick = props.limits.timestamp_period;
+        }
+    }
+
     self.dummy_buffer = resources.createDummyBuffer(self) catch return error.NoDevice;
     self.dummy_texture = resources.createDummyTexture(self) catch return error.NoDevice;
     self.dummy_sampler = resources.createDummySampler(self) catch return error.NoDevice;
@@ -585,6 +604,7 @@ const vtable: backend.Vtable = .{
     .surfaceSize = swapchain.surfaceSize,
     .present = swapchain.present,
     .submit = submit,
+    .timings = timings,
 };
 
 fn deinit(impl: backend.Impl) void {
@@ -603,6 +623,7 @@ fn deinit(impl: backend.Impl) void {
         one.descriptor_pools.deinit(self.gpa);
         destroySlot(vkd, self.runtime.device, one);
     }
+    if (self.query_pool != .none) vkd.destroyQueryPool(self.runtime.device, self.query_pool, null);
     vkd.destroyPipelineLayout(self.runtime.device, self.pipeline_layout, null);
     vkd.destroyDescriptorSetLayout(self.runtime.device, self.set_layout_textures, null);
     vkd.destroyDescriptorSetLayout(self.runtime.device, self.set_layout_uniforms, null);
@@ -652,7 +673,7 @@ fn caps(impl: backend.Impl) types.Caps {
         },
         // An edge block of a compressed level may hang past it, as the
         // level's own size is whatever it is.
-        .features = .{ .sampler_border = true, .sampler_lod_bias = true, .compressed_partial_blocks = true },
+        .features = .{ .sampler_border = true, .sampler_lod_bias = true, .compressed_partial_blocks = true, .timestamps = self.query_pool != .none },
     };
 
     // Bit n is 2^n samples, as `FormatSupport.sample_counts` counts them.
@@ -959,11 +980,45 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
                 vkd.cmdDrawIndexed(cmd, d.index_count, d.instance_count, d.first_index, d.base_vertex, 0);
             },
             .generate_mips => |h| resources.generateMips(self, as(TextureRes, device.textures.get(h).?.native)),
+            .timestamp => |mark| {
+                const at = self.timing.write(mark);
+                // A set's queries start over the first time it is written in.
+                if (at.first) vkd.cmdResetQueryPool(cmd, self.query_pool, timing.Ring.base(self.timing.at), types.max_timestamps);
+                vkd.cmdWriteTimestamp(cmd, .{ .bottom_of_pipe = true }, self.query_pool, at.query);
+            },
         }
     }
 
     self.lists += 1;
     if (self.lists >= max_lists) try finish(self);
+}
+
+/// The frame being recorded closed - its recording handed to the queue, so
+/// that it gets done - and the newest done read back, without waiting.
+fn timings(impl: backend.Impl) ?types.Timings {
+    const self = cast(impl);
+    const vkd = self.runtime.vkd;
+    if (self.timing.close() != null) flush(self) catch return null;
+    var order: [timing.sets]u32 = undefined;
+    var newest: ?types.Timings = null;
+    for (self.timing.oldestFirst(&order)) |set| {
+        const kept = self.timing.kept[set];
+        // Each a tick and whether it is there yet.
+        var pairs: [types.max_timestamps][2]u64 = undefined;
+        const asked = vkd.getQueryPoolResults(self.runtime.device, self.query_pool, timing.Ring.base(set), types.max_timestamps, @sizeOf(@TypeOf(pairs)), &pairs, @sizeOf([2]u64), .{ .x64 = true, .with_availability = true });
+        if (asked != .success and asked != .not_ready) break;
+        var ticks: [types.max_timestamps]u64 = undefined;
+        var done = true;
+        for (&ticks, pairs, 0..) |*tick, pair, i| {
+            if (kept >> @intCast(i) & 1 == 0) continue;
+            if (pair[1] == 0) done = false;
+            tick.* = pair[0];
+        }
+        if (!done) break;
+        self.timing.read(set);
+        newest = .ofTicks(&ticks, kept, self.ns_per_tick);
+    }
+    return newest;
 }
 
 /// Where a pass's samples are averaged into when it ends: a texture's view, or
@@ -2410,3 +2465,9 @@ const picture_fragment: []const u32 = &.{
     0x00000005, 0x00000012, 0x00000010, 0x00000011, 0x0003003e, 0x00000007, 0x00000012, 0x000100fd,
     0x00010038,
 };
+
+test "a frame's marks come back in order once the GPU is done, and only once" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    try timing.expectMarks(&device);
+}

@@ -35,6 +35,10 @@ pub const Command = union(enum) {
     /// and in list order: what an earlier pass drew into level zero is what
     /// gets filtered.
     generate_mips: types.Texture,
+    /// The GPU's clock, once everything before this in the queue is done,
+    /// kept as this mark of the frame's timings: see `Device.timings`.
+    /// Outside a pass; nothing where the device has no `timestamps`.
+    timestamp: u32,
 
     pub const VertexBinding = struct {
         slot: u32,
@@ -170,6 +174,11 @@ pub const CommandList = struct {
 
     pub fn generateMips(self: *CommandList, texture: types.Texture) Allocator.Error!void {
         try self.push(.{ .generate_mips = texture });
+    }
+
+    /// Keep the GPU's clock here as mark `mark`, below `max_timestamps`.
+    pub fn timestamp(self: *CommandList, mark: u32) Allocator.Error!void {
+        try self.push(.{ .timestamp = mark });
     }
 };
 

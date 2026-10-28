@@ -78,6 +78,7 @@ const rc = @import("d3d12_resource.zig");
 const cmdmod = @import("d3d12_command.zig");
 const pl = @import("d3d12_pipeline.zig");
 const readback = @import("readback.zig");
+const timing = @import("timing.zig");
 const dxgi = d3d.dxgi;
 const Guid = d3d.Guid;
 const Hresult = d3d.Hresult;
@@ -293,6 +294,16 @@ const D3d = struct {
     lists: u32 = 0,
 
     root_signature: *pl.ID3D12RootSignature,
+
+    /// The GPU's clock at each mark, a ring of frames of them, and where
+    /// a closed frame's are copied to be read: null where the queue keeps no
+    /// time. See `timing.zig`.
+    query_heap: ?*rc.ID3D12QueryHeap = null,
+    query_landing: ?*rc.ID3D12Resource = null,
+    ns_per_tick: f64 = 0,
+    timing: timing.Ring = .{},
+    /// For each set, the fence value its copy is done at.
+    timing_done: [timing.sets]u64 = @splat(0),
 
     rtv_increment: u32,
     cbv_srv_uav_increment: u32,
@@ -704,6 +715,22 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .debug = desc.debug,
     };
 
+    // Best-effort: a queue that keeps no time is timed by nothing.
+    var frequency: u64 = 0;
+    const timed = if (queue.vtable.GetTimestampFrequency(queue, &frequency).check()) |_| frequency > 0 else |_| false;
+    if (timed) {
+        const count = timing.sets * types.max_timestamps;
+        if (rc.createQueryHeap(device, .{ .type = .timestamp, .count = count })) |heap| {
+            if (transferBuffer(self, .readback, count * @sizeOf(u64))) |landing| {
+                self.query_heap = heap;
+                self.query_landing = landing;
+                self.ns_per_tick = 1e9 / @as(f64, @floatFromInt(frequency));
+            } else |_| {
+                _ = com.release(heap);
+            }
+        } else |_| {}
+    }
+
     if (desc.software) {
         const name = "Microsoft Basic Render Driver (WARP)";
         @memcpy(self.renderer[0..name.len], name);
@@ -747,6 +774,7 @@ const vtable: backend.Vtable = .{
     .surfaceSize = surfaceSize,
     .present = present,
     .submit = submit,
+    .timings = timings,
 };
 
 fn cast(impl: backend.Impl) *D3d {
@@ -773,6 +801,8 @@ fn deinit(impl: backend.Impl) void {
         self.gpa.free(shader.pixel);
     }
     if (self.compiler) |*c| c.unload();
+    if (self.query_heap) |heap| _ = com.release(heap);
+    if (self.query_landing) |landing| _ = com.release(landing);
     com.releaseAll(.{
         self.ring_sampler_heap,
         self.ring_srv_heap,
@@ -875,7 +905,7 @@ fn caps(impl: backend.Impl) types.Caps {
             .max_anisotropy = 16,
             .max_color_attachments = 1,
         },
-        .features = .{ .sampler_border = true, .sampler_lod_bias = true },
+        .features = .{ .sampler_border = true, .sampler_lod_bias = true, .timestamps = self.query_heap != null },
     };
     var flat = std.EnumSet(types.Dimension).empty;
     flat.insert(.d2);
@@ -2145,6 +2175,7 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                 cmd_list.vtable.DrawIndexedInstanced(cmd_list, d.index_count, d.instance_count, d.first_index, d.base_vertex, 0);
             },
             .generate_mips => |h| try generateMips(self, as(TextureRes, device.textures.get(h).?.native)),
+            .timestamp => |mark| self.list.vtable.EndQuery(self.list, self.query_heap.?, .timestamp, self.timing.write(mark).query),
         }
     }
 
@@ -2296,6 +2327,40 @@ fn resolve(self: *D3d, source: *TextureRes, into: Resolve) void {
         const to_present = cmdmod.ResourceBarrier.transition(into.resource, .{ .resolve_dest = true }, .{});
         list.vtable.ResourceBarrier(list, 1, &[_]cmdmod.ResourceBarrier{to_present});
     }
+}
+
+/// The frame being recorded closed - each mark it kept copied where the CPU
+/// reads it, by a list executed now - and the newest whose copy is done
+/// read, without waiting.
+fn timings(impl: backend.Impl) ?types.Timings {
+    const self = cast(impl);
+    if (self.timing.close()) |set| {
+        if (!self.recording) beginRecording(self) catch return null;
+        const kept = self.timing.kept[set];
+        for (0..types.max_timestamps) |i| if (kept >> @intCast(i) & 1 != 0) {
+            const query = timing.Ring.base(set) + @as(u32, @intCast(i));
+            self.list.vtable.ResolveQueryData(self.list, self.query_heap.?, .timestamp, query, 1, self.query_landing.?, @as(u64, query) * @sizeOf(u64));
+        };
+        closeAndExecute(self) catch return null;
+        self.timing_done[set] = self.fence_value;
+    }
+    self.completed = @max(self.completed, self.fence.vtable.GetCompletedValue(self.fence));
+    var order: [timing.sets]u32 = undefined;
+    var newest: ?types.Timings = null;
+    for (self.timing.oldestFirst(&order)) |set| {
+        if (self.timing_done[set] > self.completed) break;
+        const landing = self.query_landing.?;
+        const from = timing.Ring.base(set) * @sizeOf(u64);
+        const range: rc.Range = .{ .begin = from, .end = from + types.max_timestamps * @sizeOf(u64) };
+        var mapped: ?*anyopaque = null;
+        landing.vtable.Map(landing, 0, &range, &mapped).check() catch break;
+        var ticks: [types.max_timestamps]u64 = undefined;
+        @memcpy(std.mem.asBytes(&ticks), @as([*]const u8, @ptrCast(mapped.?))[from..][0..@sizeOf(@TypeOf(ticks))]);
+        landing.vtable.Unmap(landing, 0, &rc.Range.nothing_read);
+        self.timing.read(set);
+        newest = .ofTicks(&ticks, self.timing.kept[set], self.ns_per_tick);
+    }
+    return newest;
 }
 
 /// The tables a draw reads, made where its textures or samplers changed, and
@@ -3466,3 +3531,9 @@ const user32 = struct {
     /// `WS_POPUP`: no frame, and with no `WS_VISIBLE` never shown.
     const ws_popup: u32 = 0x80000000;
 };
+
+test "a frame's marks come back in order once the GPU is done, and only once" {
+    var device = try warpDevice();
+    defer device.deinit();
+    try timing.expectMarks(&device);
+}

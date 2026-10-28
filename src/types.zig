@@ -1056,6 +1056,41 @@ pub const FormatSupport = struct {
 /// every backend: the most OpenGL 3.3 and WebGL 2 promise a fragment shader.
 pub const max_texture_slots = 16;
 
+/// How many marks a frame's GPU timings hold: `CommandList.timestamp`'s
+/// `mark` is below it.
+pub const max_timestamps = 32;
+
+/// When the GPU got to each mark of one frame, as `Device.timings` gives
+/// it back.
+pub const Timings = struct {
+    /// In nanoseconds from the earliest mark the frame kept; null for a mark
+    /// it did not.
+    marks: [max_timestamps]?u64 = @splat(null),
+
+    /// From mark `from` to mark `to`, in nanoseconds; null unless both were
+    /// kept.
+    pub fn between(self: *const Timings, from: usize, to: usize) ?u64 {
+        const a = self.marks[from] orelse return null;
+        const b = self.marks[to] orelse return null;
+        return b -| a;
+    }
+
+    /// Of raw ticks, `ns_per_tick` nanoseconds each, the ones `kept` says
+    /// were written: what every backend hands back.
+    pub fn ofTicks(ticks: *const [max_timestamps]u64, kept: u32, ns_per_tick: f64) Timings {
+        var out: Timings = .{};
+        if (kept == 0) return out;
+        var first: u64 = std.math.maxInt(u64);
+        for (ticks, 0..) |tick, i| if (kept >> @intCast(i) & 1 != 0) {
+            first = @min(first, tick);
+        };
+        for (ticks, 0..) |tick, i| if (kept >> @intCast(i) & 1 != 0) {
+            out.marks[i] = @intFromFloat(@as(f64, @floatFromInt(tick - first)) * ns_per_tick);
+        };
+        return out;
+    }
+};
+
 pub const Limits = struct {
     /// The largest `width` or `height` of a `.d2` or `.d2_array`.
     max_texture_2d: u32,
@@ -1094,6 +1129,9 @@ pub const Features = packed struct {
     /// that samples what it drew (a shadow map, a post-processing chain) flips
     /// the coordinate when this is set.
     render_target_origin_bottom_left: bool = false,
+    /// `CommandList.timestamp` keeps the GPU's clock, and `Device.timings`
+    /// gives it back: where it does not, both do nothing.
+    timestamps: bool = false,
 };
 
 pub const Caps = struct {

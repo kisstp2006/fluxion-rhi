@@ -272,6 +272,19 @@ pub fn memory(self: *Device) ?types.Memory {
     return ask(self.impl);
 }
 
+/// When the GPU got to each mark `CommandList.timestamp` kept in the newest
+/// frame it has finished - a frame being whatever was recorded between two
+/// calls of this - and the frame being recorded closed. Null where no frame
+/// has finished since the last answer, or where the device does not keep
+/// its clock (`features.timestamps`). It never waits: call it once a frame,
+/// at the end, and the answer is of one a few frames back. What a part of a
+/// frame cost the card is the time between two marks around it.
+pub fn timings(self: *Device) ?types.Timings {
+    if (!self.capabilities.features.timestamps) return null;
+    const ask = self.vtable.timings orelse return null;
+    return ask(self.impl);
+}
+
 /// The last shader log or validation message. Empty when nothing went wrong.
 pub fn diagnostics(self: *const Device) []const u8 {
     return self.log_buffer[0..self.log_len];
@@ -730,6 +743,10 @@ fn validate(self: *Device, list: []const commands.Command) Error!void {
                 _ = try self.drawable(at, in_pass, pass_samples, pipeline, bound_slots);
                 if (!index_bound) return self.refuseAt(at, "drawIndexed: no index buffer bound in this pass");
                 if (draw.index_count == 0 or draw.instance_count == 0) return self.refuseAt(at, "drawIndexed: nothing to draw");
+            },
+            .timestamp => |mark| {
+                if (in_pass) return self.refuseAt(at, "timestamp inside a pass");
+                if (mark >= types.max_timestamps) return self.refuseAt(at, "timestamp: past the last mark, 31");
             },
             .generate_mips => |h| {
                 if (in_pass) return self.refuseAt(at, "generateMips inside a pass");

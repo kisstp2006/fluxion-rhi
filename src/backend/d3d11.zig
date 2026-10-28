@@ -60,6 +60,7 @@ const backend = @import("../backend.zig");
 const commands = @import("../commands.zig");
 const Device = @import("../Device.zig");
 const readback = @import("readback.zig");
+const timing = @import("timing.zig");
 const hlsl_cache = @import("hlsl_cache.zig");
 
 const Error = backend.Error;
@@ -531,6 +532,18 @@ const IDepthStencilState = DeviceChild("{03823EFB-8D8F-4E1C-9AA2-F64BB2CBFDF1}")
 const IBlendState = DeviceChild("{75B68FAA-347D-4159-8F45-A0640F01CD9A}");
 const IRasterizerState = DeviceChild("{9BB4AB81-AB1A-4D8F-B506-FC04200B6EE7}");
 const ISamplerState = DeviceChild("{DA6FEA51-564C-4487-9810-F0D0F9B4E3A5}");
+/// `ID3D11Query`: begun, ended and asked for its answer, nothing more.
+const IQuery = DeviceChild("{D6C00747-87B7-425E-B84D-44D108560AFD}");
+
+/// `D3D11_QUERY_DESC`, and the two kinds a frame's timings use.
+const QueryDesc = extern struct { query: u32, misc_flags: u32 = 0 };
+const query_timestamp: u32 = 2;
+const query_timestamp_disjoint: u32 = 3;
+/// `D3D11_QUERY_DATA_TIMESTAMP_DISJOINT`: how fast the clock went, and
+/// whether it held steady throughout.
+const DisjointData = extern struct { frequency: u64, disjoint: i32 };
+/// `D3D11_ASYNC_GETDATA_DONOTFLUSH`: asking does not hand the GPU work.
+const getdata_do_not_flush: u32 = 1;
 const IResource = DeviceChild("{DC8E63F3-D12B-4952-B47B-5E45026A862D}");
 
 fn asResource(object: anytype) *IResource {
@@ -567,9 +580,9 @@ const IDeviceContext = extern struct {
         IASetPrimitiveTopology: *const fn (*IDeviceContext, Topology) callconv(.winapi) void,
         VSSetShaderResources: *const fn (*IDeviceContext, u32, u32, [*]const ?*IShaderResourceView) callconv(.winapi) void,
         VSSetSamplers: *const fn (*IDeviceContext, u32, u32, [*]const ?*ISamplerState) callconv(.winapi) void,
-        Begin: *const anyopaque,
-        End: *const anyopaque,
-        GetData: *const anyopaque,
+        Begin: *const fn (*IDeviceContext, *IQuery) callconv(.winapi) void,
+        End: *const fn (*IDeviceContext, *IQuery) callconv(.winapi) void,
+        GetData: *const fn (*IDeviceContext, *IQuery, ?*anyopaque, u32, u32) callconv(.winapi) Hresult,
         SetPredication: *const anyopaque,
         GSSetShaderResources: *const anyopaque,
         GSSetSamplers: *const anyopaque,
@@ -754,6 +767,12 @@ const Raw = struct {
         return com.received(IBuffer, create(self.device, &desc, if (initial == null) null else &data, &buffer), buffer);
     }
 
+    fn createQuery(self: Raw, kind: u32) d3d.Error!*IQuery {
+        const create = slot(*const fn (*d3d11.ID3D11Device, *const QueryDesc, *?*IQuery) callconv(.winapi) Hresult, self.device.vtable.CreateQuery);
+        var query: ?*IQuery = null;
+        return com.received(IQuery, create(self.device, &.{ .query = kind }, &query), query);
+    }
+
     fn createTexture2D(self: Raw, desc: Texture2DDesc) d3d.Error!*ITexture2D {
         const create = slot(*const fn (*d3d11.ID3D11Device, *const Texture2DDesc, ?*const SubresourceData, *?*ITexture2D) callconv(.winapi) Hresult, self.device.vtable.CreateTexture2D);
         var texture: ?*ITexture2D = null;
@@ -885,6 +904,13 @@ const D3d = struct {
     /// asked for it.
     resolves: [fl11.max_color_attachments]Resolve = undefined,
     resolve_count: u32 = 0,
+
+    /// The GPU's clock at each mark, a ring of frames of them, and for each
+    /// frame the query that says how fast the clock went: empty where the
+    /// device would not make them. See `timing.zig`.
+    stamps: []*IQuery = &.{},
+    disjoint: [timing.sets]?*IQuery = @splat(null),
+    timing: timing.Ring = .{},
 };
 
 /// One multisampled attachment and where its samples go. Both sides are the
@@ -1054,7 +1080,54 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         } else |_| {}
     }
 
+    makeStamps(self) catch {};
     return .{ self, &vtable };
+}
+
+/// The queries a frame's timings take, all or none: best-effort, as a
+/// device that will not make them is timed by nothing.
+fn makeStamps(self: *D3d) !void {
+    const stamps = try self.gpa.alloc(*IQuery, timing.sets * types.max_timestamps);
+    var made: usize = 0;
+    errdefer {
+        for (stamps[0..made]) |query| _ = com.release(query);
+        self.gpa.free(stamps);
+        for (&self.disjoint) |*held| if (held.*) |query| {
+            _ = com.release(query);
+            held.* = null;
+        };
+    }
+    for (stamps) |*query| {
+        query.* = try self.raw.createQuery(query_timestamp);
+        made += 1;
+    }
+    for (&self.disjoint) |*query| query.* = try self.raw.createQuery(query_timestamp_disjoint);
+    self.stamps = stamps;
+}
+
+/// The frame being recorded closed, and the newest the GPU has answered
+/// for read back, without waiting.
+fn timings(impl: backend.Impl) ?types.Timings {
+    const self = cast(impl);
+    const context = self.context;
+    if (self.timing.close()) |set| context.vtable.End(context, self.disjoint[set].?);
+    var order: [timing.sets]u32 = undefined;
+    var newest: ?types.Timings = null;
+    sets: for (self.timing.oldestFirst(&order)) |set| {
+        var clock: DisjointData = undefined;
+        if (context.vtable.GetData(context, self.disjoint[set].?, &clock, @sizeOf(DisjointData), getdata_do_not_flush) != .s_ok) break;
+        const kept = self.timing.kept[set];
+        var ticks: [types.max_timestamps]u64 = undefined;
+        for (&ticks, 0..) |*tick, i| if (kept >> @intCast(i) & 1 != 0) {
+            const query = self.stamps[timing.Ring.base(set) + i];
+            if (context.vtable.GetData(context, query, tick, @sizeOf(u64), getdata_do_not_flush) != .s_ok) break :sets;
+        };
+        self.timing.read(set);
+        // A clock that changed speed on the way says nothing true.
+        if (clock.disjoint != 0 or clock.frequency == 0) continue;
+        newest = .ofTicks(&ticks, kept, 1e9 / @as(f64, @floatFromInt(clock.frequency)));
+    }
+    return newest;
 }
 
 const vtable: backend.Vtable = .{
@@ -1080,6 +1153,7 @@ const vtable: backend.Vtable = .{
     .surfaceSize = surfaceSize,
     .present = present,
     .submit = submit,
+    .timings = timings,
 };
 
 fn cast(impl: backend.Impl) *D3d {
@@ -1094,6 +1168,11 @@ fn deinit(impl: backend.Impl) void {
     const self = cast(impl);
     self.context.vtable.ClearState(self.context);
     self.context.vtable.Flush(self.context);
+    for (self.stamps) |query| _ = com.release(query);
+    self.gpa.free(self.stamps);
+    for (self.disjoint) |held| if (held) |query| {
+        _ = com.release(query);
+    };
     for (self.range_buffers) |held| if (held) |buffer| {
         _ = com.release(buffer);
     };
@@ -1456,7 +1535,7 @@ fn caps(impl: backend.Impl) types.Caps {
         },
         // Border addressing and a bias on the level are part of the sampler
         // state at every Direct3D 11 feature level.
-        .features = .{ .sampler_border = true, .sampler_lod_bias = true },
+        .features = .{ .sampler_border = true, .sampler_lod_bias = true, .timestamps = self.stamps.len > 0 },
     };
     for (std.enums.values(types.Format)) |format| {
         answer.formats.set(format, deriveSupport(format, native_table.get(format), self.probes.get(format)));
@@ -2193,6 +2272,13 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
                 const res = as(TextureRes, device.textures.get(h).?.native);
                 // Only ever asked of a texture `createTexture` made fillable.
                 context.vtable.GenerateMips(context, res.srv orelse return error.InvalidArgument);
+            },
+            .timestamp => |mark| {
+                const at = self.timing.write(mark);
+                // A frame's clock is read only where it held steady from
+                // its first mark to its close.
+                if (at.first) context.vtable.Begin(context, self.disjoint[self.timing.at].?);
+                context.vtable.End(context, self.stamps[at.query]);
             },
             .draw_indexed => |d| {
                 flushBindings(self);
@@ -3832,4 +3918,10 @@ test "a pass draws into a surface, and a multisampled one resolves into it" {
         if (p[0] > 0 and p[0] < 255 and p[2] > 0 and p[2] < 255) blended += 1;
     }
     try testing.expect(blended > 10);
+}
+
+test "a frame's marks come back in order once the GPU is done, and only once" {
+    var device = try warpDevice();
+    defer device.deinit();
+    try timing.expectMarks(&device);
 }

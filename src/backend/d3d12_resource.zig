@@ -631,6 +631,34 @@ pub fn createCommittedResource(
     return com.received(ID3D12Resource, result, raw);
 }
 
+/// `ID3D12QueryHeap`: where a list keeps the GPU's clock - written by
+/// `EndQuery`, read by `ResolveQueryData`, nothing called on it itself.
+pub const ID3D12QueryHeap = extern struct {
+    vtable: *const ID3D12Pageable.VTable,
+
+    pub const iid = Guid.parseComptime("{0D9658AE-ED45-469E-A61D-970EC583CAB4}");
+};
+
+/// `D3D12_QUERY_HEAP_DESC`.
+pub const QueryHeapDesc = extern struct {
+    type: QueryHeapType,
+    count: u32,
+    node_mask: u32 = 0,
+};
+
+/// `D3D12_QUERY_HEAP_TYPE`, as far as it is used.
+pub const QueryHeapType = enum(u32) { occlusion = 0, timestamp = 1, _ };
+
+/// `D3D12_QUERY_TYPE`, as far as it is used.
+pub const QueryType = enum(u32) { occlusion = 0, binary_occlusion = 1, timestamp = 2, _ };
+
+pub fn createQueryHeap(device: *ID3D12Device, desc: QueryHeapDesc) Error!*ID3D12QueryHeap {
+    const create = slot(*const fn (*ID3D12Device, *const QueryHeapDesc, *const Guid, *?*anyopaque) callconv(.winapi) Hresult, device.vtable.CreateQueryHeap);
+    var raw: ?*anyopaque = null;
+    const result = create(device, &desc, com.iidOf(ID3D12QueryHeap), &raw);
+    return com.received(ID3D12QueryHeap, result, raw);
+}
+
 pub fn createFence(device: *ID3D12Device, initial_value: u64, flags: FenceFlags) Error!*ID3D12Fence {
     const create = slot(*const fn (*ID3D12Device, u64, FenceFlags, *const Guid, *?*anyopaque) callconv(.winapi) Hresult, device.vtable.CreateFence);
     var raw: ?*anyopaque = null;

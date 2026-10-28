@@ -88,6 +88,8 @@ pub const FormatInfo = types.FormatInfo;
 pub const FormatSupport = types.FormatSupport;
 pub const Limits = types.Limits;
 pub const max_texture_slots = types.max_texture_slots;
+pub const max_timestamps = types.max_timestamps;
+pub const Timings = types.Timings;
 pub const Features = types.Features;
 /// What a device can do. See `Device.caps`.
 pub const Caps = types.Caps;
@@ -149,6 +151,7 @@ test {
     _ = Device;
     _ = @import("backend/none.zig");
     _ = @import("backend/readback.zig");
+    _ = @import("backend/timing.zig");
     _ = @import("backend/hlsl_cache.zig");
     _ = @import("backend/gl.zig");
     // Against `fluxion-webgl`'s stub, on whatever machine the tests run on.

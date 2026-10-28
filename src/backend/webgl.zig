@@ -1522,6 +1522,8 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
                 gl.generateMipmap(texture.target);
                 inheritDrawn(texture);
             },
+            // No clock here: `features.timestamps` is false.
+            .timestamp => {},
             .draw_indexed => |d| {
                 const pipeline = self.pipeline orelse return error.InvalidArgument;
                 try flushBindings(self, pipeline, d.base_vertex);

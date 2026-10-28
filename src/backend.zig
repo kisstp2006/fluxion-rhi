@@ -93,6 +93,10 @@ pub const Vtable = struct {
     /// How full the card's memory is, where the driver says: null for a
     /// backend, or a driver, that does not. See `Device.memory`.
     memory: ?*const fn (Impl) ?types.Memory = null,
+    /// The frame being recorded closed, and the newest closed one the GPU
+    /// has finished handed back: see `Device.timings`. Null for a backend
+    /// without `features.timestamps`.
+    timings: ?*const fn (Impl) ?types.Timings = null,
 };
 
 /// What opening a backend gives back: its state, and its table.

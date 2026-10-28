@@ -84,6 +84,7 @@ const types = @import("../types.zig");
 const backend = @import("../backend.zig");
 const commands = @import("../commands.zig");
 const Device = @import("../Device.zig");
+const timing = @import("timing.zig");
 
 const Error = backend.Error;
 /// The backend for OpenGL - `For(false)` - or for OpenGL ES - `For(true)`:
@@ -177,6 +178,24 @@ pub fn For(comptime is_gles: bool) type {
             samplerParameterfv: ?*const fn (sampler: gt.Uint, pname: gt.Enum, params: [*]const gt.Float) callconv(.c) void = null,
 
             pub const options: opengl.loader.Options = .{ .prefix = "gl" };
+        };
+
+        /// The GPU's clock: OpenGL 3.3's own, and on ES
+        /// `GL_EXT_disjoint_timer_query`'s, under that suffix.
+        const Timers = struct {
+            queryCounter: ?*const fn (id: gt.Uint, target: gt.Enum) callconv(.c) void = null,
+            getQueryObjectui64v: ?*const fn (id: gt.Uint, pname: gt.Enum, params: *u64) callconv(.c) void = null,
+
+            pub const options: opengl.loader.Options = .{ .prefix = "gl", .suffixes = &.{"EXT"} };
+        };
+
+        /// Their names, which the tables here do not need otherwise.
+        const timer_token = struct {
+            const timestamp: gt.Enum = 0x8E28;
+            const query_result: gt.Enum = 0x8866;
+            const query_result_available: gt.Enum = 0x8867;
+            /// ES only: whether the clock changed speed since last asked.
+            const gpu_disjoint: gt.Enum = 0x8FBB;
         };
 
         /// A command of this API's table, whether that table declares it optional
@@ -711,6 +730,13 @@ pub fn For(comptime is_gles: bool) type {
             hooks: types.GlHooks,
             api: Api,
             extra: Extra = .{},
+            /// The GPU's clock at each mark, a ring of frames of them, in the
+            /// device's own context: no queries where `timers` came up short.
+            /// See `timing.zig`.
+            timers: Timers = .{},
+            stamps: [timing.sets * types.max_timestamps]gt.Uint = @splat(0),
+            timed: bool = false,
+            timing: timing.Ring = .{},
             debug: bool,
             renderer: [128]u8 = undefined,
             renderer_len: usize = 0,
@@ -1017,6 +1043,12 @@ pub fn For(comptime is_gles: bool) type {
             _ = self.api.checkError();
             self.memory_info = if (names.set().has("GL_NVX_gpu_memory_info")) .nvx else if (names.set().has("GL_ATI_meminfo")) .ati else .none;
 
+            _ = opengl.loader.tryLoad(&self.timers, Resolver{ .hooks = hooks }, Timers.options);
+            self.timed = self.timers.queryCounter != null and self.timers.getQueryObjectui64v != null and
+                (!is_gles or names.set().has("GL_EXT_disjoint_timer_query"));
+            if (self.timed) fnOf(&self.api, "genQueries")(self.stamps.len, &self.stamps);
+            self.capabilities.features.timestamps = self.timed;
+
             // Buffers bound by slot: OpenGL 4.3's, or the extension it came from,
             // where the driver has every call of it.
             if (comptime !is_gles) {
@@ -1208,7 +1240,38 @@ pub fn For(comptime is_gles: bool) type {
             .present = present,
             .submit = submit,
             .memory = memory,
+            .timings = timings,
         };
+
+        /// The frame being recorded closed, and the newest the driver has
+        /// answered for read back, without waiting. In the device's own
+        /// context, whose the queries are.
+        fn timings(impl: backend.Impl) ?types.Timings {
+            const self = cast(impl);
+            useContext(self, null);
+            const api = &self.api;
+            _ = self.timing.close();
+            var order: [timing.sets]u32 = undefined;
+            var newest: ?types.Timings = null;
+            sets: for (self.timing.oldestFirst(&order)) |set| {
+                const kept = self.timing.kept[set];
+                for (0..types.max_timestamps) |i| if (kept >> @intCast(i) & 1 != 0) {
+                    var available: [1]gt.Uint = .{0};
+                    fnOf(api, "getQueryObjectuiv")(self.stamps[timing.Ring.base(set) + i], timer_token.query_result_available, &available);
+                    if (available[0] == 0) break :sets;
+                };
+                self.timing.read(set);
+                // A clock that changed speed since last asked says nothing
+                // true about the frames on the way.
+                if (is_gles and integer(api, timer_token.gpu_disjoint) != 0) continue;
+                var ticks: [types.max_timestamps]u64 = undefined;
+                for (&ticks, 0..) |*tick, i| if (kept >> @intCast(i) & 1 != 0) {
+                    self.timers.getQueryObjectui64v.?(self.stamps[timing.Ring.base(set) + i], timer_token.query_result, tick);
+                };
+                newest = .ofTicks(&ticks, kept, 1);
+            }
+            return newest;
+        }
 
         fn cast(impl: backend.Impl) *Gl {
             return @ptrCast(@alignCast(impl));
@@ -1220,6 +1283,7 @@ pub fn For(comptime is_gles: bool) type {
 
         fn deinit(impl: backend.Impl) void {
             const self = cast(impl);
+            if (self.timed) fnOf(&self.api, "deleteQueries")(self.stamps.len, &self.stamps);
             for (&self.framebuffers) |*entry| forgetFramebuffer(self, entry);
             // `Device` has destroyed every surface.
             self.others.deinit(self.gpa);
@@ -2132,6 +2196,11 @@ pub fn For(comptime is_gles: bool) type {
                         api.bindTexture(texture.target, texture.name);
                         api.generateMipmap(texture.target);
                         inheritDrawn(texture);
+                    },
+                    // The queries are the device's own context's: another
+                    // window's marks nothing.
+                    .timestamp => |mark| if (self.timed and self.current == null) {
+                        self.timers.queryCounter.?(self.stamps[self.timing.write(mark).query], timer_token.timestamp);
                     },
                     .draw_indexed => |d| {
                         const pipeline = self.pipeline orelse return error.InvalidArgument;
