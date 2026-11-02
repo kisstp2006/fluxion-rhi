@@ -347,6 +347,7 @@ const D3d = struct {
     /// its pipeline for each format it has filled.
     mip_shader: ?MipShader = null,
     mip_pipelines: std.EnumArray(types.Format, ?*pl.ID3D12PipelineState) = .initFill(null),
+    layered_mip_pipelines: std.EnumArray(types.Format, ?*pl.ID3D12PipelineState) = .initFill(null),
 
     /// The shader-visible rings the root descriptor tables point into; see
     /// the module comment. `*_used` is how far into its slot's part of each
@@ -496,6 +497,14 @@ const TextureRes = struct {
     /// is of its first slice; a pass into another makes one of its own.
     depth: u32 = 1,
     volume: bool = false,
+    /// Layers of a picture: `depth` of them. Its render target view is of its
+    /// first layer, as a volume's is of its first slice.
+    arrayed: bool = false,
+
+    /// Which subresource level `mip` of layer `layer` is.
+    fn subresourceOf(self: *const TextureRes, mip: u32, layer: u32) u32 {
+        return mip + (if (self.arrayed) layer else 0) * self.mip_levels;
+    }
 
     /// How big level `mip` is, across and down.
     fn levelSize(self: *const TextureRes, mip: u32) [2]u32 {
@@ -508,7 +517,7 @@ const TextureRes = struct {
 const sampled: rc.ResourceStates = .{ .pixel_shader_resource = true, .non_pixel_shader_resource = true };
 
 /// The bytecode of the shader every level of a chain is drawn with.
-const MipShader = struct { vertex: []u8, pixel: []u8 };
+const MipShader = struct { vertex: []u8, pixel: []u8, layered: []u8 };
 
 /// A triangle over the whole target, and the level above read at the middle
 /// of each of its pixels: between four texels of the level above, which a
@@ -527,6 +536,13 @@ const mip_pixel =
     \\Texture2D above : register(t0);
     \\SamplerState linear_clamp : register(s0);
     \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET { return above.SampleLevel(linear_clamp, uv, 0); }
+;
+
+/// The same for a layer, whose view begins at it.
+const layered_mip_pixel =
+    \\Texture2DArray above : register(t0);
+    \\SamplerState linear_clamp : register(s0);
+    \\float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET { return above.SampleLevel(linear_clamp, float3(uv, 0.0), 0); }
 ;
 
 const SamplerRes = struct {
@@ -796,9 +812,13 @@ fn deinit(impl: backend.Impl) void {
     for (self.mip_pipelines.values) |held| if (held) |pso| {
         _ = com.release(pso);
     };
+    for (self.layered_mip_pipelines.values) |held| if (held) |pso| {
+        _ = com.release(pso);
+    };
     if (self.mip_shader) |shader| {
         self.gpa.free(shader.vertex);
         self.gpa.free(shader.pixel);
+        self.gpa.free(shader.layered);
     }
     if (self.compiler) |*c| c.unload();
     if (self.query_heap) |heap| _ = com.release(heap);
@@ -909,7 +929,9 @@ fn caps(impl: backend.Impl) types.Caps {
     };
     var flat = std.EnumSet(types.Dimension).empty;
     flat.insert(.d2);
-    var volumes = flat;
+    var layered = flat;
+    layered.insert(.d2_array);
+    var volumes = layered;
     volumes.insert(.d3);
     for (offered) |format| {
         const native = textureFormat(format).?;
@@ -936,8 +958,8 @@ fn caps(impl: backend.Impl) types.Caps {
             // Each level drawn from the one above, filtered.
             .generate_mips = !depth and drawn and bits & support_shader_sample != 0,
             .sample_counts = counts,
-            // A colour one as a volume too, where the device makes one.
-            .dimensions = if (!depth and bits & support_texture3d != 0) volumes else flat,
+            // A colour one in layers too, and as a volume where the device makes one.
+            .dimensions = if (depth) flat else if (bits & support_texture3d != 0) volumes else layered,
         });
     }
     for (compressed) |format| {
@@ -1367,8 +1389,9 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     // `Device` has already checked `caps`, so this is defence in depth: a
     // shape or a format outside what `caps` claims never reaches here.
     const volume = desc.dimension == .d3;
-    if (desc.dimension != .d2 and !volume) return error.Unsupported;
-    if (volume and (desc.format.isDepth() or desc.samples > 1)) return error.Unsupported;
+    const arrayed = desc.dimension == .d2_array;
+    if (desc.dimension != .d2 and !volume and !arrayed) return error.Unsupported;
+    if ((volume or arrayed) and (desc.format.isDepth() or desc.samples > 1)) return error.Unsupported;
     const format = textureFormat(desc.format) orelse return error.Unsupported;
     // A chain of levels; not of depth, which nothing here fills.
     const levels = desc.mip_levels;
@@ -1425,6 +1448,8 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
     const drawn = target or (levels > 1 and bits & support_render_target != 0 and bits & support_shader_sample != 0);
     var rdesc = if (volume)
         rc.ResourceDesc.texture3d(desc.width, desc.height, @intCast(desc.depth_or_layers), format, .{ .allow_render_target = drawn })
+    else if (arrayed)
+        rc.ResourceDesc.texture2dArray(desc.width, desc.height, @intCast(desc.depth_or_layers), format, .{ .allow_render_target = drawn })
     else
         rc.ResourceDesc.texture2d(desc.width, desc.height, format, .{ .allow_render_target = drawn });
     rdesc.sample = .{ .count = desc.samples };
@@ -1445,23 +1470,33 @@ fn createTexture(impl: backend.Impl, desc: types.TextureDesc) Error!backend.Nati
             .dimension = .texture3d,
             .u = .{ .texture3d = .{ .mip_levels = levels } },
         }, cpu);
+    } else if (arrayed) {
+        rc.createShaderResourceView(self.device, obj, &.{
+            .format = format,
+            .dimension = .texture2d_array,
+            .u = .{ .texture2d_array = .{ .mip_levels = levels, .array_size = desc.depth_or_layers } },
+        }, cpu);
     } else rc.createShaderResourceView(self.device, if (desc.samples == 1) obj else null, &.{
         .format = if (desc.samples == 1) format else .r8g8b8a8_unorm,
         .dimension = .texture2d,
         .u = .{ .texture2d = .{ .mip_levels = levels } },
     }, cpu);
 
-    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu, .state = rest, .rest = rest, .samples = desc.samples, .mip_levels = levels, .depth = if (volume) desc.depth_or_layers else 1, .volume = volume };
+    res.* = .{ .resource = obj, .width = desc.width, .height = desc.height, .format = desc.format, .srv_index = slot, .srv_cpu = cpu, .state = rest, .rest = rest, .samples = desc.samples, .mip_levels = levels, .depth = if (volume or arrayed) desc.depth_or_layers else 1, .volume = volume, .arrayed = arrayed };
     if (target) {
         const rtv = try allocRtv(self);
         res.rtv_index = rtv;
         res.rtv_cpu = rtvHandle(self, rtv);
-        // A volume's first slice; a pass names another through a view of
-        // its own.
+        // A volume's first slice, or a first layer; a pass names another
+        // through a view of its own.
         rc.createRenderTargetView(self.device, obj, if (volume) &.{
             .format = format,
             .dimension = .texture3d,
             .u = .{ .texture3d = .{} },
+        } else if (arrayed) &.{
+            .format = format,
+            .dimension = .texture2d_array,
+            .u = .{ .texture2d_array = .{} },
         } else null, res.rtv_cpu);
     }
     errdefer if (res.rtv_index) |rtv| freeRtv(self, rtv);
@@ -1517,9 +1552,10 @@ fn transferBuffer(self: *D3d, heap: rc.HeapType, size: u64) Error!*rc.ID3D12Reso
 fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.TextureRegion, bytes: []const u8, row_pitch: usize, slice_pitch: usize) Error!void {
     const self = cast(impl);
     const res = as(TextureRes, native);
-    // A volume's box is slices of it, one after another in the buffer.
-    const slices: u32 = if (res.volume) @max(region.depth, 1) else 1;
-    const footprint = footprintDeep(res, region.width, region.height, slices);
+    // A volume's box is slices of it, and layers are, one after another in
+    // the buffer: a volume's copied at once, layers one at a time.
+    const slices: u32 = if (res.volume or res.arrayed) @max(region.depth, 1) else 1;
+    const footprint = footprintDeep(res, region.width, region.height, if (res.arrayed) 1 else slices);
     const row_bytes = res.format.rowBytes(region.width);
     // Rows of texels, or of blocks for a compressed format.
     const rows = res.format.rowCount(region.height);
@@ -1541,9 +1577,20 @@ fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Textur
     if (!self.recording) try beginRecording(self);
     errdefer abandonRecording(self);
     transition(self, res, .{ .copy_dest = true });
-    const dst_loc = cmdmod.TextureCopyLocation.subresource(res.resource, region.mip);
-    const src_loc = cmdmod.TextureCopyLocation.placed(staging, footprint);
-    self.list.vtable.CopyTextureRegion(self.list, &dst_loc, region.x, region.y, if (res.volume) region.z else 0, &src_loc, null);
+    if (res.arrayed) {
+        for (0..slices) |at| {
+            const layer = region.z + @as(u32, @intCast(at));
+            const dst_loc = cmdmod.TextureCopyLocation.subresource(res.resource, res.subresourceOf(region.mip, layer));
+            var one = footprint;
+            one.offset = at * slice_bytes;
+            const src_loc = cmdmod.TextureCopyLocation.placed(staging, one);
+            self.list.vtable.CopyTextureRegion(self.list, &dst_loc, region.x, region.y, 0, &src_loc, null);
+        }
+    } else {
+        const dst_loc = cmdmod.TextureCopyLocation.subresource(res.resource, region.mip);
+        const src_loc = cmdmod.TextureCopyLocation.placed(staging, footprint);
+        self.list.vtable.CopyTextureRegion(self.list, &dst_loc, region.x, region.y, if (res.volume) region.z else 0, &src_loc, null);
+    }
     transition(self, res, res.rest);
     // Read by the copy when the list runs: released once it has.
     bury(self, .{ .resource = staging });
@@ -1568,7 +1615,7 @@ fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subresourc
     errdefer abandonRecording(self);
     transition(self, res, .{ .copy_source = true });
     const dst_loc = cmdmod.TextureCopyLocation.placed(landing, footprint);
-    const src_loc = cmdmod.TextureCopyLocation.subresource(res.resource, sub.mip);
+    const src_loc = cmdmod.TextureCopyLocation.subresource(res.resource, res.subresourceOf(sub.mip, sub.layer));
     // A volume's slice: one deep of the level.
     const slice: cmdmod.Box = .{ .left = 0, .right = level[0], .bottom = level[1], .front = sub.layer, .back = sub.layer + 1 };
     self.list.vtable.CopyTextureRegion(self.list, &dst_loc, 0, 0, 0, &src_loc, if (res.volume) &slice else null);
@@ -2042,7 +2089,15 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
                         // A level below the first through a view of its own,
                         // and so a volume's slice other than its first.
                         const level = res.levelSize(color.mip_level);
-                        const rtv = if (res.volume) blk: {
+                        const rtv = if (res.arrayed) blk: {
+                            if (color.mip_level == 0 and color.layer == 0) break :blk res.rtv_cpu;
+                            rc.createRenderTargetView(self.device, res.resource, &.{
+                                .format = textureFormat(res.format).?,
+                                .dimension = .texture2d_array,
+                                .u = .{ .texture2d_array = .{ .mip_slice = color.mip_level, .first_array_slice = color.layer } },
+                            }, self.pass_rtv);
+                            break :blk self.pass_rtv;
+                        } else if (res.volume) blk: {
                             if (color.mip_level == 0 and color.layer == 0) break :blk res.rtv_cpu;
                             rc.createRenderTargetView(self.device, res.resource, &.{
                                 .format = textureFormat(res.format).?,
@@ -2192,7 +2247,7 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
 fn generateMips(self: *D3d, res: *TextureRes) Error!void {
     // A level is drawn from the one above as a picture: a volume's are not.
     if (res.volume) return error.Unsupported;
-    const pso = try mipPipelineOf(self, res.format);
+    const pso = try mipPipelineOf(self, res.format, res.arrayed);
     const list = self.list;
     const format = textureFormat(res.format).?;
     transition(self, res, sampled);
@@ -2200,20 +2255,34 @@ fn generateMips(self: *D3d, res: *TextureRes) Error!void {
     list.vtable.IASetPrimitiveTopology(list, .triangle_list);
     const textures = self.textures;
     const samplers = self.samplers;
-    for (1..res.mip_levels) |level| {
+    for (0..if (res.arrayed) res.depth else 1) |at| for (1..res.mip_levels) |level| {
+        const layer: u32 = @intCast(at);
         const mip: u32 = @intCast(level);
         const size = res.levelSize(mip);
-        rc.createShaderResourceView(self.device, res.resource, &.{
-            .format = format,
-            .dimension = .texture2d,
-            .u = .{ .texture2d = .{ .most_detailed_mip = mip - 1, .mip_levels = 1 } },
-        }, self.scratch_srv);
-        rc.createRenderTargetView(self.device, res.resource, &.{
-            .format = format,
-            .dimension = .texture2d,
-            .u = .{ .texture2d = .{ .mip_slice = mip } },
-        }, self.mip_rtv);
-        levelBarrier(self, res, mip, sampled, .{ .render_target = true });
+        if (res.arrayed) {
+            rc.createShaderResourceView(self.device, res.resource, &.{
+                .format = format,
+                .dimension = .texture2d_array,
+                .u = .{ .texture2d_array = .{ .most_detailed_mip = mip - 1, .mip_levels = 1, .first_array_slice = layer } },
+            }, self.scratch_srv);
+            rc.createRenderTargetView(self.device, res.resource, &.{
+                .format = format,
+                .dimension = .texture2d_array,
+                .u = .{ .texture2d_array = .{ .mip_slice = mip, .first_array_slice = layer } },
+            }, self.mip_rtv);
+        } else {
+            rc.createShaderResourceView(self.device, res.resource, &.{
+                .format = format,
+                .dimension = .texture2d,
+                .u = .{ .texture2d = .{ .most_detailed_mip = mip - 1, .mip_levels = 1 } },
+            }, self.scratch_srv);
+            rc.createRenderTargetView(self.device, res.resource, &.{
+                .format = format,
+                .dimension = .texture2d,
+                .u = .{ .texture2d = .{ .mip_slice = mip } },
+            }, self.mip_rtv);
+        }
+        levelBarrier(self, res, res.subresourceOf(mip, layer), sampled, .{ .render_target = true });
         list.vtable.OMSetRenderTargets(list, 1, @ptrCast(&self.mip_rtv), 0, null);
         list.vtable.RSSetViewports(list, 1, &[_]cmdmod.Viewport{.{ .width = @floatFromInt(size[0]), .height = @floatFromInt(size[1]) }});
         list.vtable.RSSetScissorRects(list, 1, &[_]cmdmod.Rect{.{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) }});
@@ -2225,8 +2294,8 @@ fn generateMips(self: *D3d, res: *TextureRes) Error!void {
         // write the same slot.
         try prepareDraw(self);
         list.vtable.DrawInstanced(list, 3, 1, 0, 0);
-        levelBarrier(self, res, mip, .{ .render_target = true }, sampled);
-    }
+        levelBarrier(self, res, res.subresourceOf(mip, layer), .{ .render_target = true }, sampled);
+    };
     self.textures = textures;
     self.samplers = samplers;
     self.textures_dirty = true;
@@ -2237,20 +2306,20 @@ fn generateMips(self: *D3d, res: *TextureRes) Error!void {
     }
 }
 
-/// One level of a texture from one state to another; the texture as a whole
-/// is kept in `res.state`, which every level is back in afterwards.
-fn levelBarrier(self: *D3d, res: *TextureRes, mip: u32, before: rc.ResourceStates, after: rc.ResourceStates) void {
+/// One subresource of a texture from one state to another; the texture as a
+/// whole is kept in `res.state`, which every level is back in afterwards.
+fn levelBarrier(self: *D3d, res: *TextureRes, subresource: u32, before: rc.ResourceStates, after: rc.ResourceStates) void {
     const barrier: cmdmod.ResourceBarrier = .{
         .type = .transition,
-        .u = .{ .transition = .{ .resource = res.resource, .subresource = mip, .state_before = before, .state_after = after } },
+        .u = .{ .transition = .{ .resource = res.resource, .subresource = subresource, .state_before = before, .state_after = after } },
     };
     self.list.vtable.ResourceBarrier(self.list, 1, &[_]cmdmod.ResourceBarrier{barrier});
 }
 
 /// The pipeline that draws a level of `format` from the one above: its
 /// shader compiled the first time, the pipeline made once for each format.
-fn mipPipelineOf(self: *D3d, format: types.Format) Error!*pl.ID3D12PipelineState {
-    if (self.mip_pipelines.get(format)) |held| return held;
+fn mipPipelineOf(self: *D3d, format: types.Format, arrayed: bool) Error!*pl.ID3D12PipelineState {
+    if ((if (arrayed) self.layered_mip_pipelines else self.mip_pipelines).get(format)) |held| return held;
     if (self.mip_shader == null) {
         var discard: Io.Writer.Discarding = .init(&.{});
         const compiler = try compilerOf(self, &discard.writer);
@@ -2258,9 +2327,13 @@ fn mipPipelineOf(self: *D3d, format: types.Format) Error!*pl.ID3D12PipelineState
         defer _ = com.release(vs_blob);
         const ps_blob = try compileStage(compiler, mip_pixel, "ps_5_0", &discard.writer);
         defer _ = com.release(ps_blob);
+        const layered_blob = try compileStage(compiler, layered_mip_pixel, "ps_5_0", &discard.writer);
+        defer _ = com.release(layered_blob);
         const vertex = try self.gpa.dupe(u8, vs_blob.bytes());
         errdefer self.gpa.free(vertex);
-        self.mip_shader = .{ .vertex = vertex, .pixel = try self.gpa.dupe(u8, ps_blob.bytes()) };
+        const pixel = try self.gpa.dupe(u8, ps_blob.bytes());
+        errdefer self.gpa.free(pixel);
+        self.mip_shader = .{ .vertex = vertex, .pixel = pixel, .layered = try self.gpa.dupe(u8, layered_blob.bytes()) };
     }
     const shader = self.mip_shader.?;
     var blend: pl.BlendDesc = .{};
@@ -2270,7 +2343,7 @@ fn mipPipelineOf(self: *D3d, format: types.Format) Error!*pl.ID3D12PipelineState
     const pso = pl.createGraphicsPipelineState(self.device, &.{
         .root_signature = self.root_signature,
         .vs = .of(shader.vertex),
-        .ps = .of(shader.pixel),
+        .ps = .of(if (arrayed) shader.layered else shader.pixel),
         .blend_state = blend,
         .rasterizer_state = .{ .cull_mode = .none },
         .depth_stencil_state = .{ .depth_enable = 0, .depth_write_mask = .zero },
@@ -2281,7 +2354,7 @@ fn mipPipelineOf(self: *D3d, format: types.Format) Error!*pl.ID3D12PipelineState
         .dsv_format = .unknown,
         .sample = .{ .count = 1 },
     }) catch return error.Failed;
-    self.mip_pipelines.set(format, pso);
+    if (arrayed) self.layered_mip_pipelines.set(format, pso) else self.mip_pipelines.set(format, pso);
     return pso;
 }
 
@@ -2893,6 +2966,40 @@ test "what is not here yet comes back as error.Unsupported" {
     try testing.expectError(error.Unsupported, device.createTexture(.{ .dimension = .d3, .format = .depth32_float, .width = 4, .height = 4, .depth_or_layers = 4 }));
     // A compressed texture's level zero is whole blocks.
     try testing.expectError(error.Unsupported, device.createTexture(.{ .width = 6, .height = 6, .format = .bc1_rgba_unorm }));
+}
+
+test "layers are written and read one at a time, a pass into one leaves the others be, and each has its levels" {
+    var device = try warpDevice();
+    defer device.deinit();
+    const palette = [_][4]u8{ .{ 255, 0, 0, 255 }, .{ 0, 255, 0, 255 }, .{ 0, 0, 255, 255 }, .{ 255, 255, 0, 255 } };
+    try testing.expect(device.caps().formatSupport(.rgba8_unorm).dimensions.contains(.d2_array));
+
+    var initial: [3 * 4 * 4 * 4]u8 = undefined;
+    for (0..3) |z| _ = solidLevel(initial[z * 64 ..][0..64], palette[z]);
+    const layers = try device.createTexture(.{ .dimension = .d2_array, .width = 4, .height = 4, .depth_or_layers = 3, .mip_levels = 3, .data = &initial, .usage = .{ .sampled = true, .render_target = true } });
+    defer device.destroyTexture(layers);
+    for (0..3) |z| {
+        const pixels = try device.readSubresource(layers, .{ .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolidLevel(pixels, palette[z]);
+    }
+
+    // Layer one cleared blue by a pass; the rest as they were.
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = layers }, .layer = 1, .clear_color = .{ 0, 0, 1, 1 } } });
+    try cmd.endPass();
+    try cmd.generateMips(layers);
+    try device.submit();
+    for (0..3) |z| {
+        const want = if (z == 1) palette[2] else palette[z];
+        const pixels = try device.readSubresource(layers, .{ .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolidLevel(pixels, want);
+        const smallest = try device.readSubresource(layers, .{ .mip = 2, .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(smallest);
+        try testing.expectEqual(@as(usize, 4), smallest.len);
+        try expectSolidLevel(smallest, want);
+    }
 }
 
 test "a volume is slices: written and read a slice at a time, and a pass into one slice leaves the others be" {

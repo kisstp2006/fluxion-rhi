@@ -285,12 +285,16 @@ pub const TextureRes = struct {
     view: vk.gen.types.ImageView,
     width: u32,
     height: u32,
-    /// Slices of a volume; one for a picture.
+    /// Slices of a volume, or layers of a picture; one for a picture alone.
     depth: u32 = 1,
     /// A volume: a 3D image, read through a 3D view, each of its first
     /// level's slices drawn into through a 2D view of its own - in
     /// `level_views` and `level_framebuffers`, a slice each.
     volume: bool = false,
+    /// Layers of a picture: a 2D image of `depth` layers, read through an
+    /// arrayed view, each of its first level's layers drawn into through a 2D
+    /// view of its own, as a volume's slices are.
+    arrayed: bool = false,
     format: types.Format,
     vk_format: vk.gen.types.Format,
     /// For a texture made to be drawn into: the framebuffer a pass begins.
@@ -328,15 +332,20 @@ pub const TextureRes = struct {
         return .{ types.mipExtent(self.width, mip), types.mipExtent(self.height, mip) };
     }
 
+    /// How many layers its image has.
+    fn layers(self: *const TextureRes) u32 {
+        return if (self.arrayed) self.depth else 1;
+    }
+
     /// How many slices level `mip` of a volume has.
     pub fn levelDepth(self: *const TextureRes, mip: u32) u32 {
         return if (self.volume) types.mipExtent(self.depth, mip) else 1;
     }
 
-    /// The view and the framebuffer a pass into level `mip` - slice `layer`
-    /// of a volume, of its first level - draws through.
+    /// The view and the framebuffer a pass into level `mip` - slice or layer
+    /// `layer` of a volume or layers, of its first level - draws through.
     pub fn target(self: *const TextureRes, mip: u32, layer: u32) ?struct { view: vk.gen.types.ImageView, framebuffer: vk.gen.types.Framebuffer } {
-        if (self.volume) {
+        if (self.volume or self.arrayed) {
             if (mip != 0 or layer >= self.level_framebuffers.len) return null;
             return .{ .view = self.level_views[layer], .framebuffer = self.level_framebuffers[layer] };
         }
@@ -366,6 +375,9 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     // view of it: `VK_KHR_maintenance1`'s, which the device has.
     const volume = desc.dimension == .d3;
     if (volume and (desc.format.isDepth() or samples > 1)) return error.Unsupported;
+    const arrayed = desc.dimension == .d2_array;
+    if (arrayed and (desc.format.isDepth() or samples > 1)) return error.Unsupported;
+    const layers: u32 = if (arrayed) desc.depth_or_layers else 1;
     var image: vk.gen.types.Image = .none;
     _ = vkd.createImage(self.runtime.device, &.{
         .flags = .{ .x2d_array_compatible = volume and desc.usage.render_target },
@@ -373,7 +385,7 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
         .format = vk_format,
         .extent = .{ .width = desc.width, .height = desc.height, .depth = if (volume) desc.depth_or_layers else 1 },
         .mip_levels = levels,
-        .array_layers = 1,
+        .array_layers = layers,
         .samples = swapchain.sampleFlags(samples),
         .tiling = .optimal,
         // A depth texture is drawn into, and kept for the passes that load
@@ -409,9 +421,9 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
 
     const res = try self.gpa.create(TextureRes);
     errdefer self.gpa.destroy(res);
-    res.* = .{ .image = image, .memory = memory, .view = .none, .width = desc.width, .height = desc.height, .depth = if (volume) desc.depth_or_layers else 1, .volume = volume, .format = desc.format, .vk_format = vk_format, .samples = samples, .sampled_depth = desc.format.isDepth() and desc.usage.sampled, .mip_levels = levels };
+    res.* = .{ .image = image, .memory = memory, .view = .none, .width = desc.width, .height = desc.height, .depth = if (volume or arrayed) desc.depth_or_layers else 1, .arrayed = arrayed, .volume = volume, .format = desc.format, .vk_format = vk_format, .samples = samples, .sampled_depth = desc.format.isDepth() and desc.usage.sampled, .mip_levels = levels };
 
-    res.view = try imageViewOf(self, image, if (volume) .@"3d" else .@"2d", vk_format, rangeOf(res.aspect(), 0, levels));
+    res.view = try imageViewOf(self, image, if (volume) .@"3d" else if (arrayed) .@"2d_array" else .@"2d", vk_format, rangeAcross(res.aspect(), 0, levels, layers));
     errdefer vkd.destroyImageView(self.runtime.device, res.view, null);
     const view = res.view;
 
@@ -451,7 +463,7 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     // draws into it leaves it.
     if (samples > 1) {
         try vulkan.ensureRecording(self);
-        barrier(self, image, 0, 1, .undefined, .color_attachment_optimal, .{}, .{ .color_attachment_write = true }, .{ .top_of_pipe = true }, .{ .color_attachment_output = true });
+        barrier(self, image, 1, 0, 1, .undefined, .color_attachment_optimal, .{}, .{ .color_attachment_write = true }, .{ .top_of_pipe = true }, .{ .color_attachment_output = true });
         self.has_work = true;
         return res;
     }
@@ -461,9 +473,9 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     errdefer freeTargets(self, res);
     if (desc.usage.render_target) {
         const render_pass = try swapchain.getRenderPass(self, vk_format, .clear, .undefined, .shader_read_only_optimal, .none, 1, null);
-        if (volume) {
-            // A slice of the first level each: a 2D view of it, and its
-            // framebuffer.
+        if (volume or arrayed) {
+            // A slice or layer of the first level each: a 2D view of it, and
+            // its framebuffer.
             res.level_views = try self.gpa.alloc(vk.gen.types.ImageView, res.depth);
             @memset(res.level_views, .none);
             res.level_framebuffers = try self.gpa.alloc(vk.gen.types.Framebuffer, res.depth);
@@ -490,7 +502,7 @@ pub fn createTexture(impl: backend.Impl, desc: types.TextureDesc) types.Error!ba
     // Every level into the layout it is sampled in, then level zero's
     // texels if it was given any.
     try vulkan.ensureRecording(self);
-    barrier(self, image, 0, levels, .undefined, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .top_of_pipe = true }, .{ .fragment_shader = true });
+    barrier(self, image, layers, 0, levels, .undefined, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .top_of_pipe = true }, .{ .fragment_shader = true });
     self.has_work = true;
     if (desc.data) |data| {
         try write(self, res, .{ .width = desc.width, .height = desc.height, .depth = res.depth }, data, desc.effectiveRowPitch(), desc.effectiveRowPitch() * desc.format.rowCount(desc.height));
@@ -542,16 +554,22 @@ fn freeTargets(self: *Vk, res: *TextureRes) void {
     res.level_views = &.{};
 }
 
-/// `count` levels from `base`, of the one layer every texture here has.
+/// `count` levels from `base`, of the one layer a texture but layers has.
 fn rangeOf(aspect: vk.gen.types.ImageAspectFlags, base: u32, count: u32) vk.gen.types.ImageSubresourceRange {
-    return .{ .aspect_mask = aspect, .base_mip_level = base, .level_count = count, .base_array_layer = 0, .layer_count = 1 };
+    return rangeAcross(aspect, base, count, 1);
 }
 
-/// One layout barrier on `count` colour levels from `base`, recorded into
-/// the backend's command buffer.
+/// `count` levels from `base`, of `layers` layers.
+fn rangeAcross(aspect: vk.gen.types.ImageAspectFlags, base: u32, count: u32, layers: u32) vk.gen.types.ImageSubresourceRange {
+    return .{ .aspect_mask = aspect, .base_mip_level = base, .level_count = count, .base_array_layer = 0, .layer_count = layers };
+}
+
+/// One layout barrier on `count` colour levels from `base`, of `layers` layers,
+/// recorded into the backend's command buffer.
 fn barrier(
     self: *Vk,
     image: vk.gen.types.Image,
+    layers: u32,
     base: u32,
     count: u32,
     old: vk.gen.types.ImageLayout,
@@ -561,7 +579,7 @@ fn barrier(
     src_stage: vk.gen.types.PipelineStageFlags,
     dst_stage: vk.gen.types.PipelineStageFlags,
 ) void {
-    barrierOf(self, image, rangeOf(.{ .color = true }, base, count), old, new, src_access, dst_access, src_stage, dst_stage);
+    barrierOf(self, image, rangeAcross(.{ .color = true }, base, count, layers), old, new, src_access, dst_access, src_stage, dst_stage);
 }
 
 fn barrierOf(
@@ -610,7 +628,7 @@ pub fn writeTexture(impl: backend.Impl, native: backend.Native, region: types.Te
 /// A box of one level - of a volume, a slice of it after another, each
 /// `slice_pitch` bytes on in `bytes` - copied onto the texture.
 fn write(self: *Vk, res: *TextureRes, region: types.TextureRegion, bytes: []const u8, row_pitch: usize, slice_pitch: usize) types.Error!void {
-    if (!res.volume) return writeSlice(self, res, region, 0, bytes, row_pitch);
+    if (!res.volume and !res.arrayed) return writeSlice(self, res, region, 0, bytes, row_pitch);
     for (0..@max(region.depth, 1)) |slice| {
         try writeSlice(self, res, region, region.z + @as(u32, @intCast(slice)), bytes[slice * slice_pitch ..], row_pitch);
     }
@@ -638,17 +656,17 @@ fn writeSlice(self: *Vk, res: *TextureRes, region: types.TextureRegion, z: u32, 
         for (0..rows) |y| @memcpy(staging.mapped.?[y * row_bytes ..][0..row_bytes], bytes[(@as(usize, first) + y) * row_pitch ..][0..row_bytes]);
 
         const top = first * block_height;
-        barrier(self, res.image, region.mip, 1, .shader_read_only_optimal, .transfer_dst_optimal, .{}, .{ .transfer_write = true }, .{ .fragment_shader = true, .color_attachment_output = true }, .{ .transfer = true });
+        barrier(self, res.image, res.layers(), region.mip, 1, .shader_read_only_optimal, .transfer_dst_optimal, .{}, .{ .transfer_write = true }, .{ .fragment_shader = true, .color_attachment_output = true }, .{ .transfer = true });
         const copy = [_]vk.gen.types.BufferImageCopy{.{
             .buffer_offset = 0,
             .buffer_row_length = 0,
             .buffer_image_height = 0,
-            .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = region.mip, .base_array_layer = 0, .layer_count = 1 },
-            .image_offset = .{ .x = @intCast(region.x), .y = @intCast(region.y + top), .z = @intCast(z) },
+            .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = region.mip, .base_array_layer = if (res.arrayed) z else 0, .layer_count = 1 },
+            .image_offset = .{ .x = @intCast(region.x), .y = @intCast(region.y + top), .z = if (res.arrayed) 0 else @intCast(z) },
             .image_extent = .{ .width = region.width, .height = @min(rows * block_height, region.height - top), .depth = 1 },
         }};
         self.runtime.vkd.cmdCopyBufferToImage(self.command_buffer, staging.buffer, res.image, .transfer_dst_optimal, copy.len, &copy);
-        barrier(self, res.image, region.mip, 1, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
+        barrier(self, res.image, res.layers(), region.mip, 1, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
         self.has_work = true;
         self.upload_bytes += size;
         // Read by the copy when this batch runs; freed by its fence.
@@ -673,18 +691,18 @@ pub fn readTexture(impl: backend.Impl, native: backend.Native, sub: types.Subres
     defer freeVersion(self, readback);
 
     try vulkan.ensureRecording(self);
-    barrier(self, res.image, sub.mip, 1, .shader_read_only_optimal, .transfer_src_optimal, .{ .color_attachment_write = true, .transfer_write = true }, .{ .transfer_read = true }, .{ .color_attachment_output = true, .fragment_shader = true, .transfer = true }, .{ .transfer = true });
+    barrier(self, res.image, res.layers(), sub.mip, 1, .shader_read_only_optimal, .transfer_src_optimal, .{ .color_attachment_write = true, .transfer_write = true }, .{ .transfer_read = true }, .{ .color_attachment_output = true, .fragment_shader = true, .transfer = true }, .{ .transfer = true });
     const copy = [_]vk.gen.types.BufferImageCopy{.{
         .buffer_offset = 0,
         .buffer_row_length = 0,
         .buffer_image_height = 0,
-        .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = sub.mip, .base_array_layer = 0, .layer_count = 1 },
+        .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = sub.mip, .base_array_layer = if (res.arrayed) sub.layer else 0, .layer_count = 1 },
         // A volume's slice is a depth into its one image.
         .image_offset = .{ .x = 0, .y = 0, .z = @intCast(if (res.volume) sub.layer else 0) },
         .image_extent = .{ .width = size[0], .height = size[1], .depth = 1 },
     }};
     self.runtime.vkd.cmdCopyImageToBuffer(self.command_buffer, res.image, .transfer_src_optimal, readback.buffer, copy.len, &copy);
-    barrier(self, res.image, sub.mip, 1, .transfer_src_optimal, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
+    barrier(self, res.image, res.layers(), sub.mip, 1, .transfer_src_optimal, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
     const to_host = [_]vk.gen.types.BufferMemoryBarrier{.{
         .src_access_mask = .{ .transfer_write = true },
         .dst_access_mask = .{ .host_read = true },
@@ -715,20 +733,20 @@ pub fn generateMips(self: *Vk, res: *TextureRes) void {
     const any_stage: vk.gen.types.PipelineStageFlags = .{ .color_attachment_output = true, .fragment_shader = true, .transfer = true };
     for (1..res.mip_levels) |level| {
         const mip: u32 = @intCast(level);
-        barrier(self, res.image, mip - 1, 1, .shader_read_only_optimal, .transfer_src_optimal, drawn, .{ .transfer_read = true }, any_stage, .{ .transfer = true });
-        barrier(self, res.image, mip, 1, .shader_read_only_optimal, .transfer_dst_optimal, .{ .shader_read = true }, .{ .transfer_write = true }, any_stage, .{ .transfer = true });
+        barrier(self, res.image, res.layers(), mip - 1, 1, .shader_read_only_optimal, .transfer_src_optimal, drawn, .{ .transfer_read = true }, any_stage, .{ .transfer = true });
+        barrier(self, res.image, res.layers(), mip, 1, .shader_read_only_optimal, .transfer_dst_optimal, .{ .shader_read = true }, .{ .transfer_write = true }, any_stage, .{ .transfer = true });
         const above = res.levelSize(mip - 1);
         const here = res.levelSize(mip);
         // A volume's levels halve in depth too.
         const blit = [_]vk.gen.types.ImageBlit{.{
-            .src_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = mip - 1, .base_array_layer = 0, .layer_count = 1 },
+            .src_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = mip - 1, .base_array_layer = 0, .layer_count = res.layers() },
             .src_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = @intCast(above[0]), .y = @intCast(above[1]), .z = @intCast(res.levelDepth(mip - 1)) } },
-            .dst_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = mip, .base_array_layer = 0, .layer_count = 1 },
+            .dst_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = mip, .base_array_layer = 0, .layer_count = res.layers() },
             .dst_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = @intCast(here[0]), .y = @intCast(here[1]), .z = @intCast(res.levelDepth(mip)) } },
         }};
         self.runtime.vkd.cmdBlitImage(self.command_buffer, res.image, .transfer_src_optimal, res.image, .transfer_dst_optimal, blit.len, &blit, .linear);
-        barrier(self, res.image, mip - 1, 1, .transfer_src_optimal, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
-        barrier(self, res.image, mip, 1, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true, .transfer_read = true }, .{ .transfer = true }, .{ .fragment_shader = true, .transfer = true });
+        barrier(self, res.image, res.layers(), mip - 1, 1, .transfer_src_optimal, .shader_read_only_optimal, .{}, .{ .shader_read = true }, .{ .transfer = true }, .{ .fragment_shader = true });
+        barrier(self, res.image, res.layers(), mip, 1, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write = true }, .{ .shader_read = true, .transfer_read = true }, .{ .transfer = true }, .{ .fragment_shader = true, .transfer = true });
     }
 }
 

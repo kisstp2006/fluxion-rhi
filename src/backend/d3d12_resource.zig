@@ -246,6 +246,18 @@ pub const ResourceDesc = extern struct {
         };
     }
 
+    /// Layers of a picture, one sample.
+    pub fn texture2dArray(width: u32, height: u32, layers: u16, format: Format, flags: ResourceFlags) ResourceDesc {
+        return .{
+            .dimension = .texture2d,
+            .width = width,
+            .height = height,
+            .depth_or_array_size = layers,
+            .format = format,
+            .flags = flags,
+        };
+    }
+
     /// A plain 2D texture, one sample - the shape every picture this backend
     /// makes is.
     pub fn texture2d(width: u32, height: u32, format: Format, flags: ResourceFlags) ResourceDesc {
@@ -437,6 +449,14 @@ pub const BufferRtv = extern struct {
 
 /// `D3D12_RENDER_TARGET_VIEW_DESC`. A real `extern union` of the branches
 /// that affect layout, for the same reason as `ShaderResourceViewDesc`'s.
+/// `D3D12_TEX2D_ARRAY_RTV`: layers of one level.
+pub const Tex2dArrayRtv = extern struct {
+    mip_slice: u32 = 0,
+    first_array_slice: u32 = 0,
+    array_size: u32 = 1,
+    plane_slice: u32 = 0,
+};
+
 /// `D3D12_TEX3D_RTV`: slices of one level of a volume.
 pub const Tex3dRtv = extern struct {
     mip_slice: u32 = 0,
@@ -450,6 +470,7 @@ pub const RenderTargetViewDesc = extern struct {
     u: extern union {
         buffer: BufferRtv,
         texture2d: Tex2dRtv,
+        texture2d_array: Tex2dArrayRtv,
         texture3d: Tex3dRtv,
     } = .{ .texture2d = .{} },
 };

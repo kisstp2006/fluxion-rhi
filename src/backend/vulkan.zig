@@ -694,9 +694,9 @@ fn caps(impl: backend.Impl) types.Caps {
             // a linear filter, which the format must allow both ways.
             .generate_mips = feats.blit_src and feats.blit_dst and feats.sampled_image_filter_linear,
             .sample_counts = if (feats.color_attachment) color_counts | 1 else 0b1,
-            // A picture, or a volume: a 3D image, drawn into a slice at a
-            // time through a 2D view of it.
-            .dimensions = std.EnumSet(types.Dimension).initMany(&.{ .d2, .d3 }),
+            // A picture, a volume - a 3D image, drawn into a slice at a time
+            // through a 2D view of it - or layers, drawn into the same way.
+            .dimensions = std.EnumSet(types.Dimension).initMany(&.{ .d2, .d3, .d2_array }),
         });
     }
     // BC's blocks are only sampled: never drawn into, their levels given.
@@ -2160,6 +2160,39 @@ test "a pass draws into one level of a chain, and the others keep theirs" {
         defer testing.allocator.free(pixels);
         try testing.expectEqual(@as(usize, types.mipExtent(8, @intCast(mip)) * types.mipExtent(4, @intCast(mip)) * 4), pixels.len);
         try expectSolid(pixels, if (mip == 2) palette[2] else palette[0]);
+    }
+}
+
+test "layers are written and read one at a time, a pass into one leaves the others be, and each has its levels" {
+    var device = try openTestDevice();
+    defer device.deinit();
+    try testing.expect(device.caps().formatSupport(.rgba8_unorm).dimensions.contains(.d2_array));
+
+    var initial: [3 * 4 * 4 * 4]u8 = undefined;
+    for (0..3) |z| _ = solidLevel(initial[z * 64 ..][0..64], palette[z]);
+    const layers = try device.createTexture(.{ .dimension = .d2_array, .width = 4, .height = 4, .depth_or_layers = 3, .mip_levels = 3, .data = &initial, .usage = .{ .sampled = true, .render_target = true } });
+    defer device.destroyTexture(layers);
+    for (0..3) |z| {
+        const pixels = try device.readSubresource(layers, .{ .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolid(pixels, palette[z]);
+    }
+
+    // Layer one cleared blue by a pass; the rest as they were.
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .texture = layers }, .layer = 1, .clear_color = .{ 0, 0, 1, 1 } } });
+    try cmd.endPass();
+    try cmd.generateMips(layers);
+    try device.submit();
+    for (0..3) |z| {
+        const want = if (z == 1) palette[2] else palette[z];
+        const pixels = try device.readSubresource(layers, .{ .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try expectSolid(pixels, want);
+        const smallest = try device.readSubresource(layers, .{ .mip = 2, .layer = @intCast(z) }, testing.allocator);
+        defer testing.allocator.free(smallest);
+        try testing.expectEqual(@as(usize, 4), smallest.len);
+        try expectSolid(smallest, want);
     }
 }
 
