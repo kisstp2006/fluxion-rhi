@@ -1026,20 +1026,19 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         dxgi_library.createFactory(dxgi.IDXGIFactory1, .{}) catch return error.NoDevice;
     errdefer _ = com.release(factory);
 
-    var device = library.createDevice(.{
-        .driver = if (desc.software) .warp else .hardware,
-        .flags = .{ .debug = desc.debug, .bgra_support = true },
-    }) catch |err| switch (err) {
-        // The debug layer is an optional Windows feature; a program that asked
-        // for it on a machine without it still gets a device.
-        else => if (desc.debug)
-            library.createDevice(.{
-                .driver = if (desc.software) .warp else .hardware,
-                .flags = .{ .bgra_support = true },
-            }) catch return error.NoDevice
-        else
-            return error.NoDevice,
+    // The fastest card where a machine has two: what Windows calls the
+    // default adapter is, for a program it has been told nothing of, the one
+    // that saves power - on a laptop the one built into the processor, a game
+    // drawn there at a fraction of the speed. Asked for by preference, and the
+    // default where it cannot be asked, before Windows 10 1803.
+    const preferred: ?*dxgi.IDXGIAdapter1 = if (desc.software) null else dxgi.adapterByPreference(factory, 0, .high_performance) catch null;
+    defer if (preferred) |adapter| {
+        _ = com.release(adapter);
     };
+    const driver: d3d11.Driver = if (desc.software) .warp else if (preferred) |adapter| .{ .adapter = @ptrCast(adapter) } else .hardware;
+    var device = deviceOn(library, driver, desc.debug) orelse
+        (if (preferred != null) deviceOn(library, .hardware, desc.debug) else null) orelse
+        return error.NoDevice;
     errdefer device.release();
 
     const raw: Raw = .{ .device = device.device };
@@ -1068,6 +1067,11 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         @memcpy(self.renderer[0..name.len], name);
         self.renderer_len = name.len;
     } else if (blk: {
+        // The one the device was made on, where it was chosen.
+        if (preferred) |adapter| {
+            _ = com.addRef(adapter);
+            break :blk adapter;
+        }
         var adapters = dxgi.adapters(factory);
         break :blk adapters.next() catch null;
     }) |adapter| {
@@ -1082,6 +1086,14 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
 
     makeStamps(self) catch {};
     return .{ self, &vtable };
+}
+
+/// A device made by `driver`, or null. The debug layer is an optional
+/// Windows feature: a program that asked for it on a machine without it
+/// still gets a device.
+fn deviceOn(library: d3d.D3d11, driver: d3d11.Driver, debug: bool) ?d3d11.Device {
+    return library.createDevice(.{ .driver = driver, .flags = .{ .debug = debug, .bgra_support = true } }) catch
+        if (debug) library.createDevice(.{ .driver = driver, .flags = .{ .bgra_support = true } }) catch null else null;
 }
 
 /// The queries a frame's timings take, all or none: best-effort, as a

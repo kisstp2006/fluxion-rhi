@@ -596,18 +596,29 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         dxgi_library.createFactory(dxgi.IDXGIFactory1, .{}) catch return error.NoDevice;
     errdefer _ = com.release(factory);
 
-    // A null adapter is Direct3D 12's own "the default hardware adapter",
-    // exactly as a null one is Direct3D 11's - so only the software case
-    // needs `dxgi.zig`'s enumeration at all.
+    // The fastest card where a machine has two: a null adapter is Direct3D
+    // 12's own "the default hardware adapter", as a null one is Direct3D
+    // 11's, and that is, for a program Windows has been told nothing of, the
+    // one that saves power - on a laptop the one built into the processor.
+    // Asked for by preference; the default where it cannot be asked, or no
+    // device is made on it.
     var adapter: ?*dxgi.IDXGIAdapter1 = null;
     defer if (adapter) |a| {
         _ = com.release(a);
     };
-    if (desc.software) adapter = dxgi.warpAdapter(factory) catch return error.NoDevice;
+    if (desc.software) {
+        adapter = dxgi.warpAdapter(factory) catch return error.NoDevice;
+    } else {
+        adapter = dxgi.adapterByPreference(factory, 0, .high_performance) catch null;
+    }
 
     const device = library.createDevice(.{
         .adapter = if (adapter) |a| @ptrCast(a) else null,
-    }) catch return error.NoDevice;
+    }) catch if (!desc.software and adapter != null) retry: {
+        _ = com.release(adapter.?);
+        adapter = null;
+        break :retry library.createDevice(.{ .adapter = null }) catch return error.NoDevice;
+    } else return error.NoDevice;
     errdefer _ = com.release(device);
 
     const queue = d3d12.createCommandQueue(device, .{ .type = .direct }) catch return error.NoDevice;
@@ -752,6 +763,11 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         @memcpy(self.renderer[0..name.len], name);
         self.renderer_len = name.len;
     } else if (blk: {
+        // The one the device was made on, where it was chosen.
+        if (adapter) |chosen| {
+            _ = com.addRef(chosen);
+            break :blk chosen;
+        }
         var it = dxgi.adapters(factory);
         break :blk it.next() catch null;
     }) |a| {
