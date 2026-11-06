@@ -2178,6 +2178,10 @@ fn submit(impl: backend.Impl, device: *Device, list_cmds: []const commands.Comma
             .end_pass => endTarget(self),
             .set_pipeline => |h| {
                 const res = as(PipelineRes, device.pipelines.get(h).?.native);
+                // The one the list has: what takes it away for a moment -
+                // a mip chain made, the list opened again - puts
+                // `current_pipeline` back itself.
+                if (self.current_pipeline == res) continue;
                 self.current_pipeline = res;
                 self.bindings_dirty = true;
                 cmd_list.vtable.SetPipelineState(cmd_list, res.pso);

@@ -940,8 +940,13 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
                 self.in_pass = false;
             },
             .set_pipeline => |h| {
-                self.current_pipeline = as(PipelineRes, device.pipelines.get(h).?.native);
-                self.pipeline_dirty = true;
+                // The one this pass has already, bound or about to be: not
+                // bound again.
+                const res = as(PipelineRes, device.pipelines.get(h).?.native);
+                if (self.current_pipeline != res) {
+                    self.current_pipeline = res;
+                    self.pipeline_dirty = true;
+                }
             },
             .set_viewport => |v| setViewport(self, v),
             .set_scissor => |maybe| setScissor(self, maybe),
@@ -959,17 +964,25 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) t
             },
             .set_uniform_buffer => |b| {
                 if (b.slot >= uniform_slots) return error.Unsupported;
-                self.current_ubo[b.slot] = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                self.current_ubo_range[b.slot] = b;
-                self.bindings_dirty = true;
+                const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
+                // What the slot has already is no reason for a new set of
+                // descriptors at the next draw.
+                if (self.current_ubo[b.slot] != res or !std.meta.eql(self.current_ubo_range[b.slot], b)) {
+                    self.current_ubo[b.slot] = res;
+                    self.current_ubo_range[b.slot] = b;
+                    self.bindings_dirty = true;
+                }
             },
             .set_texture => |b| {
                 if (b.slot >= texture_slots) return error.Unsupported;
-                self.current_tex[b.slot] = .{
+                const binding: TexBinding = .{
                     .texture = as(TextureRes, device.textures.get(b.texture).?.native),
                     .sampler = as(SamplerRes, device.samplers.get(b.sampler).?.native),
                 };
-                self.bindings_dirty = true;
+                if (!std.meta.eql(self.current_tex[b.slot], binding)) {
+                    self.current_tex[b.slot] = binding;
+                    self.bindings_dirty = true;
+                }
             },
             .draw => |d| {
                 try prepareDraw(self);

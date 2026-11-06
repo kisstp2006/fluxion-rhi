@@ -900,6 +900,12 @@ const D3d = struct {
     target_height: u32 = 0,
     vertex_bindings: [max_vertex_slots]VertexBinding = @splat(.{}),
     bindings_dirty: bool = false,
+    /// What the context was last told, so that a call saying it again is
+    /// not made: each is a call through the runtime, which checks it before
+    /// the driver sees it. Forgotten at every submit, since what the device
+    /// does between them - a copy, a mip chain made, a picture read back -
+    /// goes through the same context.
+    said: Said = .{},
     /// What `end_pass` resolves: one entry per attachment of the pass that
     /// asked for it.
     resolves: [fl11.max_color_attachments]Resolve = undefined,
@@ -934,6 +940,34 @@ const max_uniform_range = 65536;
 const VertexBinding = struct {
     buffer: ?*IBuffer = null,
     offset: u32 = 0,
+};
+
+/// The context's state as the commands last left it. Null is not known:
+/// said again the next time it is wanted.
+const Said = struct {
+    layout: ?(?*IInputLayout) = null,
+    vertex_shader: ?*IVertexShader = null,
+    pixel_shader: ?*IPixelShader = null,
+    blend: ?*IBlendState = null,
+    rasterizer: ?*IRasterizerState = null,
+    depth: ?*IDepthStencilState = null,
+    topology: ?Topology = null,
+    vertex: [max_vertex_slots]?Bound = @splat(null),
+    index: ?Index = null,
+    uniforms: [max_uniform_slots]?Uniform = @splat(null),
+    views: [types.max_texture_slots]?*IShaderResourceView = @splat(null),
+    samplers: [types.max_texture_slots]?*ISamplerState = @splat(null),
+
+    const Bound = struct { buffer: ?*IBuffer, stride: u32, offset: u32 };
+    const Index = struct { buffer: *IBuffer, format: Format };
+    /// A constant buffer on a slot of both stages, and the part of it, in
+    /// sixteen-byte constants; the whole of it with a count of nought.
+    const Uniform = struct { buffer: *IBuffer, first: u32, count: u32 };
+
+    /// What `unbindTextures` leaves: no view on any slot.
+    fn viewsGone(self: *Said) void {
+        self.views = @splat(null);
+    }
 };
 
 const BufferRes = struct {
@@ -1256,14 +1290,20 @@ fn bindRange(self: *D3d, b: commands.Command.UniformBinding, res: *BufferRes) Er
     const context = self.context;
     const size: usize = if (b.size == 0) res.size - b.offset else b.size;
     if (self.context1) |one| {
-        // The same buffer at another offset is filtered out as the binding it
-        // already has by some runtimes: the slot is emptied first.
-        const none = [_]?*IBuffer{null};
-        context.vtable.VSSetConstantBuffers(context, b.slot, 1, &none);
-        context.vtable.PSSetConstantBuffers(context, b.slot, 1, &none);
-        const buffers = [_]?*IBuffer{res.buffer};
         const first = [_]u32{b.offset / 16};
         const count = [_]u32{@intCast(std.mem.alignForward(usize, size, 256) / 16)};
+        const range: Said.Uniform = .{ .buffer = res.buffer, .first = first[0], .count = count[0] };
+        const had = self.said.uniforms[b.slot];
+        if (!differs(Said.Uniform, &self.said.uniforms[b.slot], range)) return;
+        // The same buffer at another offset is filtered out as the binding it
+        // already has by some runtimes: the slot is emptied first. Another
+        // buffer, or one not known, is not the binding the slot has.
+        if (had == null or had.?.buffer == res.buffer) {
+            const none = [_]?*IBuffer{null};
+            context.vtable.VSSetConstantBuffers(context, b.slot, 1, &none);
+            context.vtable.PSSetConstantBuffers(context, b.slot, 1, &none);
+        }
+        const buffers = [_]?*IBuffer{res.buffer};
         one.vtable.VSSetConstantBuffers1(one, b.slot, 1, &buffers, &first, &count);
         one.vtable.PSSetConstantBuffers1(one, b.slot, 1, &buffers, &first, &count);
         return;
@@ -1280,6 +1320,10 @@ fn bindRange(self: *D3d, b: commands.Command.UniformBinding, res: *BufferRes) Er
     };
     @memcpy(data[0..size], shadow[b.offset..][0..size]);
     context.vtable.Unmap(context, asResource(scratch), 0);
+    // The slot's own buffer, its contents new: bound once, and then only
+    // written.
+    const own: Said.Uniform = .{ .buffer = scratch, .first = 0, .count = 0 };
+    if (!differs(Said.Uniform, &self.said.uniforms[b.slot], own)) return;
     const buffers = [_]?*IBuffer{scratch};
     context.vtable.VSSetConstantBuffers(context, b.slot, 1, &buffers);
     context.vtable.PSSetConstantBuffers(context, b.slot, 1, &buffers);
@@ -2196,6 +2240,8 @@ fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) 
 fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) Error!void {
     const self = cast(impl);
     const context = self.context;
+    self.said = .{};
+    self.pipeline = null;
 
     for (list) |command| {
         switch (command) {
@@ -2214,15 +2260,18 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             },
             .set_pipeline => |h| {
                 const res = as(PipelineRes, device.pipelines.get(h).?.native);
+                // The same one again: everything it says is said.
+                if (self.pipeline == res) continue;
                 self.pipeline = res;
                 self.bindings_dirty = true;
-                context.vtable.IASetInputLayout(context, res.layout);
-                context.vtable.VSSetShader(context, res.shader.vertex, null, 0);
-                context.vtable.PSSetShader(context, res.shader.pixel, null, 0);
-                context.vtable.OMSetBlendState(context, res.blend, null, 0xFFFFFFFF);
-                context.vtable.RSSetState(context, res.rasterizer);
-                context.vtable.OMSetDepthStencilState(context, res.depth, 0);
-                context.vtable.IASetPrimitiveTopology(context, res.topology);
+                const said = &self.said;
+                if (differs(?*IInputLayout, &said.layout, res.layout)) context.vtable.IASetInputLayout(context, res.layout);
+                if (differs(*IVertexShader, &said.vertex_shader, res.shader.vertex)) context.vtable.VSSetShader(context, res.shader.vertex, null, 0);
+                if (differs(*IPixelShader, &said.pixel_shader, res.shader.pixel)) context.vtable.PSSetShader(context, res.shader.pixel, null, 0);
+                if (differs(*IBlendState, &said.blend, res.blend)) context.vtable.OMSetBlendState(context, res.blend, null, 0xFFFFFFFF);
+                if (differs(*IRasterizerState, &said.rasterizer, res.rasterizer)) context.vtable.RSSetState(context, res.rasterizer);
+                if (differs(*IDepthStencilState, &said.depth, res.depth)) context.vtable.OMSetDepthStencilState(context, res.depth, 0);
+                if (differs(Topology, &said.topology, res.topology)) context.vtable.IASetPrimitiveTopology(context, res.topology);
             },
             .set_viewport => |v| {
                 context.vtable.RSSetViewports(context, 1, &[_]Viewport{.{
@@ -2256,11 +2305,16 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             },
             .set_index_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
-                context.vtable.IASetIndexBuffer(context, res.buffer, if (b.format == .u16) .r16_uint else .r32_uint, 0);
+                const format: Format = if (b.format == .u16) .r16_uint else .r32_uint;
+                if (differs(Said.Index, &self.said.index, .{ .buffer = res.buffer, .format = format })) {
+                    context.vtable.IASetIndexBuffer(context, res.buffer, format, 0);
+                }
             },
             .set_uniform_buffer => |b| {
                 const res = as(BufferRes, device.buffers.get(b.buffer).?.native);
                 if (b.whole()) {
+                    const whole: Said.Uniform = .{ .buffer = res.buffer, .first = 0, .count = 0 };
+                    if (b.slot < max_uniform_slots and !differs(Said.Uniform, &self.said.uniforms[b.slot], whole)) continue;
                     const buffers = [_]?*IBuffer{res.buffer};
                     context.vtable.VSSetConstantBuffers(context, b.slot, 1, &buffers);
                     context.vtable.PSSetConstantBuffers(context, b.slot, 1, &buffers);
@@ -2271,10 +2325,17 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
                 const sampler = as(SamplerRes, device.samplers.get(b.sampler).?.native);
                 const views = [_]?*IShaderResourceView{texture.srv};
                 const samplers = [_]?*ISamplerState{sampler.state};
-                context.vtable.PSSetShaderResources(context, b.slot, 1, &views);
-                context.vtable.PSSetSamplers(context, b.slot, 1, &samplers);
-                context.vtable.VSSetShaderResources(context, b.slot, 1, &views);
-                context.vtable.VSSetSamplers(context, b.slot, 1, &samplers);
+                const known = b.slot < types.max_texture_slots;
+                if (!known or self.said.views[b.slot] != texture.srv or texture.srv == null) {
+                    context.vtable.PSSetShaderResources(context, b.slot, 1, &views);
+                    context.vtable.VSSetShaderResources(context, b.slot, 1, &views);
+                    if (known) self.said.views[b.slot] = texture.srv;
+                }
+                if (!known or self.said.samplers[b.slot] != sampler.state) {
+                    context.vtable.PSSetSamplers(context, b.slot, 1, &samplers);
+                    context.vtable.VSSetSamplers(context, b.slot, 1, &samplers);
+                    if (known) self.said.samplers[b.slot] = sampler.state;
+                }
             },
             .draw => |d| {
                 flushBindings(self);
@@ -2314,6 +2375,7 @@ fn unbindTextures(self: *D3d) void {
     const none: [unbound_slots]?*IShaderResourceView = @splat(null);
     self.context.vtable.PSSetShaderResources(self.context, 0, none.len, &none);
     self.context.vtable.VSSetShaderResources(self.context, 0, none.len, &none);
+    self.said.viewsGone();
 }
 
 fn beginPass(self: *D3d, device: *Device, pass: types.RenderPassDesc) Error!void {
@@ -2428,11 +2490,30 @@ fn flushBindings(self: *D3d) void {
 
     var buffers: [max_vertex_slots]?*IBuffer = undefined;
     var offsets: [max_vertex_slots]u32 = undefined;
+    // The run of slots from the first that changed to the last, said in one
+    // call; none, when every slot is as it was.
+    var low: usize = max_vertex_slots;
+    var high: usize = 0;
     for (0..max_vertex_slots) |i| {
         buffers[i] = self.vertex_bindings[i].buffer;
         offsets[i] = self.vertex_bindings[i].offset;
+        const now: Said.Bound = .{ .buffer = buffers[i], .stride = pipeline.strides[i], .offset = offsets[i] };
+        if (differs(Said.Bound, &self.said.vertex[i], now)) {
+            low = @min(low, i);
+            high = i + 1;
+        }
     }
-    self.context.vtable.IASetVertexBuffers(self.context, 0, max_vertex_slots, &buffers, &pipeline.strides, &offsets);
+    if (low >= high) return;
+    const n: u32 = @intCast(high - low);
+    self.context.vtable.IASetVertexBuffers(self.context, @intCast(low), n, buffers[low..].ptr, pipeline.strides[low..].ptr, offsets[low..].ptr);
+}
+
+/// Whether `value` is other than what `held` says the context has, keeping
+/// it as what the context has from now on: true means say it.
+fn differs(comptime T: type, held: *?T, value: T) bool {
+    if (held.*) |was| if (std.meta.eql(was, value)) return false;
+    held.* = value;
+    return true;
 }
 
 // -------------------------------------------------------------------------
@@ -2623,6 +2704,72 @@ test "two draws read two parts of one uniform buffer, bound from Direct3D 11.1 o
         defer testing.allocator.free(pixels);
         try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixels[(8 * 16 + 3) * 4 ..][0..4].*);
         try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, pixels[(8 * 16 + 12) * 4 ..][0..4].*);
+    }
+}
+
+test "a binding said again, moved back, or carried from the submit before draws what it names" {
+    var device = try warpDevice();
+    defer device.deinit();
+
+    const target = try device.createTexture(.{ .width = 16, .height = 16, .usage = .{ .render_target = true } });
+    const shader = try device.createShader(.{ .hlsl = .{ .vertex = flat_vs, .fragment = flat_ps } });
+    const desc: types.PipelineDesc = .{
+        .shader = shader,
+        .attributes = &.{
+            .{ .location = 0, .format = .float2, .offset = 0 },
+            .{ .location = 1, .format = .float4, .offset = 8 },
+        },
+        .buffers = &.{.{ .stride = @sizeOf(Vertex) }},
+        .topology = .triangle_strip,
+    };
+    const one = try device.createPipeline(desc);
+    const other = try device.createPipeline(desc);
+    const white: [4]f32 = .{ 1, 1, 1, 1 };
+    const vertices = [_]Vertex{
+        .{ .position = .{ -1, -1 }, .colour = white }, .{ .position = .{ -1, 1 }, .colour = white },
+        .{ .position = .{ 0, -1 }, .colour = white },  .{ .position = .{ 0, 1 }, .colour = white },
+        .{ .position = .{ 0, -1 }, .colour = white },  .{ .position = .{ 0, 1 }, .colour = white },
+        .{ .position = .{ 1, -1 }, .colour = white },  .{ .position = .{ 1, 1 }, .colour = white },
+    };
+    const buffer = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(vertices)), .data = std.mem.asBytes(&vertices) });
+    const step = device.caps().limits.uniform_offset_alignment;
+    const tints = try device.createBuffer(.{ .kind = .uniform, .size = step + 16 });
+    try device.updateBuffer(tints, 0, std.mem.asBytes(&[4]f32{ 1, 0, 0, 1 }));
+    try device.updateBuffer(tints, step, std.mem.asBytes(&[4]f32{ 0, 1, 0, 1 }));
+    const red: [4]u8 = .{ 255, 0, 0, 255 };
+    const green: [4]u8 = .{ 0, 255, 0, 255 };
+
+    // Left, right: which part of the buffer each half reads, null for the
+    // whole of it, and what each half should then be.
+    const Round = struct { left: ?u32, right: ?u32, want_left: [4]u8, want_right: [4]u8 };
+    const rounds = [_]Round{
+        .{ .left = 0, .right = step, .want_left = red, .want_right = green },
+        // The submit before left the slot at `step`: moved back to 0.
+        .{ .left = step, .right = 0, .want_left = green, .want_right = red },
+        // The whole buffer, then a part of the same one, then the whole again.
+        .{ .left = null, .right = step, .want_left = red, .want_right = green },
+        .{ .left = step, .right = null, .want_left = green, .want_right = red },
+    };
+    for (rounds) |round| {
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+        try cmd.setPipeline(one);
+        try cmd.setPipeline(one);
+        try cmd.setVertexBuffer(0, buffer, 0);
+        if (round.left) |at| try cmd.setUniformBufferRange(0, tints, at, 16) else try cmd.setUniformBuffer(0, tints);
+        try cmd.draw(.{ .vertex_count = 4 });
+        // Another pipeline in the same state, the same vertex buffer again.
+        try cmd.setPipeline(other);
+        try cmd.setVertexBuffer(0, buffer, 0);
+        if (round.right) |at| try cmd.setUniformBufferRange(0, tints, at, 16) else try cmd.setUniformBuffer(0, tints);
+        try cmd.draw(.{ .vertex_count = 4, .first_vertex = 4 });
+        try cmd.endPass();
+        try device.submit();
+
+        const pixels = try device.readTexture(target, testing.allocator);
+        defer testing.allocator.free(pixels);
+        try testing.expectEqual(round.want_left, pixels[(8 * 16 + 3) * 4 ..][0..4].*);
+        try testing.expectEqual(round.want_right, pixels[(8 * 16 + 12) * 4 ..][0..4].*);
     }
 }
 
