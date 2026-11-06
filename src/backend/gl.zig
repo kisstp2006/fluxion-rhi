@@ -797,7 +797,48 @@ pub fn For(comptime is_gles: bool) type {
             pass_framebuffer: gt.Uint = 0,
             pass_size: [2]u32 = .{ 0, 0 },
             resolves: [most_color_attachments]?Resolve = @splat(null),
+            /// What the context was last told, so that a call saying it again
+            /// is not made. Forgotten at every submit and every pass: a pass
+            /// may be another window's context, and what the device does
+            /// between them moves bindings and masks.
+            said: Said = .{},
         };
+
+        /// The context's state as `bindPipeline` and `set_texture` last left
+        /// it. Null is not known: said again the next time it is wanted.
+        const Said = struct {
+            program: ?gt.Uint = null,
+            color_write: ?bool = null,
+            blend_on: ?bool = null,
+            blend_func: ?[4]gt.Enum = null,
+            blend_equation: ?[2]gt.Enum = null,
+            depth_on: ?bool = null,
+            depth_func: ?gt.Enum = null,
+            depth_write: ?bool = null,
+            offset_on: ?bool = null,
+            offset: ?[2]f32 = null,
+            cull_on: ?bool = null,
+            cull_face: ?gt.Enum = null,
+            front_face: ?gt.Enum = null,
+            active_unit: ?u32 = null,
+            units: [types.max_texture_slots]?Unit = @splat(null),
+
+            /// What a texture unit has bound: the texture on its target, and
+            /// the sampler.
+            const Unit = struct {
+                target: gt.Enum,
+                texture: gt.Uint,
+                sampler: gt.Uint,
+            };
+        };
+
+        /// Whether `value` is other than what `held` says the context has,
+        /// keeping it as what the context has from now on: true means say it.
+        fn differs(comptime T: type, held: *?T, value: T) bool {
+            if (held.*) |was| if (std.meta.eql(was, value)) return false;
+            held.* = value;
+            return true;
+        }
 
         const VertexBinding = struct {
             name: gt.Uint = 0,
@@ -2131,6 +2172,8 @@ pub fn For(comptime is_gles: bool) type {
         fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) Error!void {
             const self = cast(impl);
             const api = &self.api;
+            self.said = .{};
+            self.pipeline = null;
 
             for (list) |command| {
                 switch (command) {
@@ -2179,12 +2222,10 @@ pub fn For(comptime is_gles: bool) type {
                     .set_texture => |b| {
                         const texture = as(TextureRes, device.textures.get(b.texture).?.native);
                         const sampler = as(SamplerRes, device.samplers.get(b.sampler).?.native);
-                        api.activeTexture(c.texture0 + b.slot);
                         // The kind that it is: a shader's `samplerCube` reads the cube
                         // binding of the unit and a `sampler2D` the 2D one, so a
                         // texture goes where its shape says.
-                        api.bindTexture(texture.target, texture.name);
-                        fnOf(api, "bindSampler")(b.slot, sampler.name);
+                        bindTexture(self, b.slot, texture.target, texture.name, sampler.name);
                     },
                     .draw => |d| {
                         const pipeline = self.pipeline orelse return error.InvalidArgument;
@@ -2194,6 +2235,11 @@ pub fn For(comptime is_gles: bool) type {
                     .generate_mips => |h| {
                         const texture = as(TextureRes, device.textures.get(h).?.native);
                         api.bindTexture(texture.target, texture.name);
+                        // On whichever unit is active, which no longer has
+                        // what it was said to.
+                        if (self.said.active_unit) |unit| {
+                            if (unit < self.said.units.len) self.said.units[unit] = null;
+                        } else self.said.units = @splat(null);
                         api.generateMipmap(texture.target);
                         inheritDrawn(texture);
                     },
@@ -2311,6 +2357,7 @@ pub fn For(comptime is_gles: bool) type {
             self.target_height = size[1];
             self.pipeline = null;
             self.bindings_dirty = true;
+            self.said = .{};
 
             // A pass begins with the whole attachment, and the whole of the depth range:
             // what an earlier pass's viewport asked of it is not this one's.
@@ -2380,53 +2427,84 @@ pub fn For(comptime is_gles: bool) type {
         }
 
         fn bindPipeline(self: *Gl, res: *PipelineRes) Error!void {
+            // The same pipeline again in the same pass: everything it says is
+            // already said, and its vertex array still points where `pointed`
+            // knows.
+            if (self.pipeline == res) return;
             const api = &self.api;
+            const said = &self.said;
             self.pipeline = res;
             forgetPointers(self);
 
-            api.useProgram(res.program);
+            if (differs(gt.Uint, &said.program, res.program)) api.useProgram(res.program);
             try bindVertexArrayOf(self, res);
 
             // A pipeline for a depth-only pass has no colour format and must not
             // write one, whatever the draw buffers of the framebuffer it is bound
             // with; and the pass before, which opened the mask to clear, is undone.
-            const color: gt.Boolean = if (res.color_write) gt.gl_true else gt.gl_false;
-            api.colorMask(color, color, color, color);
+            if (differs(bool, &said.color_write, res.color_write)) {
+                const color: gt.Boolean = if (res.color_write) gt.gl_true else gt.gl_false;
+                api.colorMask(color, color, color, color);
+            }
 
+            // Each switch said only when it changes, and what it switches on
+            // only while it is on: a rule kept from before it was switched off
+            // is still the context's.
+            if (differs(bool, &said.blend_on, res.blend.enabled)) {
+                if (res.blend.enabled) api.enable(c.blend) else api.disable(c.blend);
+            }
             if (res.blend.enabled) {
-                api.enable(c.blend);
-                api.blendFuncSeparate(factor(res.blend.src_rgb), factor(res.blend.dst_rgb), factor(res.blend.src_alpha), factor(res.blend.dst_alpha));
-                api.blendEquationSeparate(equation(res.blend.op_rgb), equation(res.blend.op_alpha));
-            } else {
-                api.disable(c.blend);
+                const func: [4]gt.Enum = .{ factor(res.blend.src_rgb), factor(res.blend.dst_rgb), factor(res.blend.src_alpha), factor(res.blend.dst_alpha) };
+                if (differs([4]gt.Enum, &said.blend_func, func)) api.blendFuncSeparate(func[0], func[1], func[2], func[3]);
+                const eq: [2]gt.Enum = .{ equation(res.blend.op_rgb), equation(res.blend.op_alpha) };
+                if (differs([2]gt.Enum, &said.blend_equation, eq)) api.blendEquationSeparate(eq[0], eq[1]);
             }
 
+            if (differs(bool, &said.depth_on, res.depth.test_enabled)) {
+                if (res.depth.test_enabled) api.enable(c.depth_test) else api.disable(c.depth_test);
+            }
             if (res.depth.test_enabled) {
-                api.enable(c.depth_test);
-                api.depthFunc(compare(res.depth.compare));
-            } else {
-                api.disable(c.depth_test);
+                const func = compare(res.depth.compare);
+                if (differs(gt.Enum, &said.depth_func, func)) api.depthFunc(func);
             }
-            api.depthMask(if (res.depth.write) gt.gl_true else gt.gl_false);
-            if (res.depth.biased()) {
-                api.enable(c.polygon_offset_fill);
-                api.polygonOffset(res.depth.slope_bias, @floatFromInt(res.depth.bias));
-            } else {
-                api.disable(c.polygon_offset_fill);
+            if (differs(bool, &said.depth_write, res.depth.write)) {
+                api.depthMask(if (res.depth.write) gt.gl_true else gt.gl_false);
+            }
+            const biased = res.depth.biased();
+            if (differs(bool, &said.offset_on, biased)) {
+                if (biased) api.enable(c.polygon_offset_fill) else api.disable(c.polygon_offset_fill);
+            }
+            if (biased) {
+                const offset: [2]f32 = .{ res.depth.slope_bias, @floatFromInt(res.depth.bias) };
+                if (differs([2]f32, &said.offset, offset)) api.polygonOffset(offset[0], offset[1]);
             }
 
-            switch (res.cull) {
-                .none => api.disable(c.cull_face),
-                .back => {
-                    api.enable(c.cull_face);
-                    api.cullFace(c.back);
-                },
-                .front => {
-                    api.enable(c.cull_face);
-                    api.cullFace(c.front);
-                },
+            const culls = res.cull != .none;
+            if (differs(bool, &said.cull_on, culls)) {
+                if (culls) api.enable(c.cull_face) else api.disable(c.cull_face);
             }
-            api.frontFace(if (res.front_face == .ccw) c.ccw else c.cw);
+            if (culls) {
+                const face: gt.Enum = if (res.cull == .back) c.back else c.front;
+                if (differs(gt.Enum, &said.cull_face, face)) api.cullFace(face);
+            }
+            const front: gt.Enum = if (res.front_face == .ccw) c.ccw else c.cw;
+            if (differs(gt.Enum, &said.front_face, front)) api.frontFace(front);
+        }
+
+        /// A texture and a sampler on a unit, saying only what the unit has
+        /// not got.
+        fn bindTexture(self: *Gl, slot: u32, target: gt.Enum, texture: gt.Uint, sampler: gt.Uint) void {
+            const api = &self.api;
+            const said = &self.said;
+            const want: Said.Unit = .{ .target = target, .texture = texture, .sampler = sampler };
+            const had: ?Said.Unit = if (slot < said.units.len) said.units[slot] else null;
+            if (had) |held| if (std.meta.eql(held, want)) return;
+            if (differs(u32, &said.active_unit, slot)) api.activeTexture(c.texture0 + slot);
+            const same_texture = if (had) |held| held.target == target and held.texture == texture else false;
+            if (!same_texture) api.bindTexture(target, texture);
+            const same_sampler = if (had) |held| held.sampler == sampler else false;
+            if (!same_sampler) fnOf(api, "bindSampler")(slot, sampler);
+            if (slot < said.units.len) said.units[slot] = want;
         }
 
         /// Point the pipeline's attributes at whatever buffers are bound now. Done at

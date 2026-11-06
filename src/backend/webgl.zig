@@ -463,7 +463,51 @@ const WebGl = struct {
     /// `flushBindings`.
     pointed: [max_vertex_slots]?Pointed = @splat(null),
     pointed_index: webgl.Buffer = .none,
+
+    // What the context was last told, so that a call saying it again is not
+    // made: each one is a call out to the page, and the browser checks each
+    // before it reaches the driver. Forgotten - every field null - at every
+    // submit and every pass, since what the device does between them (a
+    // texture written, a buffer made, a clear) moves bindings and masks.
+    said: Said = .{},
 };
+
+/// The context's state as `bindPipeline` and `set_texture` last left it.
+/// Null is not known: said again the next time it is wanted.
+const Said = struct {
+    program: ?webgl.Program = null,
+    vao: ?webgl.VertexArray = null,
+    blend_on: ?bool = null,
+    blend_func: ?[4]Enum = null,
+    blend_equation: ?[2]Enum = null,
+    depth_on: ?bool = null,
+    depth_func: ?Enum = null,
+    depth_write: ?bool = null,
+    offset_on: ?bool = null,
+    offset: ?[2]f32 = null,
+    color_write: ?bool = null,
+    cull_on: ?bool = null,
+    cull_face: ?Enum = null,
+    front_face: ?Enum = null,
+    active_unit: ?u32 = null,
+    units: [types.max_texture_slots]?Unit = @splat(null),
+
+    /// What a texture unit has bound: the texture on its target, and the
+    /// sampler.
+    const Unit = struct {
+        target: Enum,
+        texture: webgl.Texture,
+        sampler: webgl.Sampler,
+    };
+};
+
+/// Whether `value` is other than what `held` says the context has, keeping
+/// it as what the context has from now on: true means say it.
+fn differs(comptime T: type, held: *?T, value: T) bool {
+    if (held.*) |was| if (std.meta.eql(was, value)) return false;
+    held.* = value;
+    return true;
+}
 
 /// Where a slot's attributes point: its buffer, and how far into it - the
 /// base vertex's vertices in, for a slot that steps once a vertex.
@@ -1491,6 +1535,8 @@ fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMode) 
 fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) Error!void {
     const self = cast(impl);
     const gl = self.gl;
+    self.said = .{};
+    self.pipeline = null;
 
     for (list) |command| {
         switch (command) {
@@ -1539,9 +1585,7 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
             .set_texture => |b| {
                 const texture = textureOf(device, b.texture);
                 const sampler = as(SamplerRes, device.samplers.get(b.sampler).?.native);
-                gl.activeTexture(c.textureUnit(b.slot));
-                gl.bindTexture(texture.target, texture.texture);
-                gl.bindSampler(b.slot, try samplerFor(self, sampler, texture));
+                bindTexture(self, b.slot, texture, try samplerFor(self, sampler, texture));
             },
             .draw => |d| {
                 const pipeline = self.pipeline orelse return error.InvalidArgument;
@@ -1552,6 +1596,11 @@ fn submit(impl: backend.Impl, device: *Device, list: []const commands.Command) E
                 // Every face at once, for a cube: they are one texture.
                 const texture = textureOf(device, h);
                 gl.bindTexture(texture.target, texture.texture);
+                // On whichever unit is active, which no longer has what it
+                // was said to.
+                if (self.said.active_unit) |unit| {
+                    if (unit < self.said.units.len) self.said.units[unit] = null;
+                } else self.said.units = @splat(null);
                 gl.generateMipmap(texture.target);
                 inheritDrawn(texture);
             },
@@ -1622,6 +1671,7 @@ fn beginPass(self: *WebGl, device: *Device, pass: types.RenderPassDesc) Error!vo
     self.pass_size = size;
     self.pipeline = null;
     self.bindings_dirty = true;
+    self.said = .{};
 
     // The whole attachment, at the whole depth range: the state a pass
     // begins in, whatever the last one left.
@@ -1682,12 +1732,19 @@ fn endPass(self: *WebGl) Error!void {
 }
 
 fn bindPipeline(self: *WebGl, res: *PipelineRes) void {
+    // The same pipeline again in the same pass: everything it says is
+    // already said, and the pointers its vertex array holds are still the
+    // ones `pointed` knows.
+    if (self.pipeline == res) return;
     const gl = self.gl;
+    const said = &self.said;
     self.pipeline = res;
-    forgetPointers(self);
 
-    gl.useProgram(res.program);
-    gl.bindVertexArray(res.vao);
+    if (differs(webgl.Program, &said.program, res.program)) gl.useProgram(res.program);
+    if (differs(webgl.VertexArray, &said.vao, res.vao)) {
+        forgetPointers(self);
+        gl.bindVertexArray(res.vao);
+    }
     // That an attribute is on, and whether it steps once an instance, a
     // vertex array keeps: said the first time it is bound, and by no draw.
     if (!res.vao_ready) {
@@ -1698,43 +1755,66 @@ fn bindPipeline(self: *WebGl, res: *PipelineRes) void {
         }
     }
 
+    // Each switch said only when it changes, and what it switches on only
+    // while it is on: a rule kept from before it was switched off is still
+    // the context's.
+    if (differs(bool, &said.blend_on, res.blend.enabled)) {
+        if (res.blend.enabled) gl.enable(c.blend) else gl.disable(c.blend);
+    }
     if (res.blend.enabled) {
-        gl.enable(c.blend);
-        gl.blendFuncSeparate(factor(res.blend.src_rgb), factor(res.blend.dst_rgb), factor(res.blend.src_alpha), factor(res.blend.dst_alpha));
-        gl.blendEquationSeparate(equation(res.blend.op_rgb), equation(res.blend.op_alpha));
-    } else {
-        gl.disable(c.blend);
+        const func: [4]Enum = .{ factor(res.blend.src_rgb), factor(res.blend.dst_rgb), factor(res.blend.src_alpha), factor(res.blend.dst_alpha) };
+        if (differs([4]Enum, &said.blend_func, func)) gl.blendFuncSeparate(func[0], func[1], func[2], func[3]);
+        const eq: [2]Enum = .{ equation(res.blend.op_rgb), equation(res.blend.op_alpha) };
+        if (differs([2]Enum, &said.blend_equation, eq)) gl.blendEquationSeparate(eq[0], eq[1]);
     }
 
-    if (res.depth.test_enabled) {
-        gl.enable(c.depth_test);
-        gl.depthFunc(compare(res.depth.compare));
-    } else {
-        gl.disable(c.depth_test);
+    if (differs(bool, &said.depth_on, res.depth.test_enabled)) {
+        if (res.depth.test_enabled) gl.enable(c.depth_test) else gl.disable(c.depth_test);
     }
-    gl.depthMask(res.depth.write);
-    if (res.depth.biased()) {
-        gl.enable(c.polygon_offset_fill);
-        gl.polygonOffset(res.depth.slope_bias, @floatFromInt(res.depth.bias));
-    } else {
-        gl.disable(c.polygon_offset_fill);
+    if (res.depth.test_enabled) {
+        const func = compare(res.depth.compare);
+        if (differs(Enum, &said.depth_func, func)) gl.depthFunc(func);
+    }
+    if (differs(bool, &said.depth_write, res.depth.write)) gl.depthMask(res.depth.write);
+    const biased = res.depth.biased();
+    if (differs(bool, &said.offset_on, biased)) {
+        if (biased) gl.enable(c.polygon_offset_fill) else gl.disable(c.polygon_offset_fill);
+    }
+    if (biased) {
+        const offset: [2]f32 = .{ res.depth.slope_bias, @floatFromInt(res.depth.bias) };
+        if (differs([2]f32, &said.offset, offset)) gl.polygonOffset(offset[0], offset[1]);
     }
     // A pipeline with no colour format is for a pass with no colour: nothing
     // it draws may reach one that is there.
-    gl.colorMask(res.writes_color, res.writes_color, res.writes_color, res.writes_color);
-
-    switch (res.cull) {
-        .none => gl.disable(c.cull_face),
-        .back => {
-            gl.enable(c.cull_face);
-            gl.cullFace(c.back);
-        },
-        .front => {
-            gl.enable(c.cull_face);
-            gl.cullFace(c.front);
-        },
+    if (differs(bool, &said.color_write, res.writes_color)) {
+        gl.colorMask(res.writes_color, res.writes_color, res.writes_color, res.writes_color);
     }
-    gl.frontFace(if (res.front_face == .ccw) c.ccw else c.cw);
+
+    const culls = res.cull != .none;
+    if (differs(bool, &said.cull_on, culls)) {
+        if (culls) gl.enable(c.cull_face) else gl.disable(c.cull_face);
+    }
+    if (culls) {
+        const face: Enum = if (res.cull == .back) c.back else c.front;
+        if (differs(Enum, &said.cull_face, face)) gl.cullFace(face);
+    }
+    const front: Enum = if (res.front_face == .ccw) c.ccw else c.cw;
+    if (differs(Enum, &said.front_face, front)) gl.frontFace(front);
+}
+
+/// A texture and a sampler on a unit, saying only what the unit has not got.
+fn bindTexture(self: *WebGl, slot: u32, texture: *const TextureRes, sampler: webgl.Sampler) void {
+    const gl = self.gl;
+    const said = &self.said;
+    const want: Said.Unit = .{ .target = texture.target, .texture = texture.texture, .sampler = sampler };
+    const had: ?Said.Unit = if (slot < said.units.len) said.units[slot] else null;
+    if (had) |held| if (std.meta.eql(held, want)) return;
+    if (differs(u32, &said.active_unit, slot)) gl.activeTexture(c.textureUnit(slot));
+    const same_texture = if (had) |held| held.target == want.target and held.texture == want.texture else false;
+    if (!same_texture) gl.bindTexture(want.target, want.texture);
+    const same_sampler = if (had) |held| held.sampler == want.sampler else false;
+    if (!same_sampler) gl.bindSampler(slot, want.sampler);
+    if (slot < said.units.len) said.units[slot] = want;
 }
 
 /// Point the pipeline's attributes at whatever buffers are bound now - and,
@@ -2124,6 +2204,53 @@ test "blending gives colour and alpha a rule each" {
         .{ c.src_alpha, c.one_minus_src_alpha, c.one, c.one_minus_src_alpha },
         stub.state.last_blend_func,
     );
+}
+
+test "what the context already has is not said to it again" {
+    var device = try openDevice();
+    defer device.deinit();
+
+    const shader = try device.createShader(shader_desc);
+    const desc: types.PipelineDesc = .{ .shader = shader, .attributes = &.{}, .buffers = &.{}, .blend = .alpha };
+    const one = try device.createPipeline(desc);
+    const other = try device.createPipeline(desc);
+    const texture = try device.createTexture(.{ .width = 4, .height = 4 });
+    const linear = try device.createSampler(.linear);
+    const nearest = try device.createSampler(.nearest);
+    const surface = try device.createSurface(.{});
+
+    const Calls = struct {
+        fn of(d: *Device, pipelines: []const types.Pipeline, textures: usize, t: types.Texture, s: types.Sampler, target: types.Surface) !u32 {
+            const cmd = d.begin();
+            try cmd.beginPass(.{ .color = .{ .target = .{ .surface = target } } });
+            for (pipelines) |pipeline| try cmd.setPipeline(pipeline);
+            for (0..textures) |_| try cmd.setTexture(0, t, s);
+            try cmd.endPass();
+            const before = stub.state.calls;
+            try d.submit();
+            return stub.state.calls - before;
+        }
+    };
+
+    // The same pipeline and the same texture three times over cost what
+    // once does.
+    const once = try Calls.of(&device, &.{one}, 1, texture, linear, surface);
+    const thrice = try Calls.of(&device, &.{ one, one, one }, 3, texture, linear, surface);
+    try testing.expectEqual(once, thrice);
+
+    // Another pipeline of the same shader in the same state is its vertex
+    // array and nothing else: the program is the shader's, and bound.
+    const two = try Calls.of(&device, &.{ one, other }, 1, texture, linear, surface);
+    try testing.expectEqual(once + 1, two);
+
+    // A unit given another sampler for the same texture has that sampler.
+    const cmd = device.begin();
+    try cmd.beginPass(.{ .color = .{ .target = .{ .surface = surface } } });
+    try cmd.setTexture(2, texture, linear);
+    try cmd.setTexture(2, texture, nearest);
+    try cmd.endPass();
+    try device.submit();
+    try testing.expectEqual(samplerName(&device, nearest), stub.state.samplers[2]);
 }
 
 test "a buffer and a sampler land in the slot they were set to" {
