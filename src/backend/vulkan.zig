@@ -421,6 +421,18 @@ pub const Vk = struct {
     renderer: [256]u8 = undefined,
     renderer_len: usize = 0,
 
+    /// What every pipeline is made through, so that the driver's work for
+    /// one is kept: in `shader_cache` between runs, under a key of this card
+    /// and driver, and put back at the next start. See `openPipelineCache`.
+    pipeline_cache: vk.gen.types.PipelineCache = .none,
+    shader_cache: ?types.ShaderCache = null,
+    pipeline_cache_key: types.ShaderCache.Key = @splat(0),
+    /// Pipelines made since the cache was last kept, and the frames shown
+    /// since the last one was made: kept once a few go by with none, as an
+    /// app on a phone is often stopped without being closed.
+    pipelines_unsaved: u32 = 0,
+    quiet_frames: u32 = 0,
+
     // --- state that only means something while a command buffer is being
     // recorded, reset by `record` and by every `beginPass` ---
     recording: bool = false,
@@ -550,6 +562,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) types.Error!backend.Opened {
     const n = @min(name.len, self.renderer.len);
     @memcpy(self.renderer[0..n], name[0..n]);
     self.renderer_len = n;
+    openPipelineCache(self, desc.shader_cache, &props);
 
     if (props.limits.timestamp_compute_and_graphics != 0 and props.limits.timestamp_period > 0) {
         var pool: vk.gen.types.QueryPool = .none;
@@ -613,6 +626,7 @@ fn deinit(impl: backend.Impl) void {
     flush(self) catch {};
     waitIdle(self);
 
+    savePipelineCache(self);
     resources.destroyDummyResources(self);
     collect(self);
     self.graveyard.deinit(self.gpa);
@@ -629,9 +643,78 @@ fn deinit(impl: backend.Impl) void {
     vkd.destroyDescriptorSetLayout(self.runtime.device, self.set_layout_uniforms, null);
     // Frees the slots' command buffers too.
     vkd.destroyCommandPool(self.runtime.device, self.command_pool, null);
+    if (self.pipeline_cache != .none) vkd.destroyPipelineCache(self.runtime.device, self.pipeline_cache, null);
 
     self.runtime.deinit();
     self.gpa.destroy(self);
+}
+
+/// What a kept pipeline cache starts with: this file's way of keeping one,
+/// changed when it changes. What follows is the driver's own, which says
+/// itself which card and driver made it.
+const pipeline_cache_magic = "FXVKPC01";
+
+/// How many frames in a row with no new pipeline before the cache is kept.
+const quiet_frames_to_save = 120;
+
+/// The pipeline cache, with what this card's driver kept last time put back
+/// in it. A key of the card, its driver's version and the cache's own UUID
+/// picks out what is kept; a driver given another's data ignores it, as
+/// Vulkan has it do, and one that cannot be made at all leaves pipelines
+/// made without one.
+fn openPipelineCache(self: *Vk, cache: ?types.ShaderCache, props: *const vk.PhysicalDeviceProperties) void {
+    var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
+    hash.update("fluxion-rhi vulkan pipeline cache " ++ pipeline_cache_magic ++ "\x00");
+    hash.update(std.mem.asBytes(&props.vendor_id));
+    hash.update(std.mem.asBytes(&props.device_id));
+    hash.update(std.mem.asBytes(&props.driver_version));
+    hash.update(&props.pipeline_cache_uuid);
+    self.pipeline_cache_key = hash.finalResult();
+    self.shader_cache = cache;
+
+    const kept: ?[]u8 = if (cache) |held| held.load(held.context, self.gpa, self.pipeline_cache_key) else null;
+    defer if (kept) |bytes| self.gpa.free(bytes);
+    const initial: []const u8 = if (kept) |bytes|
+        (if (bytes.len > pipeline_cache_magic.len and std.mem.eql(u8, bytes[0..pipeline_cache_magic.len], pipeline_cache_magic)) bytes[pipeline_cache_magic.len..] else &.{})
+    else
+        &.{};
+    const vkd = self.runtime.vkd;
+    var made: vk.gen.types.PipelineCache = .none;
+    if (vkd.createPipelineCache(self.runtime.device, &.{
+        .initial_data_size = initial.len,
+        .initial_data = if (initial.len > 0) initial.ptr else null,
+    }, null, &made) == .success) {
+        self.pipeline_cache = made;
+        return;
+    }
+    // What was kept would not go in: an empty one.
+    if (initial.len > 0 and vkd.createPipelineCache(self.runtime.device, &.{}, null, &made) == .success) self.pipeline_cache = made;
+}
+
+/// Keep what the pipeline cache holds, where pipelines were made since it
+/// was last kept.
+pub fn savePipelineCache(self: *Vk) void {
+    if (self.pipelines_unsaved == 0 or self.pipeline_cache == .none) return;
+    const cache = self.shader_cache orelse return;
+    self.pipelines_unsaved = 0;
+    const vkd = self.runtime.vkd;
+    var size: usize = 0;
+    if (vkd.getPipelineCacheData(self.runtime.device, self.pipeline_cache, &size, null) != .success or size == 0) return;
+    const bytes = self.gpa.alloc(u8, pipeline_cache_magic.len + size) catch return;
+    defer self.gpa.free(bytes);
+    var got = size;
+    if (vkd.getPipelineCacheData(self.runtime.device, self.pipeline_cache, &got, bytes[pipeline_cache_magic.len..].ptr) != .success) return;
+    @memcpy(bytes[0..pipeline_cache_magic.len], pipeline_cache_magic);
+    cache.store(cache.context, self.pipeline_cache_key, bytes[0 .. pipeline_cache_magic.len + got]);
+}
+
+/// A frame shown: the cache kept once enough go by without a new pipeline.
+pub fn frameShown(self: *Vk) void {
+    if (self.pipelines_unsaved == 0) return;
+    self.quiet_frames += 1;
+    if (self.quiet_frames < quiet_frames_to_save) return;
+    self.quiet_frames = 0;
+    savePipelineCache(self);
 }
 
 fn info(impl: backend.Impl) types.Info {
@@ -1839,6 +1922,52 @@ test "a float target keeps light over one, read back clamped" {
     const pixels = try device.readTexture(bright, testing.allocator);
     defer testing.allocator.free(pixels);
     try testing.expectEqualSlices(u8, &.{ 255, 64, 0, 255 }, pixels[(1 * 4 + 1) * 4 ..][0..4]);
+}
+
+test "the pipelines a device made are kept when it closes, and the next device starts from them" {
+    const hlsl_cache = @import("hlsl_cache.zig");
+    var memory: hlsl_cache.MemoryCache = .{};
+    defer memory.deinit();
+    for (0..2) |run| {
+        var device = Device.init(testing.allocator, .{ .backend = .vulkan, .shader_cache = memory.cache() }) catch |err| switch (err) {
+            error.NoDevice, error.Unsupported => return error.SkipZigTest,
+            else => return err,
+        };
+        defer device.deinit();
+        const shader = try device.createShader(.{ .spirv = .{ .vertex = shaded_vertex, .fragment = look_fragment } });
+        defer device.destroyShader(shader);
+        const pipeline = try device.createPipeline(.{
+            .shader = shader,
+            .attributes = &.{ .{ .location = 0, .format = .float3, .offset = 0 }, .{ .location = 1, .format = .float4, .offset = 12 } },
+            .buffers = &.{.{ .stride = 28 }},
+        });
+        defer device.destroyPipeline(pipeline);
+        const w = [4]f32{ 1, 1, 1, 1 };
+        const whole = [_][7]f32{ .{ -1, -1, 0 } ++ w, .{ -1, 3, 0 } ++ w, .{ 3, -1, 0 } ++ w };
+        const corners = try device.createBuffer(.{ .kind = .vertex, .size = @sizeOf(@TypeOf(whole)), .data = std.mem.asBytes(&whole) });
+        defer device.destroyBuffer(corners);
+        const colour = try device.createBuffer(.{ .kind = .uniform, .size = 16, .data = std.mem.asBytes(&[4]f32{ 0, 1, 0, 1 }) });
+        defer device.destroyBuffer(colour);
+        const target = try device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .sampled = true, .render_target = true } });
+        defer device.destroyTexture(target);
+        const cmd = device.begin();
+        try cmd.beginPass(.{ .color = .{ .target = .{ .texture = target } } });
+        try cmd.setPipeline(pipeline);
+        try cmd.setVertexBuffer(0, corners, 0);
+        try cmd.setUniformBuffer(0, colour);
+        try cmd.draw(.{ .vertex_count = 3 });
+        try cmd.endPass();
+        try device.submit();
+        const drawn = try device.readTexture(target, testing.allocator);
+        defer testing.allocator.free(drawn);
+        // Drawn the same either way.
+        try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, drawn[0..4].*);
+        // The first found nothing kept; the second found what the first kept.
+        try testing.expectEqual(@as(usize, run), memory.hits);
+    }
+    // Kept once by each: the second made its pipeline too, from what was kept.
+    try testing.expectEqual(@as(usize, 2), memory.stores);
+    try testing.expectEqual(@as(usize, 1), memory.kept.count());
 }
 
 test "two draws read two parts of one uniform buffer" {

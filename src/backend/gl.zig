@@ -176,9 +176,15 @@ pub fn For(comptime is_gles: bool) type {
                 data: ?*const anyopaque,
             ) callconv(.c) void = null,
             samplerParameterfv: ?*const fn (sampler: gt.Uint, pname: gt.Enum, params: [*]const gt.Float) callconv(.c) void = null,
+            /// 4.1 and ES 3.0: what tells the driver, before a program is
+            /// linked, that its binary will be asked for.
+            programParameteri: ?*const fn (program: gt.Uint, pname: gt.Enum, value: gt.Int) callconv(.c) void = null,
 
             pub const options: opengl.loader.Options = .{ .prefix = "gl" };
         };
+
+        /// `GL_PROGRAM_BINARY_RETRIEVABLE_HINT`.
+        const program_binary_retrievable_hint: gt.Enum = 0x8257;
 
         /// The GPU's clock: OpenGL 3.3's own, and on ES
         /// `GL_EXT_disjoint_timer_query`'s, under that suffix.
@@ -740,6 +746,9 @@ pub fn For(comptime is_gles: bool) type {
             debug: bool,
             renderer: [128]u8 = undefined,
             renderer_len: usize = 0,
+            /// Where a linked program's binary is kept, to be put back at the
+            /// next start instead of compiling its source again.
+            shader_cache: ?types.ShaderCache = null,
             /// Which way the driver tells how full the card's memory is: see `memory`.
             memory_info: MemoryInfo = .none,
             /// What the driver's debug output last complained about, kept rather
@@ -1058,6 +1067,7 @@ pub fn For(comptime is_gles: bool) type {
                 .api = undefined,
                 .debug = desc.debug,
                 .surface = .{},
+                .shader_cache = desc.shader_cache,
             };
 
             self.api.load(Resolver{ .hooks = hooks }) catch return error.NoDevice;
@@ -1956,6 +1966,18 @@ pub fn For(comptime is_gles: bool) type {
                 return error.ShaderFailed;
             };
 
+            // The program this driver linked from these sources before, put
+            // back as it was: no compiling, which on a phone is most of a
+            // start. Anything the driver will not take - its own update, a
+            // binary of another card - is compiled again.
+            const key = if (self.shader_cache != null) binaryKey(self, sources.vertex, sources.fragment) else undefined;
+            if (self.shader_cache != null) if (loadBinary(self, key)) |kept| {
+                errdefer api.deleteProgram(kept);
+                const res = try self.gpa.create(ShaderRes);
+                res.* = .{ .program = kept };
+                return res;
+            };
+
             const vertex = try compileStage(api, c.vertex_shader, sources.vertex, log);
             defer api.deleteShader(vertex);
             const fragment = try compileStage(api, c.fragment_shader, sources.fragment, log);
@@ -1965,6 +1987,7 @@ pub fn For(comptime is_gles: bool) type {
             errdefer api.deleteProgram(program);
             api.attachShader(program, vertex);
             api.attachShader(program, fragment);
+            if (self.shader_cache != null) if (self.extra.programParameteri) |set| set(program, program_binary_retrievable_hint, 1);
             api.linkProgram(program);
 
             var linked: [1]gt.Int = .{0};
@@ -1976,10 +1999,78 @@ pub fn For(comptime is_gles: bool) type {
                 log.print("the program did not link:\n{s}", .{text[0..@intCast(length)]}) catch {};
                 return error.ShaderFailed;
             }
+            if (self.shader_cache != null) storeBinary(self, key, program);
 
             const res = try self.gpa.create(ShaderRes);
             res.* = .{ .program = program };
             return res;
+        }
+
+        /// What a kept binary starts with: this file's way of keeping one,
+        /// changed when it changes, then the driver's format for it.
+        const binary_magic = "FXGLBIN1";
+
+        /// The key of a program linked from `vertex` and `fragment` by this
+        /// driver: its maker, its name and its version are in it, so another
+        /// card's or an older driver's binary is never asked for.
+        fn binaryKey(self: *const Gl, vertex: []const u8, fragment: []const u8) types.ShaderCache.Key {
+            var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
+            hash.update("fluxion-rhi glsl binary " ++ binary_magic ++ (if (is_gles) " es" else " gl") ++ "\x00");
+            for ([_]gt.Enum{ c.vendor, c.renderer, c.version }) |name| {
+                hash.update(self.api.string(name) orelse "");
+                hash.update("\x00");
+            }
+            hash.update(vertex);
+            hash.update("\x00");
+            hash.update(fragment);
+            return hash.finalResult();
+        }
+
+        /// A program from the binary kept under `key`, linked; null where
+        /// none is kept or the driver turns it down.
+        fn loadBinary(self: *Gl, key: types.ShaderCache.Key) ?gt.Uint {
+            const cache = self.shader_cache orelse return null;
+            const put_back = self.api.programBinary orelse return null;
+            const bytes = cache.load(cache.context, self.gpa, key) orelse return null;
+            defer self.gpa.free(bytes);
+            const header = binary_magic.len + 4;
+            if (bytes.len <= header or !std.mem.eql(u8, bytes[0..binary_magic.len], binary_magic)) return null;
+            const format = std.mem.readInt(u32, bytes[binary_magic.len..][0..4], .little);
+            const api = &self.api;
+            const program = api.createProgram();
+            put_back(program, format, bytes[header..].ptr, @intCast(bytes.len - header));
+            var linked: [1]gt.Int = .{0};
+            api.getProgramiv(program, c.link_status, &linked);
+            if (linked[0] != 0) return program;
+            api.deleteProgram(program);
+            // What the refusal left in the error queue is not a later
+            // call's mistake.
+            for (0..8) |_| if (api.checkError() == null) break;
+            return null;
+        }
+
+        /// Keep the binary of `program`, just linked, under `key`. Passed
+        /// over where the driver has none to give.
+        fn storeBinary(self: *Gl, key: types.ShaderCache.Key, program: gt.Uint) void {
+            const cache = self.shader_cache orelse return;
+            const take = self.api.getProgramBinary orelse return;
+            const api = &self.api;
+            var length: [1]gt.Int = .{0};
+            api.getProgramiv(program, c.program_binary_length, &length);
+            if (length[0] <= 0) return;
+            const header = binary_magic.len + 4;
+            const bytes = self.gpa.alloc(u8, header + @as(usize, @intCast(length[0]))) catch return;
+            defer self.gpa.free(bytes);
+            var written: gt.Sizei = 0;
+            var format: gt.Enum = 0;
+            take(program, length[0], &written, &format, bytes[header..].ptr);
+            if (written <= 0 or written > length[0]) {
+                for (0..8) |_| if (api.checkError() == null) break;
+                return;
+            }
+            @memcpy(bytes[0..binary_magic.len], binary_magic);
+            std.mem.writeInt(u32, bytes[binary_magic.len..][0..4], format, .little);
+            cache.store(cache.context, key, bytes[0 .. header + @as(usize, @intCast(written))]);
         }
 
         fn compileStage(api: *const Api, kind: gt.Enum, source: [:0]const u8, log: *Io.Writer) Error!gt.Uint {

@@ -149,6 +149,7 @@ pub fn present(impl: backend.Impl, native: backend.Native, mode: types.PresentMo
     const self = vulkan.cast(impl);
     const res = as(SurfaceRes, native);
     res.want_mode = mode;
+    vulkan.frameShown(self);
     const index = res.acquired orelse return;
     res.acquired = null;
     const presentFn = self.runtime.vkd.queuePresentKHR orelse return error.Unsupported;

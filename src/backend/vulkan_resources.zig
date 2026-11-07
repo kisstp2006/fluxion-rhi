@@ -1085,7 +1085,9 @@ pub fn pipelineFor(self: *Vk, res: *PipelineRes, format: vk.gen.types.Format, de
     }};
 
     var pipeline: vk.gen.types.Pipeline = .none;
-    _ = self.runtime.vkd.createGraphicsPipelines(self.runtime.device, .none, 1, &pipeline_info, null, @ptrCast(&pipeline)).check() catch return error.PipelineFailed;
+    _ = self.runtime.vkd.createGraphicsPipelines(self.runtime.device, self.pipeline_cache, 1, &pipeline_info, null, @ptrCast(&pipeline)).check() catch return error.PipelineFailed;
+    self.pipelines_unsaved += 1;
+    self.quiet_frames = 0;
     res.variants[index] = .{ .format = format, .depth = depth, .pipeline = pipeline };
     return pipeline;
 }
