@@ -63,6 +63,11 @@ pub const backend = @import("backend.zig");
 pub const resources = @import("resources.zig");
 
 pub const Device = @import("Device.zig");
+/// HLSL compiled ahead of any device, on any thread, into the shader cache
+/// the Direct3D backends read: see `backend/hlsl_precompile.zig`.
+pub const HlslPrecompiler = @import("backend/hlsl_precompile.zig").Precompiler;
+pub const HlslStage = @import("backend/hlsl_precompile.zig").Stage;
+pub const HlslOutcome = @import("backend/hlsl_precompile.zig").Outcome;
 pub const CommandList = commands.CommandList;
 pub const Command = commands.Command;
 
@@ -72,6 +77,10 @@ pub const Opener = backend.Opener;
 pub const Select = types.Select;
 pub const Error = types.Error;
 pub const Info = types.Info;
+pub const HlslOptimization = types.HlslOptimization;
+/// The key the shader cache keeps a stage's HLSL bytecode under, as the
+/// Direct3D backends compile it: see `backend/hlsl_cache.zig`.
+pub const hlslKeyFor = @import("backend/hlsl_cache.zig").keyFor;
 pub const Memory = types.Memory;
 
 pub const Buffer = types.Buffer;
@@ -153,6 +162,7 @@ test {
     _ = @import("backend/readback.zig");
     _ = @import("backend/timing.zig");
     _ = @import("backend/hlsl_cache.zig");
+    _ = @import("backend/hlsl_precompile.zig");
     _ = @import("backend/gl.zig");
     // Against `fluxion-webgl`'s stub, on whatever machine the tests run on.
     _ = @import("backend/webgl.zig");

@@ -926,7 +926,17 @@ pub const DeviceDesc = struct {
     /// Where what a backend compiles from source is kept between runs. Null
     /// compiles every shader every time it is made.
     shader_cache: ?ShaderCache = null,
+    /// How Direct3D's HLSL compiler treats what it compiles: see
+    /// `HlslOptimization`. The other backends compile nothing.
+    hlsl_optimization: HlslOptimization = .full,
 };
+
+/// How the Direct3D backends compile HLSL. `full` is fxc's own optimiser -
+/// the smallest bytecode, and for a large shader minutes of compiling.
+/// `fast_compile` skips it: tens of times quicker to compile, the bytecode
+/// larger, and the driver - which optimises the bytecode again as it makes a
+/// pipeline - left to do the rest. The two are kept apart in the cache.
+pub const HlslOptimization = enum { full, fast_compile };
 
 /// Where a backend keeps what it compiles from source while the program
 /// runs, to find it again the next time: Direct3D 11 and 12, which compile
@@ -948,6 +958,12 @@ pub const ShaderCache = struct {
     /// Keep `bytes` under `key`. What cannot be kept is passed over: the
     /// next run compiles it again.
     store: *const fn (context: *anyopaque, key: Key, bytes: []const u8) void,
+    /// Optional: keep the source `key` was compiled from, and its target -
+    /// called for each stage the device makes, found in the cache or not -
+    /// so that a cache that has only the sources can be compiled ahead, on
+    /// another machine or another run, without drawing anything. Null keeps
+    /// no sources.
+    keep_source: ?*const fn (context: *anyopaque, key: Key, target: []const u8, source: []const u8) void = null,
 
     /// SHA-256 of what decides a compilation.
     pub const Key = [32]u8;

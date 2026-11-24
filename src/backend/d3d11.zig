@@ -879,6 +879,7 @@ const D3d = struct {
     /// in the shader cache.
     compiler: ?d3d.Compiler = null,
     shader_cache: ?types.ShaderCache,
+    hlsl_optimization: types.HlslOptimization = .full,
     device: d3d11.Device,
     raw: Raw,
     context: *IDeviceContext,
@@ -1087,6 +1088,7 @@ pub fn open(gpa: Allocator, desc: types.DeviceDesc) Error!backend.Opened {
         .dxgi_library = dxgi_library,
         .factory = factory,
         .shader_cache = desc.shader_cache,
+        .hlsl_optimization = desc.hlsl_optimization,
         .device = device,
         .raw = raw,
         .context = @ptrCast(device.context),
@@ -1928,9 +1930,9 @@ fn compilerOf(self: *D3d, log: *Io.Writer) Error!d3d.Compiler {
     return self.compiler.?;
 }
 
-fn compileStage(compiler: d3d.Compiler, source: []const u8, target: [:0]const u8, label: []const u8, log: *Io.Writer) Error!*d3d.ID3DBlob {
+fn compileStage(compiler: d3d.Compiler, source: []const u8, target: [:0]const u8, label: []const u8, optimization: types.HlslOptimization, log: *Io.Writer) Error!*d3d.ID3DBlob {
     _ = label;
-    var output = compiler.compile(source, .{ .target = target, .name = "fluxion-rhi.hlsl" });
+    var output = compiler.compile(source, .{ .target = target, .name = "fluxion-rhi.hlsl", .flags = hlsl_cache.flagsFor(d3d.compiler.Flags, optimization) });
     errdefer output.release();
     const code = output.check() catch {
         log.print("{s} did not compile:\n{s}", .{ target, output.text() }) catch {};
@@ -1944,9 +1946,12 @@ fn compileStage(compiler: d3d.Compiler, source: []const u8, target: [:0]const u8
 /// A stage's bytecode, owned by `self.gpa`: as the shader cache keeps it,
 /// or compiled now and kept there for the next time.
 fn stageCode(self: *D3d, source: []const u8, target: [:0]const u8, label: []const u8, log: *Io.Writer) Error![]u8 {
-    const key = hlsl_cache.keyOf(source, target);
+    const key = hlsl_cache.keyFor(source, target, self.hlsl_optimization);
+    // What it was made from, kept beside it: what a warm-up compiles ahead
+    // where there is a source and no bytecode.
+    hlsl_cache.keepSource(self.shader_cache, key, target, source);
     if (hlsl_cache.load(self.gpa, self.shader_cache, key)) |code| return code;
-    const blob = try compileStage(try compilerOf(self, log), source, target, label, log);
+    const blob = try compileStage(try compilerOf(self, log), source, target, label, self.hlsl_optimization, log);
     defer _ = com.release(blob);
     const code = try self.gpa.dupe(u8, blob.bytes());
     hlsl_cache.store(self.shader_cache, key, code);

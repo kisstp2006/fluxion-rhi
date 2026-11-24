@@ -24,6 +24,26 @@ pub fn keyOf(source: []const u8, target: []const u8) types.ShaderCache.Key {
     return hash.finalResult();
 }
 
+/// `keyOf`, for a compile `optimization` says how to make: a fully
+/// optimised one keeps the key it always had, a quick one has its own.
+pub fn keyFor(source: []const u8, target: []const u8, optimization: types.HlslOptimization) types.ShaderCache.Key {
+    if (optimization == .full) return keyOf(source, target);
+    var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
+    hash.update("fluxion-rhi hlsl " ++ version ++ " fast\x00");
+    hash.update(target);
+    hash.update("\x00main\x00");
+    hash.update(source);
+    return hash.finalResult();
+}
+
+/// The flags fxc is given for `optimization`.
+pub fn flagsFor(comptime Flags: type, optimization: types.HlslOptimization) Flags {
+    return switch (optimization) {
+        .full => .{},
+        .fast_compile => .{ .skip_optimization = true },
+    };
+}
+
 /// The bytecode kept under `key`, owned by `gpa`, where there is some and it
 /// reads as a DXBC container; anything else is passed over, to be compiled
 /// again.
@@ -38,6 +58,14 @@ pub fn load(gpa: std.mem.Allocator, cache: ?types.ShaderCache, key: types.Shader
 pub fn store(cache: ?types.ShaderCache, key: types.ShaderCache.Key, bytes: []const u8) void {
     const held = cache orelse return;
     held.store(held.context, key, bytes);
+}
+
+/// The source of the stage under `key`, and its target, kept where the
+/// cache keeps sources: see `ShaderCache.keep_source`.
+pub fn keepSource(cache: ?types.ShaderCache, key: types.ShaderCache.Key, target: []const u8, source: []const u8) void {
+    const held = cache orelse return;
+    const keep = held.keep_source orelse return;
+    keep(held.context, key, target, source);
 }
 
 /// Whether `bytes` are a DXBC container as far as its header goes: `DXBC`,
@@ -93,6 +121,9 @@ test "the key changes with the source and the target, and nothing else" {
     const other_target = keyOf("float4 main() : SV_POSITION { return 0; }", "ps_5_0");
     try testing.expect(!std.mem.eql(u8, &vertex, &other_target));
     const other_source = keyOf("float4 main() : SV_POSITION { return 1; }", "vs_5_0");
+    // A quick compile is kept apart from a full one; a full one keeps its key.
+    try testing.expectEqualSlices(u8, &vertex, &keyFor("float4 main() : SV_POSITION { return 0; }", "vs_5_0", .full));
+    try testing.expect(!std.mem.eql(u8, &vertex, &keyFor("float4 main() : SV_POSITION { return 0; }", "vs_5_0", .fast_compile)));
     try testing.expect(!std.mem.eql(u8, &vertex, &other_source));
 }
 
